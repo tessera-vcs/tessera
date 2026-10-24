@@ -259,30 +259,63 @@ fn is_path_ignored(rel_path: &str, is_dir: bool, rules: &[IgnoreRule]) -> bool {
     ignored
 }
 
-/// Evaluates a simple `*` wildcard glob pattern against `candidate`.
+/// Evaluates a wildcard glob pattern (supporting multiple `*` and `**/` segments) against `candidate`.
 fn glob_match(pattern: &str, candidate: &str) -> bool {
-    if pattern == "*" {
-        return true;
-    }
+    if let Some(rest) = pattern.strip_prefix("**/") {
+        if glob_match(rest, candidate) {
+            return true;
+        }
 
-    if let Some(suffix) = pattern.strip_prefix('*') {
-        if !suffix.contains('*') {
-            return candidate.ends_with(suffix);
+        for (idx, ch) in candidate.char_indices() {
+            if ch == '/' && glob_match(rest, &candidate[idx + 1..]) {
+                return true;
+            }
         }
     }
 
-    if let Some(prefix) = pattern.strip_suffix('*') {
-        if !prefix.contains('*') {
-            return candidate.starts_with(prefix);
+    if let Some((head, tail)) = pattern.split_once("/**/") {
+        if glob_match(&format!("{head}/{tail}"), candidate) {
+            return true;
         }
     }
 
-    if let Some((prefix, suffix)) = pattern.split_once('*') {
-        return candidate.starts_with(prefix)
-            && candidate.ends_with(suffix)
-            && candidate.len() >= prefix.len() + suffix.len();
+    if !pattern.contains('*') {
+        return pattern == candidate;
     }
-    pattern == candidate
+
+    let parts: Vec<&str> = pattern.split('*').collect();
+    let mut rem = candidate;
+
+    if let Some(first) = parts.first() {
+        if !first.is_empty() {
+            let Some(after_first) = rem.strip_prefix(first) else {
+                return false;
+            };
+            rem = after_first;
+        }
+    }
+
+    if let Some(last) = parts.last() {
+        if !last.is_empty() && parts.len() > 1 {
+            let Some(before_last) = rem.strip_suffix(last) else {
+                return false;
+            };
+            rem = before_last;
+        }
+    }
+
+    for part in parts.iter().skip(1).take(parts.len().saturating_sub(2)) {
+        if part.is_empty() {
+            continue;
+        }
+
+        let Some(pos) = rem.find(part) else {
+            return false;
+        };
+        rem = &rem[pos + part.len()..];
+    }
+
+    true
 }
 
 /// Incrementally snapshots `working_dir` into `git` using the stat cache identified by `cache_key`.
@@ -551,12 +584,19 @@ mod tests {
         let oplog_dir = git.git_dir().join("tessera/stat_cache");
         fs::create_dir_all(&oplog_dir).expect("mkdir stat_cache");
 
-        fs::write(tmp.path().join(".gitignore"), "*.log\n.env*\ncoverage/\n").expect("gitignore");
+        fs::write(
+            tmp.path().join(".gitignore"),
+            "*.log\n.env*\ncoverage/\n**/*/ignored-lock.json\n",
+        )
+        .expect("gitignore");
         fs::write(tmp.path().join("README.md"), "# Monorepo\n").expect("write readme");
         fs::write(tmp.path().join("debug.log"), "ignored log\n").expect("write log");
         fs::write(tmp.path().join(".env.local"), "SECRET=1\n").expect("write env");
         fs::create_dir_all(tmp.path().join("coverage")).expect("mkdir coverage");
         fs::write(tmp.path().join("coverage/lcov.info"), "ignored\n").expect("write cov");
+        fs::create_dir_all(tmp.path().join("packages/ui")).expect("mkdir packages/ui");
+        fs::write(tmp.path().join("packages/ui/ignored-lock.json"), "{}\n")
+            .expect("write ignored lock");
 
         let snap1 =
             snapshot_working_dir(&git, tmp.path(), "test-agent", &[], None).expect("snap 1");
@@ -566,6 +606,7 @@ mod tests {
         assert!(!snap1.files.contains_key("debug.log"));
         assert!(!snap1.files.contains_key(".env.local"));
         assert!(!snap1.files.contains_key("coverage/lcov.info"));
+        assert!(!snap1.files.contains_key("packages/ui/ignored-lock.json"));
 
         let snap2 =
             snapshot_working_dir(&git, tmp.path(), "test-agent", &[], None).expect("snap 2");
