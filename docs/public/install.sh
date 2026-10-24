@@ -56,9 +56,9 @@ download_with_progress() {
       count=$((count + 1))
 
       if [ -n "$size_str" ]; then
-        printf "  ${PURPLE}⬇${RESET} %s... (0%% of %s)" "$label" "$size_str"
+        printf "  ${PURPLE}↓${RESET} %s... (0%% of %s)" "$label" "$size_str"
       else
-        printf "  ${PURPLE}⬇${RESET} %s... (0%%)" "$label"
+        printf "  ${PURPLE}↓${RESET} %s... (0%%)" "$label"
       fi
 
       curl -fL -# "$url" -o "$dest" 2>&1 | awk -v RS="$CR" '
@@ -71,9 +71,9 @@ download_with_progress() {
         }
       ' | while read -r pct; do
         if [ -n "$size_str" ]; then
-          printf "\r  ${PURPLE}⬇${RESET} %s... (%s of %s)\033[K" "$label" "$pct" "$size_str"
+          printf "\r  ${PURPLE}↓${RESET} %s... (%s of %s)\033[K" "$label" "$pct" "$size_str"
         else
-          printf "\r  ${PURPLE}⬇${RESET} %s... (%s)\033[K" "$label" "$pct"
+          printf "\r  ${PURPLE}↓${RESET} %s... (%s)\033[K" "$label" "$pct"
         fi
       done
 
@@ -93,12 +93,12 @@ download_with_progress() {
     printf "\r  ${RED}✖${RESET} %s (failed after %d attempts)\033[K\n" "$label" "$retries" >&2
     return 1
   elif command -v wget >/dev/null 2>&1; then
-    printf "  ${PURPLE}⬇${RESET} %s...\n" "$label"
+    printf "  ${PURPLE}↓${RESET} %s...\n" "$label"
     wget --show-progress -qO "$dest" "$url" 2>/dev/null || wget -qO "$dest" "$url"
     success "$label"
     return 0
   elif command -v ftp >/dev/null 2>&1; then
-    printf "  ${PURPLE}⬇${RESET} %s...\n" "$label"
+    printf "  ${PURPLE}↓${RESET} %s...\n" "$label"
     ftp -o "$dest" "$url"
     success "$label"
     return 0
@@ -179,7 +179,7 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 
 step "2" "Downloading & verifying archive..."
 
-download_with_progress "${BASE_URL}/${ARCHIVE}" "${TMP_DIR}/${ARCHIVE}" "Downloading ${ARCHIVE}"
+download_with_progress "${BASE_URL}/${ARCHIVE}" "${TMP_DIR}/${ARCHIVE}" "Downloading tes"
 
 if [ "${TES_SKIP_CHECKSUM:-0}" != "1" ]; then
   if ! download_quiet "${BASE_URL}/${ARCHIVE}.sha256" "${TMP_DIR}/${ARCHIVE}.sha256" || [ ! -s "${TMP_DIR}/${ARCHIVE}.sha256" ]; then
