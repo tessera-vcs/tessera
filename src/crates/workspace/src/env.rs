@@ -1114,9 +1114,15 @@ pub fn build_agent_env_with_config(
 
     let db_name = format!("test_slot_{}", agent.slot);
     let base_db_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://localhost:5432/dev".to_string());
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| lookup_dotenv_var(working_dir, "DATABASE_URL"))
+        .unwrap_or_else(|| "postgres://localhost:5432/dev".to_string());
     let base_test_db_url = std::env::var("TEST_DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://localhost:5432/test".to_string());
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| lookup_dotenv_var(working_dir, "TEST_DATABASE_URL"))
+        .unwrap_or_else(|| "postgres://localhost:5432/test".to_string());
 
     env.insert("TES_AGENT_ID".to_string(), agent.agent_id.clone());
     env.insert("TES_AGENT_SLOT".to_string(), agent.slot.to_string());
@@ -1206,19 +1212,146 @@ pub fn build_agent_env_with_config(
     env
 }
 
-/// Appends `_slot_<slot>` to the database name in `raw_url` while preserving any query string.
-fn suffix_database_url(raw_url: &str, slot: u16) -> String {
-    let suffix = format!("_slot_{slot}");
-    if let Some((before_query, query)) = raw_url.split_once('?') {
-        if before_query.ends_with(&suffix) {
-            raw_url.to_string()
-        } else {
-            format!("{before_query}{suffix}?{query}")
+/// Looks up `key` inside `.env.local`, `.env.development.local`, `.env.development`, or `.env`
+/// inside `working_dir` without modifying process state.
+fn lookup_dotenv_var(working_dir: &Path, key: &str) -> Option<String> {
+    for file_name in [
+        ".env.local",
+        ".env.development.local",
+        ".env.development",
+        ".env",
+    ] {
+        let Ok((_, path)) = resolve_confined_repo_path(working_dir, file_name) else {
+            continue;
+        };
+
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() || !meta.is_file() || meta.len() > 64 * 1024 {
+            continue;
         }
-    } else if raw_url.ends_with(&suffix) {
-        raw_url.to_string()
+
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+
+        for line in raw.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+
+            let body = trimmed.strip_prefix("export ").map_or(trimmed, str::trim);
+            let Some((k, v)) = body.split_once('=') else {
+                continue;
+            };
+
+            if k.trim() != key {
+                continue;
+            }
+
+            let val_trimmed = v.trim();
+            let unquoted = if (val_trimmed.starts_with('"')
+                && val_trimmed.ends_with('"')
+                && val_trimmed.len() >= 2)
+                || (val_trimmed.starts_with('\'')
+                    && val_trimmed.ends_with('\'')
+                    && val_trimmed.len() >= 2)
+            {
+                &val_trimmed[1..val_trimmed.len() - 1]
+            } else {
+                val_trimmed
+                    .split_once(" #")
+                    .map_or(val_trimmed, |(before_comment, _)| before_comment.trim())
+            };
+
+            if !unquoted.is_empty() && !unquoted.chars().any(|c| c.is_control()) {
+                return Some(unquoted.to_string());
+            }
+        }
+    }
+
+    None
+}
+
+/// Appends `_slot_<slot>` to the database name in `raw_url` when `raw_url` targets a local
+/// network database server (`localhost`, `127.0.0.1`, `[::1]`, `0.0.0.0`), while preserving
+/// file-based database URLs (`file:`, `sqlite:`, `*.db`, `*.sqlite*`) and remote cloud hosts.
+fn suffix_database_url(raw_url: &str, slot: u16) -> String {
+    let trimmed = raw_url.trim();
+    if trimmed.is_empty() {
+        return raw_url.to_string();
+    }
+
+    let (before_query, query_opt) = match trimmed.split_once('?') {
+        Some((b, q)) => (b, Some(q)),
+        None => (trimmed, None),
+    };
+
+    let lower = before_query.to_ascii_lowercase();
+    if lower.starts_with("sqlite:")
+        || lower.starts_with("file:")
+        || lower.starts_with("duckdb:")
+        || lower.starts_with("libsql://file:")
+        || lower.contains(":memory:")
+        || lower.ends_with(".db")
+        || lower.ends_with(".sqlite")
+        || lower.ends_with(".sqlite3")
+        || lower.ends_with(".duckdb")
+    {
+        return raw_url.to_string();
+    }
+
+    let Some((scheme, rest)) = before_query.split_once("://") else {
+        return raw_url.to_string();
+    };
+
+    let scheme_lower = scheme.to_ascii_lowercase();
+    if matches!(scheme_lower.as_str(), "redis" | "rediss" | "valkey") {
+        return raw_url.to_string();
+    }
+
+    let Some((authority, db_path)) = rest.split_once('/') else {
+        return raw_url.to_string();
+    };
+
+    if db_path.is_empty() {
+        return raw_url.to_string();
+    }
+
+    let host_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, hp)| hp);
+    let host = if host_port.starts_with('[') {
+        host_port
+            .split_once(']')
+            .map_or(host_port, |(h, _)| &h[1..])
     } else {
-        format!("{raw_url}{suffix}")
+        host_port.split_once(':').map_or(host_port, |(h, _)| h)
+    };
+
+    let host_lower = host.to_ascii_lowercase();
+    let is_local_host = host_lower.is_empty()
+        || matches!(
+            host_lower.as_str(),
+            "localhost" | "127.0.0.1" | "::1" | "0.0.0.0" | "host.docker.internal"
+        )
+        || host_lower.ends_with(".localhost");
+
+    if !is_local_host {
+        return raw_url.to_string();
+    }
+
+    let suffix = format!("_slot_{slot}");
+    if before_query.ends_with(&suffix) {
+        return raw_url.to_string();
+    }
+
+    if let Some(query) = query_opt {
+        format!("{before_query}{suffix}?{query}")
+    } else {
+        format!("{before_query}{suffix}")
     }
 }
 
@@ -1281,5 +1414,47 @@ mod tests {
         assert!(!env_custom.contains_key("LD_PRELOAD"));
         assert!(!env_custom.contains_key("DYLD_INSERT_LIBRARIES"));
         assert_eq!(env_custom.get("APP_PORT").map(String::as_str), Some("3100"));
+    }
+
+    #[test]
+    fn suffix_database_url_isolates_local_servers_and_preserves_sqlite_and_remote_urls() {
+        assert_eq!(
+            suffix_database_url("postgres://localhost:5432/myapp", 1),
+            "postgres://localhost:5432/myapp_slot_1"
+        );
+        assert_eq!(
+            suffix_database_url("postgresql://user:pass@127.0.0.1:5432/myapp?schema=public", 2),
+            "postgresql://user:pass@127.0.0.1:5432/myapp_slot_2?schema=public"
+        );
+        assert_eq!(
+            suffix_database_url("mysql://root@[::1]:3306/shop", 3),
+            "mysql://root@[::1]:3306/shop_slot_3"
+        );
+        assert_eq!(
+            suffix_database_url("file:./dev.db", 1),
+            "file:./dev.db"
+        );
+        assert_eq!(
+            suffix_database_url("sqlite:///var/data/app.sqlite3?mode=rwc", 2),
+            "sqlite:///var/data/app.sqlite3?mode=rwc"
+        );
+        assert_eq!(
+            suffix_database_url("sqlite::memory:", 1),
+            "sqlite::memory:"
+        );
+        let neon_url =
+            "postgresql://owner:secret@ep-cool-frog-123.us-east-2.aws.neon.tech/neondb?sslmode=require";
+        assert_eq!(suffix_database_url(neon_url, 1), neon_url);
+
+        let supabase_url = "postgresql://postgres:secret@db.abcdefgh.supabase.co:5432/postgres";
+        assert_eq!(suffix_database_url(supabase_url, 2), supabase_url);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join(".env"), "DATABASE_URL=\"file:./prisma/dev.db\"\n")
+            .expect("write .env");
+        assert_eq!(
+            lookup_dotenv_var(dir.path(), "DATABASE_URL").as_deref(),
+            Some("file:./prisma/dev.db")
+        );
     }
 }
