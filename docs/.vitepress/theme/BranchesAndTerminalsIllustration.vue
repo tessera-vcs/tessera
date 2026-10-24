@@ -117,7 +117,7 @@ onUnmounted(() => {
               </g>
               <g transform="translate(12, 9)">
                 <text x="30" y="10.5" class="svg-browser-url" fill="var(--svg-blue-text-bold)">Term 1 · (tes:feat/pricing)</text>
-                <text x="14" y="33" class="svg-mono-sub" fill="var(--svg-blue-text)">❯ npm run dev → :4100</text>
+                <text x="14" y="33" class="svg-mono-sub" fill="var(--svg-blue-text)">❯ npm run dev → :3100</text>
               </g>
 
               <g transform="translate(12, 62)" filter="url(#ink-sketch-branches)">

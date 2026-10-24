@@ -10,9 +10,9 @@ tes claim --intent <TEXT> [options] <files...>
 
 ## Options
 
-- `-i, --intent <TEXT>` - Concise description of the task being performed.
+- `--intent <TEXT>` - Concise description of the task being performed.
 - `-b, --branch <BRANCH>` - Target branch for the session (created from `HEAD` if it does not exist).
-- `-a, --agent <ID>` - Explicit session ID (auto-detected from environment by default).
+- `--agent <ID>` - Explicit session ID (auto-detected from environment by default).
 
 ## Description
 

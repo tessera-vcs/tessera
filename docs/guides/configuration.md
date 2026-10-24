@@ -20,9 +20,10 @@ To share configuration across your team in version control, create a `tessera.to
 
 ```toml
 trunk_branch = "main"
-base_port = 4000
+base_port = 3000
 port_stride = 100
-verify_cmd = ["npm", "run", "build"]
+port_isolation = true
+verify_command = "npm run build"
 
 cow_cache_dirs = [
   "node_modules",
@@ -69,24 +70,24 @@ tes config set trunk_branch main
 #### `base_port`
 
 - **Type:** `number`
-- **Default:** `4000`
+- **Default:** `3000`
 - **Description:** Starting port used when calculating isolated session ports (`PORT = base_port + slot * port_stride`).
 
 ```toml
-base_port = 4000
+base_port = 3000
 ```
 
 Update via CLI:
 
 ```bash:no-line-numbers
-tes config set base_port 4000
+tes config set base_port 3000
 ```
 
 #### `port_stride`
 
 - **Type:** `number`
 - **Default:** `100`
-- **Description:** Port increment between session slots (e.g., Slot 1 receives `4100`, Slot 2 receives `4200`).
+- **Description:** Port increment between session slots (e.g., Slot 1 receives `3100`, Slot 2 receives `3200`).
 
 ```toml
 port_stride = 100
@@ -98,20 +99,38 @@ Update via CLI:
 tes config set port_stride 100
 ```
 
-#### `verify_cmd`
+#### `port_isolation`
 
-- **Type:** `string[]`
-- **Default:** `[]`
-- **Description:** Optional verification command executed automatically before `tes merge` finalizes.
+- **Type:** `boolean`
+- **Default:** `false`
+- **Description:** When enabled (`true`) or when `TES_PORT_ISOLATION=1` is set in the environment, `tes env` and `tes exec` automatically export `PORT` and framework port environment variables (`VITE_PORT`, `PORT`, `FLASK_RUN_PORT`, etc.) and prepend CLI port-wrapper shims (`TES_SHIM_BIN`) for each session slot.
 
 ```toml
-verify_cmd = ["npm", "test"]
+port_isolation = true
 ```
 
 Update via CLI:
 
 ```bash:no-line-numbers
-tes config set verify_cmd "npm test"
+tes config set port_isolation true
+```
+
+#### `verify_command`
+
+- **Type:** `string | null`
+- **Default:** `null`
+- **Description:** Optional verification command executed automatically when running `tes merge --verify` or `tes commit --verify`.
+
+```toml
+verify_command = "npm test"
+```
+
+Update via CLI:
+
+```bash:no-line-numbers
+tes config set verify_command "npm test"
+# or using the shorthand flag:
+tes config --verify-cmd "npm test"
 ```
 
 #### `co_author`
@@ -171,11 +190,10 @@ tes config set pager "delta --paging=always"
 - **Default:** `["node_modules", ".pnpm-store", ".next", ".nuxt", ".svelte-kit", ".turbo", ".parcel-cache", ".vite", "target", ".venv", "venv", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox", "vendor", ".bundle", "_build", "deps", ".gradle", "build", ".build", "cmake-build-debug", "cmake-build-release", ".zig-cache", "zig-out", "bin", "obj", ".dart_tool"]`
 - **Description:** Dependency and build cache directories cloned via Copy-on-Write into every branch sandbox.
 
-Add or remove directories via CLI:
+Add directories via CLI:
 
 ```bash:no-line-numbers
 tes config add-cache-dir .nx .angular
-tes config remove-cache-dir .angular
 ```
 
 #### `extra_bin_dirs`
@@ -184,11 +202,22 @@ tes config remove-cache-dir .angular
 - **Default:** `["node_modules/.bin", ".venv/bin", "venv/bin", "vendor/bin", "bin"]`
 - **Description:** Relative directories inside the branch sandbox prepended to `PATH` during `tes exec`.
 
-Add or remove binary directories via CLI:
+Add binary directories via CLI:
 
 ```bash:no-line-numbers
 tes config add-bin-dir ./scripts ./tools/bin
-tes config remove-bin-dir ./scripts
+```
+
+#### `package_globs`
+
+- **Type:** `string[]`
+- **Default:** `["crates/*", "packages/*", "apps/*", "services/*", "libs/*"]`
+- **Description:** Monorepo workspace or package glob patterns scanned when discovering nested dependency caches.
+
+Add package globs via CLI:
+
+```bash:no-line-numbers
+tes config add-package-glob "modules/*" "plugins/*"
 ```
 
 ### Environment Variables
@@ -205,12 +234,11 @@ DATABASE_URL = "postgres://localhost:5432/app_test_{slot}"
 APP_URL = "http://localhost:{port}"
 ```
 
-Set or remove environment templates via CLI:
+Set environment templates via CLI:
 
 ```bash:no-line-numbers
 tes config set-env DATABASE_URL "postgres://localhost:5432/app_test_{slot}"
 tes config set-env APP_URL "http://localhost:{port}"
-tes config unset-env APP_URL
 ```
 
 ### Repository Trust (`tessera.toml`)

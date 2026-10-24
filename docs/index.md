@@ -117,11 +117,11 @@ tes radar
 # Enable (tes:<branch>) in your shell prompt
 tes env --install
 
-# Terminal 1: run feat/pricing on port 4100
+# Terminal 1: run feat/pricing on port 3100
 tes switch feat/pricing
 npm run dev
 
-# Terminal 2: run feat/faq on port 4200
+# Terminal 2: run feat/faq on port 3200
 tes switch feat/faq
 npm run dev
 ```
@@ -169,11 +169,11 @@ tes radar
 # Enable (tes:<branch>) in your shell prompt
 tes env --install
 
-# Terminal 1: run feat/pricing on port 4100
+# Terminal 1: run feat/pricing on port 3100
 tes switch feat/pricing
 npm run dev
 
-# Terminal 2: run feat/faq on port 4200
+# Terminal 2: run feat/faq on port 3200
 tes switch feat/faq
 npm run dev
 ```

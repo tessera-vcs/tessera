@@ -25,14 +25,20 @@ Each terminal tab executes against its own branch's files and dependencies witho
 
 ## Running Dev Servers
 
-To preview two feature branches in your browser at the same time, switch each terminal tab to its branch and start your dev server:
+To preview two feature branches in your browser at the same time with automatic port isolation, enable `port_isolation`:
+
+```bash:no-line-numbers
+tes config set port_isolation true
+```
+
+Then switch each terminal tab to its branch and start your dev server:
 
 **Terminal 1:**
 
 ```bash:no-line-numbers
 tes switch feat/pricing
 npm run dev
-# TES_PORT=4100
+# TES_PORT=3100
 ```
 
 **Terminal 2:**
@@ -40,17 +46,17 @@ npm run dev
 ```bash:no-line-numbers
 tes switch feat/faq
 npm run dev
-# TES_PORT=4200
+# TES_PORT=3200
 ```
 
 Or run them explicitly with `tes exec -b <branch>`:
 
 ```bash:no-line-numbers
 # Terminal 1
-tes exec -b feat/pricing -- npm run dev -- --port 4100
+tes exec -b feat/pricing -- npm run dev -- --port 3100
 
 # Terminal 2
-tes exec -b feat/faq -- npm run dev -- --port 4200
+tes exec -b feat/faq -- npm run dev -- --port 3200
 ```
 
 ## One-Off Commands
@@ -94,9 +100,9 @@ Each session slot (`1`, `2`, `3`, ...) receives non-overlapping environment vari
 
 | Variable | Slot 1 | Slot 2 | Description |
 |----------|--------|--------|-------------|
-| `PORT` / `TES_PORT` | `4100` | `4200` | Calculated as `base_port + (slot * port_stride)` |
+| `TES_PORT` (`PORT` when `port_isolation = true`) | `3100` | `3200` | Calculated as `base_port + (slot * port_stride)` |
 | `TES_BRANCH` | `feat/pricing` | `feat/faq` | Target branch name for the session |
 | `TES_DB_NAME` | `tessera_slot_1` | `tessera_slot_2` | Isolated database name for integration tests |
 | `DATABASE_URL` | `sqlite:///.../tessera_slot_1.db` | `sqlite:///.../tessera_slot_2.db` | Isolated database connection URL |
 
-To customize `base_port`, `port_stride`, or custom environment variable templates, see the [Configuration Guide](/guides/configuration).
+To customize `base_port`, `port_stride`, `port_isolation`, or custom environment variable templates, see the [Configuration Guide](/guides/configuration).

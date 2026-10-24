@@ -22,7 +22,7 @@ Tessera lets multiple agents and terminal tabs work in the **same repository fol
 
 When an agent claims a branch like `feat/pricing`, Tessera isolates that session inside `.git/tessera/` without changing `.git/HEAD` for the rest of your workspace. Both agents can edit `src/App.vue` on their own branches in `~/acme-web` at the same time without touching each other's uncommitted files.
 
-When you want to preview or test a branch, `tes exec -b feat/pricing -- npm run dev` starts the dev server inside a copy-on-write sandbox. It clones your existing `node_modules`, `target`, or `.venv` directory in milliseconds using filesystem reflinks and assigns each branch its own port (`localhost:4100`, `localhost:4200`) so you can open both branches side by side in your browser.
+When you want to preview or test a branch, `tes exec -b feat/pricing -- npm run dev` starts the dev server inside a copy-on-write sandbox. It clones your existing `node_modules`, `target`, or `.venv` directory in milliseconds using filesystem reflinks and assigns each branch its own port (`localhost:3100`, `localhost:3200`) so you can open both branches side by side in your browser.
 
 ## Merging by Syntax Tree
 

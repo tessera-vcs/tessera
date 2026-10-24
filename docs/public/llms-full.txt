@@ -48,8 +48,8 @@ In standard Git, every open terminal and AI agent shares a single `.git/HEAD` an
        │
        ▼
 3. Branch Dev Servers (Copy-on-Write node_modules / target)
-   ├─ http://localhost:4100 (feat/pricing)
-   └─ http://localhost:4200 (feat/faq)
+   ├─ http://localhost:3100 (feat/pricing)
+   └─ http://localhost:3200 (feat/faq)
        │
        ▼
 4. Merge into main (3-Way Tree-sitter AST Merge)
@@ -116,11 +116,11 @@ tes radar
 # Enable (tes:<branch>) in your shell prompt
 tes env --install
 
-# Terminal 1: run feat/pricing on port 4100
+# Terminal 1: run feat/pricing on port 3100
 tes switch feat/pricing
 npm run dev
 
-# Terminal 2: run feat/faq on port 4200
+# Terminal 2: run feat/faq on port 3200
 tes switch feat/faq
 npm run dev
 ```
@@ -221,11 +221,11 @@ In standard Git, running two AI agents on two different branches requires creati
 With Tessera, you work inside a **single repository folder**:
 
 ```bash
-# Terminal 1 works on feat/pricing (assigned port 4100)
+# Terminal 1 works on feat/pricing (assigned port 3100)
 tes switch feat/pricing
 npm run dev
 
-# Terminal 2 works on feat/faq in the same folder (assigned port 4200)
+# Terminal 2 works on feat/faq in the same folder (assigned port 3200)
 tes switch feat/faq
 npm run dev
 ```
@@ -274,8 +274,8 @@ Tessera lets multiple agents and terminal tabs work in the **same repository fol
        │
        ▼
 3. Branch Dev Servers (Copy-on-Write node_modules / target)
-   ├─ http://localhost:4100 (feat/pricing)
-   └─ http://localhost:4200 (feat/faq)
+   ├─ http://localhost:3100 (feat/pricing)
+   └─ http://localhost:3200 (feat/faq)
        │
        ▼
 4. Merge into main (3-Way Tree-sitter AST Merge)
@@ -284,7 +284,7 @@ Tessera lets multiple agents and terminal tabs work in the **same repository fol
 
 When an agent claims a branch like `feat/pricing`, Tessera isolates that session inside `.git/tessera/` without changing `.git/HEAD` for the rest of your workspace. Both agents can edit `src/App.vue` on their own branches in `~/acme-web` at the same time without touching each other's uncommitted files.
 
-When you want to preview or test a branch, `tes exec -b feat/pricing -- npm run dev` starts the dev server inside a copy-on-write sandbox. It clones your existing `node_modules`, `target`, or `.venv` directory in milliseconds using filesystem reflinks and assigns each branch its own port (`localhost:4100`, `localhost:4200`) so you can open both branches side by side in your browser.
+When you want to preview or test a branch, `tes exec -b feat/pricing -- npm run dev` starts the dev server inside a copy-on-write sandbox. It clones your existing `node_modules`, `target`, or `.venv` directory in milliseconds using filesystem reflinks and assigns each branch its own port (`localhost:3100`, `localhost:3200`) so you can open both branches side by side in your browser.
 
 ## Merging by Syntax Tree
 
@@ -336,7 +336,7 @@ Tessera is lightweight and self-contained:
 
 ### macOS, Linux, and BSD
 
-Install `tes` on macOS (Apple Silicon & Intel), Linux (`x86_64` & `ARM64`, glibc & musl), FreeBSD, OpenBSD, or NetBSD:
+Install `tes` on macOS (Apple Silicon & Intel), Linux (`x86_64` & `ARM64`, glibc & musl), FreeBSD, or OpenBSD:
 
 ```bash
 curl -fsSL https://tessera.getlunaris.dev/install.sh | sh
@@ -350,7 +350,7 @@ Install `tes.exe` on Windows (`x86_64` and `ARM64`) using PowerShell:
 irm https://tessera.getlunaris.dev/install.ps1 | iex
 ```
 
-The Windows installer verifies the SHA-256 checksum, extracts `tes.exe` into `$HOME\.local\bin`, adds it to your user `Path`, and configures your PowerShell `$PROFILE`.
+The Windows installer verifies the SHA-256 checksum, extracts `tes.exe` into `$HOME\.local\bin`, and adds it to your user `Path`.
 
 ### Prebuilt Binaries
 
@@ -358,16 +358,15 @@ You can also download prebuilt archives directly from GitHub Releases:
 
 | Platform                           | Architecture                            | Release Archive                                                                  |
 | ---------------------------------- | --------------------------------------- | -------------------------------------------------------------------------------- |
-| **macOS**                          | Apple Silicon (`arm64`)                 | `tes-aarch64-apple-darwin.tar.gz`                                                |
-| **macOS**                          | Intel (`x86_64`)                        | `tes-x86_64-apple-darwin.tar.gz`                                                 |
-| **Linux**                          | `x86_64` (static musl / glibc)          | `tes-x86_64-unknown-linux-musl.tar.gz` / `tes-x86_64-unknown-linux-gnu.tar.gz`   |
-| **Linux**                          | `ARM64` (`aarch64` static musl / glibc) | `tes-aarch64-unknown-linux-musl.tar.gz` / `tes-aarch64-unknown-linux-gnu.tar.gz` |
-| **Windows**                        | `x86_64` (MSVC)                         | `tes-x86_64-pc-windows-msvc.zip`                                                 |
-| **Windows**                        | `ARM64` (MSVC)                          | `tes-aarch64-pc-windows-msvc.zip`                                                |
-| **FreeBSD**                        | `x86_64`                                | `tes-x86_64-unknown-freebsd.tar.gz`                                              |
-| **OpenBSD**                        | `x86_64`                                | `tes-x86_64-unknown-openbsd.tar.gz`                                              |
-| **NetBSD**                         | `x86_64`                                | `tes-x86_64-unknown-netbsd.tar.gz`                                               |
-| **VS Code / Antigravity / Cursor** | Universal `.vsix`                       | `tessera-vscode.vsix`                                                            |
+| **macOS**                          | Apple Silicon (`arm64`)                 | [`tes-aarch64-apple-darwin.tar.gz`](https://github.com/tessera-vcs/tessera/releases/latest/download/tes-aarch64-apple-darwin.tar.gz) |
+| **macOS**                          | Intel (`x86_64`)                        | [`tes-x86_64-apple-darwin.tar.gz`](https://github.com/tessera-vcs/tessera/releases/latest/download/tes-x86_64-apple-darwin.tar.gz) |
+| **Linux**                          | `x86_64` (static musl / glibc)          | [`tes-x86_64-unknown-linux-musl.tar.gz`](https://github.com/tessera-vcs/tessera/releases/latest/download/tes-x86_64-unknown-linux-musl.tar.gz) / [`tes-x86_64-unknown-linux-gnu.tar.gz`](https://github.com/tessera-vcs/tessera/releases/latest/download/tes-x86_64-unknown-linux-gnu.tar.gz) |
+| **Linux**                          | `ARM64` (`aarch64` static musl / glibc) | [`tes-aarch64-unknown-linux-musl.tar.gz`](https://github.com/tessera-vcs/tessera/releases/latest/download/tes-aarch64-unknown-linux-musl.tar.gz) / [`tes-aarch64-unknown-linux-gnu.tar.gz`](https://github.com/tessera-vcs/tessera/releases/latest/download/tes-aarch64-unknown-linux-gnu.tar.gz) |
+| **Windows**                        | `x86_64` (MSVC)                         | [`tes-x86_64-pc-windows-msvc.zip`](https://github.com/tessera-vcs/tessera/releases/latest/download/tes-x86_64-pc-windows-msvc.zip) |
+| **Windows**                        | `ARM64` (MSVC)                          | [`tes-aarch64-pc-windows-msvc.zip`](https://github.com/tessera-vcs/tessera/releases/latest/download/tes-aarch64-pc-windows-msvc.zip) |
+| **FreeBSD**                        | `x86_64`                                | [`tes-x86_64-unknown-freebsd.tar.gz`](https://github.com/tessera-vcs/tessera/releases/latest/download/tes-x86_64-unknown-freebsd.tar.gz) |
+| **OpenBSD**                        | `x86_64`                                | [`tes-x86_64-unknown-openbsd.tar.gz`](https://github.com/tessera-vcs/tessera/releases/latest/download/tes-x86_64-unknown-openbsd.tar.gz) |
+| **VS Code / Antigravity / Cursor** | Universal `.vsix`                       | [`tessera-vscode.vsix`](https://github.com/tessera-vcs/tessera/releases/latest/download/tessera-vscode.vsix) |
 
 Verify the installation:
 
@@ -468,6 +467,37 @@ tes init --harness vscode
 tes init --harness all
 ```
 
+## Uninstalling Tessera
+
+### 1. Remove Shell Integration
+
+If you configured shell prompt integration (`tes env --install`), remove the `tes env` line from your shell profile:
+
+- **Zsh (`~/.zshrc`)**: remove `eval "$(tes env --zsh 2>/dev/null)"`
+- **Bash (`~/.bashrc`, `~/.bash_profile`)**: remove `eval "$(tes env --bash 2>/dev/null)"`
+- **POSIX `sh` (`~/.profile`, `~/.kshrc`, `~/.mkshrc`)**: remove `eval "$(tes env --sh 2>/dev/null)"`
+- **Fish (`~/.config/fish/config.fish`)**: remove `tes env --fish 2>/dev/null | source`
+- **`tcsh` / `csh` (`~/.tcshrc`, `~/.cshrc`)**: remove `` eval "`tes env --tcsh`" ``
+- **PowerShell (`$PROFILE`)**: remove `Invoke-Expression (& tes env --pwsh)`
+
+### 2. Delete the CLI Binary
+
+**macOS, Linux, and BSD:**
+
+```bash
+rm -f ~/.local/bin/tes
+```
+
+**Windows (PowerShell):**
+
+```powershell
+Remove-Item -Force "$HOME\.local\bin\tes.exe"
+```
+
+### 3. Clean Up Repository State (Optional)
+
+Inside any repository where you ran `tes init`, Tessera stores its metadata and sandboxes in `.git/tessera` (and Git hooks that automatically no-op when `tes` is not installed). To remove the local Tessera state from a repository, delete `.git/tessera`.
+
 ---
 
 ## Next Steps
@@ -494,8 +524,8 @@ In this guide, you will initialize Tessera in a project, work across two feature
        │
        ▼
 3. Branch Dev Servers (Copy-on-Write node_modules / target)
-   ├─ http://localhost:4100 (feat/pricing)
-   └─ http://localhost:4200 (feat/faq)
+   ├─ http://localhost:3100 (feat/pricing)
+   └─ http://localhost:3200 (feat/faq)
        │
        ▼
 4. Merge into main (3-Way Tree-sitter AST Merge)
@@ -568,7 +598,7 @@ tes diff -b feat/faq
 
 **`tes radar`**
 - Shows every active AI agent or terminal session
-- Displays each session's target branch, assigned port (`:4100`, `:4200`), and claimed files
+- Displays each session's target branch, assigned port (`:3100`, `:3200`), and claimed files
 
 **`tes status`**
 - **Staged / Session Changes**: Files recorded in the current session (`M`, `A`, `D`)
@@ -756,7 +786,7 @@ Tessera separates **per-terminal branches**, **per-agent branches**, and your **
 ```text
 [Architecture: Editor, Terminal & Agent Branches in One Folder]
 - Editor Working Tree : .git/HEAD stays on main in VS Code / Antigravity IDE
-- Terminal Tabs       : tes switch feat/pricing (:4100) | tes switch feat/faq (:4200)
+- Terminal Tabs       : tes switch feat/pricing (:3100) | tes switch feat/faq (:3200)
 - Agent Branches      : tes claim --branch isolates agent edits inside .git/tessera/
 - Switch or Merge     : tes switch <branch> --editor  OR  tes merge ... --into main
 ```
@@ -879,14 +909,20 @@ Each terminal tab executes against its own branch's files and dependencies witho
 
 ## Running Dev Servers
 
-To preview two feature branches in your browser at the same time, switch each terminal tab to its branch and start your dev server:
+To preview two feature branches in your browser at the same time with automatic port isolation, enable `port_isolation`:
+
+```bash
+tes config set port_isolation true
+```
+
+Then switch each terminal tab to its branch and start your dev server:
 
 **Terminal 1:**
 
 ```bash
 tes switch feat/pricing
 npm run dev
-# TES_PORT=4100
+# TES_PORT=3100
 ```
 
 **Terminal 2:**
@@ -894,17 +930,17 @@ npm run dev
 ```bash
 tes switch feat/faq
 npm run dev
-# TES_PORT=4200
+# TES_PORT=3200
 ```
 
 Or run them explicitly with `tes exec -b <branch>`:
 
 ```bash
 # Terminal 1
-tes exec -b feat/pricing -- npm run dev -- --port 4100
+tes exec -b feat/pricing -- npm run dev -- --port 3100
 
 # Terminal 2
-tes exec -b feat/faq -- npm run dev -- --port 4200
+tes exec -b feat/faq -- npm run dev -- --port 3200
 ```
 
 ## One-Off Commands
@@ -948,12 +984,12 @@ Each session slot (`1`, `2`, `3`, ...) receives non-overlapping environment vari
 
 | Variable | Slot 1 | Slot 2 | Description |
 |----------|--------|--------|-------------|
-| `PORT` / `TES_PORT` | `4100` | `4200` | Calculated as `base_port + (slot * port_stride)` |
+| `TES_PORT` (`PORT` when `port_isolation = true`) | `3100` | `3200` | Calculated as `base_port + (slot * port_stride)` |
 | `TES_BRANCH` | `feat/pricing` | `feat/faq` | Target branch name for the session |
 | `TES_DB_NAME` | `tessera_slot_1` | `tessera_slot_2` | Isolated database name for integration tests |
 | `DATABASE_URL` | `sqlite:///.../tessera_slot_1.db` | `sqlite:///.../tessera_slot_2.db` | Isolated database connection URL |
 
-To customize `base_port`, `port_stride`, or custom environment variable templates, see the [Configuration Guide](/guides/configuration).
+To customize `base_port`, `port_stride`, `port_isolation`, or custom environment variable templates, see the [Configuration Guide](/guides/configuration).
 
 ---
 
@@ -1164,9 +1200,10 @@ To share configuration across your team in version control, create a `tessera.to
 
 ```toml
 trunk_branch = "main"
-base_port = 4000
+base_port = 3000
 port_stride = 100
-verify_cmd = ["npm", "run", "build"]
+port_isolation = true
+verify_command = "npm run build"
 
 cow_cache_dirs = [
   "node_modules",
@@ -1213,24 +1250,24 @@ tes config set trunk_branch main
 #### `base_port`
 
 - **Type:** `number`
-- **Default:** `4000`
+- **Default:** `3000`
 - **Description:** Starting port used when calculating isolated session ports (`PORT = base_port + slot * port_stride`).
 
 ```toml
-base_port = 4000
+base_port = 3000
 ```
 
 Update via CLI:
 
 ```bash
-tes config set base_port 4000
+tes config set base_port 3000
 ```
 
 #### `port_stride`
 
 - **Type:** `number`
 - **Default:** `100`
-- **Description:** Port increment between session slots (e.g., Slot 1 receives `4100`, Slot 2 receives `4200`).
+- **Description:** Port increment between session slots (e.g., Slot 1 receives `3100`, Slot 2 receives `3200`).
 
 ```toml
 port_stride = 100
@@ -1242,20 +1279,38 @@ Update via CLI:
 tes config set port_stride 100
 ```
 
-#### `verify_cmd`
+#### `port_isolation`
 
-- **Type:** `string[]`
-- **Default:** `[]`
-- **Description:** Optional verification command executed automatically before `tes merge` finalizes.
+- **Type:** `boolean`
+- **Default:** `false`
+- **Description:** When enabled (`true`) or when `TES_PORT_ISOLATION=1` is set in the environment, `tes env` and `tes exec` automatically export `PORT` and framework port environment variables (`VITE_PORT`, `PORT`, `FLASK_RUN_PORT`, etc.) and prepend CLI port-wrapper shims (`TES_SHIM_BIN`) for each session slot.
 
 ```toml
-verify_cmd = ["npm", "test"]
+port_isolation = true
 ```
 
 Update via CLI:
 
 ```bash
-tes config set verify_cmd "npm test"
+tes config set port_isolation true
+```
+
+#### `verify_command`
+
+- **Type:** `string | null`
+- **Default:** `null`
+- **Description:** Optional verification command executed automatically when running `tes merge --verify` or `tes commit --verify`.
+
+```toml
+verify_command = "npm test"
+```
+
+Update via CLI:
+
+```bash
+tes config set verify_command "npm test"
+# or using the shorthand flag:
+tes config --verify-cmd "npm test"
 ```
 
 #### `co_author`
@@ -1315,11 +1370,10 @@ tes config set pager "delta --paging=always"
 - **Default:** `["node_modules", ".pnpm-store", ".next", ".nuxt", ".svelte-kit", ".turbo", ".parcel-cache", ".vite", "target", ".venv", "venv", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox", "vendor", ".bundle", "_build", "deps", ".gradle", "build", ".build", "cmake-build-debug", "cmake-build-release", ".zig-cache", "zig-out", "bin", "obj", ".dart_tool"]`
 - **Description:** Dependency and build cache directories cloned via Copy-on-Write into every branch sandbox.
 
-Add or remove directories via CLI:
+Add directories via CLI:
 
 ```bash
 tes config add-cache-dir .nx .angular
-tes config remove-cache-dir .angular
 ```
 
 #### `extra_bin_dirs`
@@ -1328,11 +1382,22 @@ tes config remove-cache-dir .angular
 - **Default:** `["node_modules/.bin", ".venv/bin", "venv/bin", "vendor/bin", "bin"]`
 - **Description:** Relative directories inside the branch sandbox prepended to `PATH` during `tes exec`.
 
-Add or remove binary directories via CLI:
+Add binary directories via CLI:
 
 ```bash
 tes config add-bin-dir ./scripts ./tools/bin
-tes config remove-bin-dir ./scripts
+```
+
+#### `package_globs`
+
+- **Type:** `string[]`
+- **Default:** `["crates/*", "packages/*", "apps/*", "services/*", "libs/*"]`
+- **Description:** Monorepo workspace or package glob patterns scanned when discovering nested dependency caches.
+
+Add package globs via CLI:
+
+```bash
+tes config add-package-glob "modules/*" "plugins/*"
 ```
 
 ### Environment Variables
@@ -1349,12 +1414,11 @@ DATABASE_URL = "postgres://localhost:5432/app_test_{slot}"
 APP_URL = "http://localhost:{port}"
 ```
 
-Set or remove environment templates via CLI:
+Set environment templates via CLI:
 
 ```bash
 tes config set-env DATABASE_URL "postgres://localhost:5432/app_test_{slot}"
 tes config set-env APP_URL "http://localhost:{port}"
-tes config unset-env APP_URL
 ```
 
 ### Repository Trust (`tessera.toml`)
@@ -1503,8 +1567,8 @@ This example shows two agents building separate features on `feat/pricing` and `
        │
        ▼
 3. Branch Dev Servers (Copy-on-Write node_modules / target)
-   ├─ http://localhost:4100 (feat/pricing)
-   └─ http://localhost:4200 (feat/faq)
+   ├─ http://localhost:3100 (feat/pricing)
+   └─ http://localhost:3200 (feat/faq)
        │
        ▼
 4. Merge into main (3-Way Tree-sitter AST Merge)
@@ -1937,9 +2001,9 @@ tes claim --intent <TEXT> [options] <files...>
 
 ## Options
 
-- `-i, --intent <TEXT>` - Concise description of the task being performed.
+- `--intent <TEXT>` - Concise description of the task being performed.
 - `-b, --branch <BRANCH>` - Target branch for the session (created from `HEAD` if it does not exist).
-- `-a, --agent <ID>` - Explicit session ID (auto-detected from environment by default).
+- `--agent <ID>` - Explicit session ID (auto-detected from environment by default).
 
 ## Description
 
@@ -2447,7 +2511,7 @@ tes resolve <path> --strategy <strategy>
 
 ## Options
 
-- `-s, --strategy <STRATEGY>` - Resolution strategy (`ast-union`, `ours`, `theirs`, or `working`).
+- `--strategy <STRATEGY>` - Resolution strategy (`ast-union`, `ours`, `theirs`, `working`, or `content`).
 
 ## Description
 
@@ -2598,15 +2662,17 @@ tes config <subcommand> [arguments]
 ## Subcommands
 
 - `show` - Display the effective configuration for the repository.
-- `set <KEY> <VALUE>` - Update `trunk_branch`, `base_port`, `port_stride`, `verify_command`, `co_author`, `co_author_trailer`, or `pager`.
-- `trust` - Trust the repository's `tessera.toml` so `verify_command`, `pager`, and `extra_bin_dirs` defined in `tessera.toml` are allowed to execute.
+- `set <KEY> <VALUE>` - Update `trunk_branch`, `base_port`, `port_stride`, `port_isolation`, `verify_command`, `watch_interval_ms`, `watch_timeout_secs`, `co_author`, `co_author_trailer`, `auto_isolate_dirty_claims`, or `pager`.
+- `trust` - Trust the repository's `tessera.toml` so `verify_command`, `pager`, `extra_bin_dirs`, and `custom_env` defined in `tessera.toml` are allowed to execute.
 - `untrust` - Revoke trust for the repository's `tessera.toml`.
 - `add-cache-dir <DIRS...>` - Add directories to `cow_cache_dirs`.
-- `remove-cache-dir <DIRS...>` - Remove directories from `cow_cache_dirs`.
 - `add-bin-dir <DIRS...>` - Add directories to `extra_bin_dirs`.
-- `remove-bin-dir <DIRS...>` - Remove directories from `extra_bin_dirs`.
+- `add-package-glob <GLOBS...>` - Add monorepo package glob patterns to `package_globs`.
 - `set-env <KEY> <TEMPLATE>` - Set a custom environment variable template (`{slot}`, `{port}`, `{branch}`, `{agent_id}`).
-- `unset-env <KEY>` - Remove a custom environment variable template.
+
+## Options
+
+- `--verify-cmd <CMD>` - Shorthand to set `verify_command` directly (`tes config --verify-cmd "npm test"`).
 
 ## Examples
 
@@ -2614,8 +2680,9 @@ tes config <subcommand> [arguments]
 # view current configuration
 tes config show
 
-# update base port and verification command
-tes config set base_port 4000
+# update base port, port isolation, and verification command
+tes config set base_port 3000
+tes config set port_isolation true
 tes config set verify_command "npm test"
 
 # enable Co-authored-by trailer on Tessera commits (false by default)

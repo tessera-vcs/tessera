@@ -70,7 +70,7 @@ tes diff -b feat/faq
 
 **`tes radar`**
 - Shows every active AI agent or terminal session
-- Displays each session's target branch, assigned port (`:4100`, `:4200`), and claimed files
+- Displays each session's target branch, assigned port (`:3100`, `:3200`), and claimed files
 
 **`tes status`**
 - **Staged / Session Changes**: Files recorded in the current session (`M`, `A`, `D`)

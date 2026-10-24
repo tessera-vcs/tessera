@@ -78,11 +78,11 @@ In standard Git, running two AI agents on two different branches requires creati
 With Tessera, you work inside a **single repository folder**:
 
 ```bash:no-line-numbers
-# Terminal 1 works on feat/pricing (assigned port 4100)
+# Terminal 1 works on feat/pricing (assigned port 3100)
 tes switch feat/pricing
 npm run dev
 
-# Terminal 2 works on feat/faq in the same folder (assigned port 4200)
+# Terminal 2 works on feat/faq in the same folder (assigned port 3200)
 tes switch feat/faq
 npm run dev
 ```

@@ -42,7 +42,7 @@ tes exec [-b <branch>] -- <command>
 - Materializes the branch's committed + uncommitted files inside a Copy-on-Write sandbox (`clonefile` on macOS APFS, `FICLONE` on Linux Btrfs/XFS/bcachefs).
 - Reuses `node_modules`, `target`, `.venv`, and `vendor` in milliseconds without extra disk space.
 - Injects isolated environment variables per session slot:
-  - `PORT` / `TES_PORT` (`4100`, `4200`, ...)
+  - `TES_PORT` (`3100`, `3200`, ...; also exports `PORT` when `port_isolation = true`)
   - `TES_BRANCH` (`<branch>`)
   - `TES_DB_NAME` (`tessera_slot_<N>`)
   - `DATABASE_URL` (`sqlite:///.../tessera_slot_<N>.db` or custom template from `tessera.toml`)
@@ -103,7 +103,7 @@ tes merge <branch1> [<branch2> ...] --into main -m "<commit message>"
 | `tes checkpoint` | `tes checkpoint <name>` |
 | `tes restore` | `tes restore [<rev>] [<paths...>] [-b <branch>] [--source <rev>]` |
 | `tes undo` | `tes undo [--op <operation-id>]` |
-| `tes config` | `tes config show \| set <k> <v> \| add-cache-dir <d> \| add-bin-dir <d> \| set-env <k> <v> \| trust \| untrust` |
+| `tes config` | `tes config show \| set <k> <v> \| add-cache-dir <d> \| add-package-glob <p> \| add-bin-dir <d> \| set-env <k> <v> \| trust \| untrust` |
 | `tes session` | `tes session focus <session-id>` (jumps to the terminal tab, tmux/zellij/kitty/wezterm pane, or IDE window) |
 
 ---

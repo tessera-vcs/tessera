@@ -186,7 +186,7 @@ onUnmounted(() => {
                 <rect x="132" y="29" width="56" height="16" rx="2.5" fill="var(--svg-blue-card-bg)" stroke="var(--accent-blue)" stroke-width="1.2" />
               </g>
               <g transform="translate(12, 7)">
-                <text x="30" y="10.5" class="svg-browser-url" fill="var(--svg-blue-text-bold)">localhost:4100 (feat/pricing)</text>
+                <text x="30" y="10.5" class="svg-browser-url" fill="var(--svg-blue-text-bold)">localhost:3100 (feat/pricing)</text>
                 <text x="36" y="40" text-anchor="middle" class="svg-card-txt" fill="var(--svg-blue-text)">Basic $0</text>
                 <text x="98" y="40" text-anchor="middle" class="svg-card-txt-bold" fill="var(--svg-blue-text-bold)">Pro $29</text>
                 <text x="160" y="40" text-anchor="middle" class="svg-card-txt" fill="var(--svg-blue-text)">Team $99</text>
@@ -205,7 +205,7 @@ onUnmounted(() => {
                 <line x1="14" y1="41.5" x2="122" y2="41.5" stroke="var(--svg-purple-line)" stroke-width="2" stroke-linecap="round" />
               </g>
               <g transform="translate(12, 62)">
-                <text x="30" y="10.5" class="svg-browser-url" fill="var(--svg-purple-text)">localhost:4200 (feat/faq)</text>
+                <text x="30" y="10.5" class="svg-browser-url" fill="var(--svg-purple-text)">localhost:3200 (feat/faq)</text>
               </g>
             </svg>
 
@@ -263,7 +263,7 @@ onUnmounted(() => {
                 <line x1="14" y1="66" x2="132" y2="66" stroke="var(--svg-purple-line)" stroke-width="2" stroke-linecap="round" />
               </g>
               <g transform="translate(12, 31)">
-                <text x="30" y="10.5" class="svg-browser-url" fill="var(--svg-green-text)">localhost:4000 (main)</text>
+                <text x="30" y="10.5" class="svg-browser-url" fill="var(--svg-green-text)">localhost:3000 (main)</text>
                 <text x="36" y="39.5" text-anchor="middle" class="svg-card-txt" fill="var(--svg-blue-text)">Basic $0</text>
                 <text x="98" y="39.5" text-anchor="middle" class="svg-card-txt-bold" fill="var(--svg-blue-text-bold)">Pro $29</text>
                 <text x="160" y="39.5" text-anchor="middle" class="svg-card-txt" fill="var(--svg-blue-text)">Team $99</text>

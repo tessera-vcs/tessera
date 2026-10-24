@@ -182,7 +182,7 @@ onUnmounted(() => {
                 <rect x="8" y="18" width="180" height="23" rx="3" fill="var(--svg-blue-card-bg)" stroke="var(--accent-blue)" stroke-width="1.1" />
               </g>
               <g transform="translate(12, 9)">
-                <text x="30" y="10.5" class="svg-browser-url" fill="var(--svg-blue-text-bold)">Slot 1 · :4100 (feat/pricing)</text>
+                <text x="30" y="10.5" class="svg-browser-url" fill="var(--svg-blue-text-bold)">Slot 1 · :3100 (feat/pricing)</text>
                 <text x="14" y="33" class="svg-mono-sub" fill="var(--svg-blue-text)">❯ tes exec -- npm run build  ✓</text>
               </g>
 
@@ -195,7 +195,7 @@ onUnmounted(() => {
                 <rect x="8" y="18" width="180" height="23" rx="3" fill="var(--svg-purple-card-bg)" stroke="var(--accent-purple)" stroke-width="1.1" />
               </g>
               <g transform="translate(12, 62)">
-                <text x="30" y="10.5" class="svg-browser-url" fill="var(--svg-purple-text)">Slot 2 · :4200 (feat/faq)</text>
+                <text x="30" y="10.5" class="svg-browser-url" fill="var(--svg-purple-text)">Slot 2 · :3200 (feat/faq)</text>
                 <text x="14" y="33" class="svg-mono-sub" fill="var(--svg-purple-line)">❯ tes exec -- npm run build  ✓</text>
               </g>
             </svg>

@@ -10,7 +10,7 @@ tes resolve <path> --strategy <strategy>
 
 ## Options
 
-- `-s, --strategy <STRATEGY>` - Resolution strategy (`ast-union`, `ours`, `theirs`, or `working`).
+- `--strategy <STRATEGY>` - Resolution strategy (`ast-union`, `ours`, `theirs`, `working`, or `content`).
 
 ## Description
 
