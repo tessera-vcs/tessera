@@ -1386,181 +1386,185 @@ fn slot_reuse_and_polyglot_port_isolation_across_shells_and_dev_servers() {
         );
     }
 
-    let fake_bin = repo.root.join("fake-bin");
-    fs::create_dir_all(&fake_bin).expect("create fake-bin");
+    #[cfg(unix)]
+    {
+        let fake_bin = repo.root.join("fake-bin");
+        fs::create_dir_all(&fake_bin).expect("create fake-bin");
 
-    for tool in [
-        "node", "bun", "deno", "npx", "python3", "uv", "mkdocs", "gunicorn", "php", "ruby",
-        "bundle", "hugo", "caddy", "dotnet", "mvn", "gradle", "sbt", "flutter",
-    ] {
-        let rel = format!("fake-bin/{tool}");
-        repo.write(&rel, "#!/bin/sh\nprintf '%s' \"$*\"\n");
-        repo.chmod(&rel, true);
-    }
+        for tool in [
+            "node", "bun", "deno", "npx", "python3", "uv", "mkdocs", "gunicorn", "php", "ruby",
+            "bundle", "hugo", "caddy", "dotnet", "mvn", "gradle", "sbt", "flutter",
+        ] {
+            let rel = format!("fake-bin/{tool}");
+            repo.write(&rel, "#!/bin/sh\nprintf '%s' \"$*\"\n");
+            repo.chmod(&rel, true);
+        }
 
-    let shim_dir = PathBuf::from(env1_json["shim_bin"].as_str().expect("shim_bin"));
-    let orig_path = std::env::var("PATH").unwrap_or_default();
-    let combined_path = format!("{}:{}:{orig_path}", shim_dir.display(), fake_bin.display());
+        let shim_dir = PathBuf::from(env1_json["shim_bin"].as_str().expect("shim_bin"));
+        let orig_path = std::env::var("PATH").unwrap_or_default();
+        let combined_path = format!("{}:{}:{orig_path}", shim_dir.display(), fake_bin.display());
 
-    let mut env_cmd = Command::new(Path::new(env!("CARGO_BIN_EXE_tes")));
-    env_cmd
-        .current_dir(&repo.root)
-        .env("TES_SESSION_ID", "term-1001")
-        .env("PATH", &combined_path)
-        .args(["env"]);
-    let out = env_cmd.output().expect("tes env with fake-bin");
-    assert!(out.status.success());
+        let mut env_cmd = Command::new(Path::new(env!("CARGO_BIN_EXE_tes")));
+        env_cmd
+            .current_dir(&repo.root)
+            .env("TES_SESSION_ID", "term-1001")
+            .env("PATH", &combined_path)
+            .args(["env"]);
+        let out = env_cmd.output().expect("tes env with fake-bin");
+        assert!(out.status.success());
 
-    let out_disabled = Command::new(shim_dir.join("node"))
-        .current_dir(&repo.root)
-        .env("PATH", &combined_path)
-        .env("PORT", "3100")
-        .env("TES_PORT", "3100")
-        .env_remove("TES_PORT_ISOLATION")
-        .args(["node_modules/.bin/vite"])
-        .output()
-        .expect("run shimmed binary without TES_PORT_ISOLATION");
-    assert!(out_disabled.status.success());
-    assert_eq!(
-        String::from_utf8_lossy(&out_disabled.stdout),
-        "node_modules/.bin/vite",
-        "shim must pass arguments untouched when TES_PORT_ISOLATION is not enabled"
-    );
-
-    let run_shimmed = |port: &str, prog: &str, args: &[&str]| -> String {
-        let out = Command::new(shim_dir.join(prog))
+        let out_disabled = Command::new(shim_dir.join("node"))
             .current_dir(&repo.root)
             .env("PATH", &combined_path)
-            .env("PORT", port)
-            .env("TES_PORT", port)
-            .env("TES_PORT_ISOLATION", "1")
-            .args(args)
+            .env("PORT", "3100")
+            .env("TES_PORT", "3100")
+            .env_remove("TES_PORT_ISOLATION")
+            .args(["node_modules/.bin/vite"])
             .output()
-            .expect("run shimmed binary");
-        assert!(out.status.success());
-        String::from_utf8_lossy(&out.stdout).to_string()
-    };
+            .expect("run shimmed binary without TES_PORT_ISOLATION");
+        assert!(out_disabled.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&out_disabled.stdout),
+            "node_modules/.bin/vite",
+            "shim must pass arguments untouched when TES_PORT_ISOLATION is not enabled"
+        );
 
-    assert_eq!(
-        run_shimmed("3100", "node", &["node_modules/.bin/vitepress", "dev", "docs"]),
-        "node_modules/.bin/vitepress dev docs --port 3100"
-    );
-    assert_eq!(
-        run_shimmed("3200", "node", &["node_modules/.bin/vite"]),
-        "node_modules/.bin/vite --port 3200"
-    );
-    assert_eq!(
-        run_shimmed("3100", "node", &["node_modules/next/dist/bin/next", "dev"]),
-        "node_modules/next/dist/bin/next dev -p 3100"
-    );
-    assert_eq!(
-        run_shimmed("3100", "node", &["node_modules/nuxi/bin/nuxi.mjs", "dev"]),
-        "node_modules/nuxi/bin/nuxi.mjs dev --port 3100"
-    );
-    assert_eq!(
-        run_shimmed("3100", "node", &["node_modules/@remix-run/dev/dist/cli.js", "vite:dev"]),
-        "node_modules/@remix-run/dev/dist/cli.js vite:dev --port 3100"
-    );
-    assert_eq!(
-        run_shimmed("3100", "node", &["node_modules/storybook/index.js", "dev"]),
-        "node_modules/storybook/index.js dev -p 3106"
-    );
-    assert_eq!(
-        run_shimmed("3100", "node", &["node_modules/prisma/build/index.js", "studio"]),
-        "node_modules/prisma/build/index.js studio --port 3108"
-    );
-    assert_eq!(
-        run_shimmed("3100", "bun", &["x", "astro", "dev"]),
-        "x astro dev --port 3100"
-    );
-    assert_eq!(
-        run_shimmed("3100", "npx", &["vite"]),
-        "vite --port 3100"
-    );
-    assert_eq!(
-        run_shimmed("3100", "deno", &["serve", "main.ts"]),
-        "serve main.ts --port 3100"
-    );
-    assert_eq!(
-        run_shimmed("3100", "python3", &["manage.py", "runserver"]),
-        "manage.py runserver 3100"
-    );
-    assert_eq!(
-        run_shimmed("3100", "python3", &["-m", "http.server"]),
-        "-m http.server 3100"
-    );
-    assert_eq!(
-        run_shimmed("3100", "uv", &["run", "uvicorn", "app:app"]),
-        "run uvicorn app:app --port 3100"
-    );
-    assert_eq!(
-        run_shimmed("3100", "uv", &["run", "python", "manage.py", "runserver"]),
-        "run python manage.py runserver 3100"
-    );
-    assert_eq!(
-        run_shimmed("3100", "mkdocs", &["serve"]),
-        "serve --dev-addr 127.0.0.1:3100"
-    );
-    assert_eq!(
-        run_shimmed("3100", "gunicorn", &["wsgi:app"]),
-        "wsgi:app --bind 127.0.0.1:3100"
-    );
-    assert_eq!(
-        run_shimmed("3100", "php", &["artisan", "serve"]),
-        "artisan serve --port=3100"
-    );
-    assert_eq!(
-        run_shimmed("3100", "php", &["artisan", "octane:start"]),
-        "artisan octane:start --port=3100"
-    );
-    assert_eq!(
-        run_shimmed("3100", "php", &["-S", "127.0.0.1:8000", "-t", "public"]),
-        "-S 127.0.0.1:3100 -t public"
-    );
-    assert_eq!(
-        run_shimmed("3100", "ruby", &["-run", "-e", "httpd", "."]),
-        "-run -e httpd . -p 3100"
-    );
-    assert_eq!(
-        run_shimmed("3100", "bundle", &["exec", "rails", "s"]),
-        "exec rails s -p 3100"
-    );
-    assert_eq!(
-        run_shimmed("3100", "hugo", &["server"]),
-        "server -p 3100"
-    );
-    assert_eq!(
-        run_shimmed("3100", "caddy", &["file-server"]),
-        "file-server --listen :3100"
-    );
-    assert_eq!(
-        run_shimmed("3100", "dotnet", &["run"]),
-        "run --urls http://localhost:3100"
-    );
-    assert_eq!(
-        run_shimmed("3100", "mvn", &["spring-boot:run"]),
-        "spring-boot:run -Dspring-boot.run.arguments=--server.port=3100 -Dserver.port=3100"
-    );
-    assert_eq!(
-        run_shimmed("3100", "gradle", &["bootRun"]),
-        "bootRun -Dserver.port=3100 -Dquarkus.http.port=3100"
-    );
-    assert_eq!(
-        run_shimmed("3100", "sbt", &["run"]),
-        "-Dhttp.port=3100 run"
-    );
-    assert_eq!(
-        run_shimmed("3100", "flutter", &["run", "-d", "web-server"]),
-        "run -d web-server --web-port=3109"
-    );
+        let run_shimmed = |port: &str, prog: &str, args: &[&str]| -> String {
+            let out = Command::new(shim_dir.join(prog))
+                .current_dir(&repo.root)
+                .env("PATH", &combined_path)
+                .env("PORT", port)
+                .env("TES_PORT", port)
+                .env("TES_PORT_ISOLATION", "1")
+                .args(args)
+                .output()
+                .expect("run shimmed binary");
+            assert!(out.status.success());
+            String::from_utf8_lossy(&out.stdout).to_string()
+        };
 
-    let lease_dir = shim_dir.join(".leases").join("3100");
-    fs::create_dir_all(&lease_dir).expect("create lease 3100");
-    fs::write(lease_dir.join("pid"), format!("{}\n", std::process::id())).expect("write live pid");
-    assert_eq!(
-        run_shimmed("3100", "node", &["node_modules/.bin/vite"]),
-        "node_modules/.bin/vite --port 3101",
-        "second concurrent server in the same session must step to 3101 when 3100 is leased"
-    );
-    let _ = fs::remove_file(lease_dir.join("pid"));
+        assert_eq!(
+            run_shimmed("3100", "node", &["node_modules/.bin/vitepress", "dev", "docs"]),
+            "node_modules/.bin/vitepress dev docs --port 3100"
+        );
+        assert_eq!(
+            run_shimmed("3200", "node", &["node_modules/.bin/vite"]),
+            "node_modules/.bin/vite --port 3200"
+        );
+        assert_eq!(
+            run_shimmed("3100", "node", &["node_modules/next/dist/bin/next", "dev"]),
+            "node_modules/next/dist/bin/next dev -p 3100"
+        );
+        assert_eq!(
+            run_shimmed("3100", "node", &["node_modules/nuxi/bin/nuxi.mjs", "dev"]),
+            "node_modules/nuxi/bin/nuxi.mjs dev --port 3100"
+        );
+        assert_eq!(
+            run_shimmed("3100", "node", &["node_modules/@remix-run/dev/dist/cli.js", "vite:dev"]),
+            "node_modules/@remix-run/dev/dist/cli.js vite:dev --port 3100"
+        );
+        assert_eq!(
+            run_shimmed("3100", "node", &["node_modules/storybook/index.js", "dev"]),
+            "node_modules/storybook/index.js dev -p 3106"
+        );
+        assert_eq!(
+            run_shimmed("3100", "node", &["node_modules/prisma/build/index.js", "studio"]),
+            "node_modules/prisma/build/index.js studio --port 3108"
+        );
+        assert_eq!(
+            run_shimmed("3100", "bun", &["x", "astro", "dev"]),
+            "x astro dev --port 3100"
+        );
+        assert_eq!(
+            run_shimmed("3100", "npx", &["vite"]),
+            "vite --port 3100"
+        );
+        assert_eq!(
+            run_shimmed("3100", "deno", &["serve", "main.ts"]),
+            "serve main.ts --port 3100"
+        );
+        assert_eq!(
+            run_shimmed("3100", "python3", &["manage.py", "runserver"]),
+            "manage.py runserver 3100"
+        );
+        assert_eq!(
+            run_shimmed("3100", "python3", &["-m", "http.server"]),
+            "-m http.server 3100"
+        );
+        assert_eq!(
+            run_shimmed("3100", "uv", &["run", "uvicorn", "app:app"]),
+            "run uvicorn app:app --port 3100"
+        );
+        assert_eq!(
+            run_shimmed("3100", "uv", &["run", "python", "manage.py", "runserver"]),
+            "run python manage.py runserver 3100"
+        );
+        assert_eq!(
+            run_shimmed("3100", "mkdocs", &["serve"]),
+            "serve --dev-addr 127.0.0.1:3100"
+        );
+        assert_eq!(
+            run_shimmed("3100", "gunicorn", &["wsgi:app"]),
+            "wsgi:app --bind 127.0.0.1:3100"
+        );
+        assert_eq!(
+            run_shimmed("3100", "php", &["artisan", "serve"]),
+            "artisan serve --port=3100"
+        );
+        assert_eq!(
+            run_shimmed("3100", "php", &["artisan", "octane:start"]),
+            "artisan octane:start --port=3100"
+        );
+        assert_eq!(
+            run_shimmed("3100", "php", &["-S", "127.0.0.1:8000", "-t", "public"]),
+            "-S 127.0.0.1:3100 -t public"
+        );
+        assert_eq!(
+            run_shimmed("3100", "ruby", &["-run", "-e", "httpd", "."]),
+            "-run -e httpd . -p 3100"
+        );
+        assert_eq!(
+            run_shimmed("3100", "bundle", &["exec", "rails", "s"]),
+            "exec rails s -p 3100"
+        );
+        assert_eq!(
+            run_shimmed("3100", "hugo", &["server"]),
+            "server -p 3100"
+        );
+        assert_eq!(
+            run_shimmed("3100", "caddy", &["file-server"]),
+            "file-server --listen :3100"
+        );
+        assert_eq!(
+            run_shimmed("3100", "dotnet", &["run"]),
+            "run --urls http://localhost:3100"
+        );
+        assert_eq!(
+            run_shimmed("3100", "mvn", &["spring-boot:run"]),
+            "spring-boot:run -Dspring-boot.run.arguments=--server.port=3100 -Dserver.port=3100"
+        );
+        assert_eq!(
+            run_shimmed("3100", "gradle", &["bootRun"]),
+            "bootRun -Dserver.port=3100 -Dquarkus.http.port=3100"
+        );
+        assert_eq!(
+            run_shimmed("3100", "sbt", &["run"]),
+            "-Dhttp.port=3100 run"
+        );
+        assert_eq!(
+            run_shimmed("3100", "flutter", &["run", "-d", "web-server"]),
+            "run -d web-server --web-port=3109"
+        );
+
+        let lease_dir = shim_dir.join(".leases").join("3100");
+        fs::create_dir_all(&lease_dir).expect("create lease 3100");
+        fs::write(lease_dir.join("pid"), format!("{}\n", std::process::id()))
+            .expect("write live pid");
+        assert_eq!(
+            run_shimmed("3100", "node", &["node_modules/.bin/vite"]),
+            "node_modules/.bin/vite --port 3101",
+            "second concurrent server in the same session must step to 3101 when 3100 is leased"
+        );
+        let _ = fs::remove_file(lease_dir.join("pid"));
+    }
 }

@@ -358,84 +358,62 @@ fn find_stable_session_ancestor_pid(start_pid: i32) -> i32 {
 }
 
 /// Queries `(parent_pid, command_name)` for `pid` using `/proc/<pid>/stat` when available,
-/// portable `ps` invocations on macOS and BSDs, or CIM on Windows.
+/// or portable `ps` invocations on macOS and BSDs.
 fn query_process_parent_and_name(pid: i32) -> Option<(i32, String)> {
-    // Fast path on Linux / NetBSD procfs: read `/proc/<pid>/stat` without spawning a subprocess.
-    if let Ok(stat_line) = fs::read_to_string(format!("/proc/{pid}/stat")) {
-        if let (Some(open_paren), Some(close_paren)) =
-            (stat_line.find('('), stat_line.rfind(')'))
-        {
-            if close_paren > open_paren {
-                let comm = stat_line[open_paren + 1..close_paren].trim().to_string();
-                let after = stat_line[close_paren + 1..].trim();
-                // Fields after `(comm)` in `/proc/<pid>/stat`: `state ppid pgrp session ...`
-                let mut fields = after.split_whitespace();
-                let _state = fields.next()?;
-                if let Some(ppid_str) = fields.next() {
-                    if let Ok(ppid) = ppid_str.parse::<i32>() {
-                        return Some((ppid, comm));
-                    }
-                }
-            }
-        }
-    }
-
-    #[cfg(target_os = "windows")]
+    #[cfg(unix)]
     {
-        if let Ok(out) = std::process::Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                &format!(
-                    "$p = Get-CimInstance Win32_Process -Filter 'ProcessId = {pid}'; if ($p) {{ \"$($p.ParentProcessId) $($p.Name)\" }}"
-                ),
-            ])
-            .output()
-        {
-            if out.status.success() {
-                let line = String::from_utf8_lossy(&out.stdout);
-                let mut parts = line.trim().splitn(2, char::is_whitespace);
-                if let (Some(ppid_str), Some(name)) = (parts.next(), parts.next()) {
-                    if let Ok(ppid) = ppid_str.trim().parse::<i32>() {
-                        let trimmed_name = name.trim();
-                        if !trimmed_name.is_empty() {
-                            return Some((ppid, trimmed_name.to_string()));
+        // Fast path on Linux / NetBSD procfs: read `/proc/<pid>/stat` without spawning a subprocess.
+        if let Ok(stat_line) = fs::read_to_string(format!("/proc/{pid}/stat")) {
+            if let (Some(open_paren), Some(close_paren)) =
+                (stat_line.find('('), stat_line.rfind(')'))
+            {
+                if close_paren > open_paren {
+                    let comm = stat_line[open_paren + 1..close_paren].trim().to_string();
+                    let after = stat_line[close_paren + 1..].trim();
+                    // Fields after `(comm)` in `/proc/<pid>/stat`: `state ppid pgrp session ...`
+                    let mut fields = after.split_whitespace();
+                    let _state = fields.next()?;
+                    if let Some(ppid_str) = fields.next() {
+                        if let Ok(ppid) = ppid_str.parse::<i32>() {
+                            return Some((ppid, comm));
                         }
                     }
                 }
             }
         }
-    }
 
-    // Portable POSIX / BSD `ps`: try `ppid=,comm=` (macOS, FreeBSD, NetBSD, Linux) and fall back to
-    // `ppid=,ucomm=` (OpenBSD, where `ucomm` is the short command keyword).
-    for format_arg in ["ppid=,comm=", "ppid=,ucomm="] {
-        let Ok(out) = std::process::Command::new("ps")
-            .args(["-o", format_arg, "-p", &pid.to_string()])
-            .output()
-        else {
-            continue;
-        };
+        // Portable POSIX / BSD `ps`: try `ppid=,comm=` (macOS, FreeBSD, NetBSD, Linux) and fall back to
+        // `ppid=,ucomm=` (OpenBSD, where `ucomm` is the short command keyword).
+        for format_arg in ["ppid=,comm=", "ppid=,ucomm="] {
+            let Ok(out) = std::process::Command::new("ps")
+                .args(["-o", format_arg, "-p", &pid.to_string()])
+                .output()
+            else {
+                continue;
+            };
 
-        if !out.status.success() {
-            continue;
-        }
+            if !out.status.success() {
+                continue;
+            }
 
-        let line = String::from_utf8_lossy(&out.stdout);
-        let trimmed = line.trim();
-        let mut parts = trimmed.splitn(2, char::is_whitespace);
-        let Some(ppid_str) = parts.next() else {
-            continue;
-        };
-        let comm = parts.next().unwrap_or("").trim().to_string();
+            let line = String::from_utf8_lossy(&out.stdout);
+            let trimmed = line.trim();
+            let mut parts = trimmed.splitn(2, char::is_whitespace);
+            let Some(ppid_str) = parts.next() else {
+                continue;
+            };
+            let comm = parts.next().unwrap_or("").trim().to_string();
 
-        if let Ok(ppid) = ppid_str.trim().parse::<i32>() {
-            if !comm.is_empty() {
-                return Some((ppid, comm));
+            if let Ok(ppid) = ppid_str.trim().parse::<i32>() {
+                if !comm.is_empty() {
+                    return Some((ppid, comm));
+                }
             }
         }
     }
+
+    #[cfg(not(unix))]
+    let _ = pid;
 
     None
 }
@@ -615,6 +593,7 @@ fn query_process_tty(pid: i32) -> Option<String> {
         return None;
     }
 
+    #[cfg(unix)]
     if let Ok(out) = std::process::Command::new("ps")
         .args(["-o", "tty=", "-p", &pid.to_string()])
         .output()
@@ -634,41 +613,8 @@ fn query_process_tty(pid: i32) -> Option<String> {
     }
 
     #[cfg(target_os = "windows")]
-    {
-        if std::env::var_os("WT_SESSION").is_some() {
-            return Some(format!("conpty:{pid}"));
-        }
-
-        let mut curr = pid;
-        for _ in 0..8 {
-            if curr <= 1 {
-                break;
-            }
-
-            let Some((next_ppid, comm)) = query_process_parent_and_name(curr) else {
-                break;
-            };
-            let lower = comm.to_ascii_lowercase();
-            if lower.contains("language_server") {
-                return None;
-            }
-
-            if lower.contains("windowsterminal")
-                || lower.contains("openconsole")
-                || lower.contains("conhost")
-                || lower.contains("alacritty")
-                || lower.contains("wezterm")
-                || lower.contains("mintty")
-                || lower.contains("conemu")
-            {
-                return Some(format!("conpty:{pid}"));
-            }
-
-            if next_ppid <= 1 || next_ppid == curr {
-                break;
-            }
-            curr = next_ppid;
-        }
+    if std::env::var_os("WT_SESSION").is_some() {
+        return Some(format!("conpty:{pid}"));
     }
 
     None

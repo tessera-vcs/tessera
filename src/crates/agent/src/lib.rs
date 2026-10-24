@@ -346,7 +346,17 @@ impl Coordinator {
                 .and_then(|s| s.parse::<i32>().ok());
 
             if let Some(pid) = pid_opt {
-                if pid > 1 && agent.intent_inferred && agent.workspace_path.is_none() {
+                let matches_shell_pid = agent
+                    .waypoint
+                    .as_ref()
+                    .and_then(|wp| wp.shell_pid)
+                    .is_some_and(|spid| spid == pid as u32);
+
+                if pid > 1
+                    && matches_shell_pid
+                    && agent.intent_inferred
+                    && agent.workspace_path.is_none()
+                {
                     let alive = crate::autopilot::is_process_alive(pid);
 
                     if !alive {
