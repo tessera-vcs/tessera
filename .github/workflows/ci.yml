@@ -207,7 +207,7 @@ jobs:
           npm i
           npm run docs:build
 
-      - name: Deploy Docs to Vercel (on main when docs/ changes)
+      - name: Deploy docs to Vercel
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         working-directory: docs
         env:
@@ -222,8 +222,5 @@ jobs:
           fi
 
           if git diff --name-only "$BEFORE_SHA" "${{ github.sha }}" -- . | grep -q .; then
-            echo "Changes detected in docs/ — deploying to Vercel production..."
             npx --yes vercel deploy --prod --yes --token="$VERCEL_TOKEN"
-          else
-            echo "No changes in docs/ — skipping Vercel deploy."
           fi

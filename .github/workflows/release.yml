@@ -292,7 +292,7 @@ jobs:
           generate_release_notes: true
           files: release-assets/*
 
-      - name: Deploy Docs to Vercel (if docs/ changed since previous release)
+      - name: Deploy docs to Vercel
         working-directory: docs
         env:
           VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
@@ -304,8 +304,5 @@ jobs:
           PREV_TAG="$(git tag --list 'v*' --sort=-creatordate | grep -vxF "$CURRENT_TAG" | head -n1 || true)"
 
           if [ -z "$PREV_TAG" ] || git diff --name-only "$PREV_TAG" "${{ github.sha }}" -- . | grep -q .; then
-            echo "Deploying docs/ to Vercel production for release ${CURRENT_TAG}..."
             npx --yes vercel deploy --prod --yes --token="$VERCEL_TOKEN"
-          else
-            echo "No changes in docs/ since ${PREV_TAG} — skipping Vercel deploy."
           fi
