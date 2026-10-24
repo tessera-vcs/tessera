@@ -1481,7 +1481,7 @@ fn linux_bsd_terminal_sessions_and_all_shell_env_hooks_e2e() {
 
     let fake_home = root.join("fake-home");
     fs::create_dir_all(fake_home.join(".config/fish")).expect("mkdir fish");
-    for rc in [".profile", ".kshrc", ".mkshrc", ".tcshrc", ".cshrc"] {
+    for rc in [".zshrc", ".profile", ".kshrc", ".mkshrc", ".tcshrc", ".cshrc"] {
         fs::write(fake_home.join(rc), "# existing profile\n").expect("write rc");
     }
 

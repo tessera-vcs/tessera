@@ -1203,32 +1203,9 @@ fn activate_host_terminal_window(wp: &SessionWaypoint) -> Option<(String, String
     #[cfg(target_os = "windows")]
     {
         if let Some(start_pid) = wp.shell_pid.and_then(|p| i32::try_from(p).ok()) {
-            let mut ancestor_pids = Vec::new();
-            let mut curr = start_pid;
-            for _ in 0..8 {
-                if curr <= 1 || wp.ide_pid.is_some_and(|ide| ide == curr as u32) {
-                    break;
-                }
-                ancestor_pids.push(curr);
-                let Some((next_ppid, comm)) = query_process_parent_and_name(curr) else {
-                    break;
-                };
-                if is_ide_process_name(&comm.to_ascii_lowercase())
-                    || next_ppid <= 1
-                    || next_ppid == curr
-                {
-                    break;
-                }
-                curr = next_ppid;
-            }
-
-            let pid_list = ancestor_pids
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(",");
+            let stop_ide_pid = wp.ide_pid.unwrap_or(0);
             let ps_script = format!(
-                "$ws = New-Object -ComObject WScript.Shell; foreach ($p in @({pid_list})) {{ if ($ws.AppActivate($p)) {{ Write-Output \"focused:$p\"; exit 0 }} }}; if ($ws.AppActivate('WindowsTerminal')) {{ Write-Output 'focused:wt'; exit 0 }}; exit 1"
+                "$ws = New-Object -ComObject WScript.Shell; $curr = {start_pid}; for ($i = 0; $i -lt 8; $i++) {{ if ($curr -le 1 -or $curr -eq {stop_ide_pid}) {{ break }}; if ($ws.AppActivate($curr)) {{ Write-Output \"focused:$curr\"; exit 0 }}; $proc = Get-CimInstance Win32_Process -Filter \"ProcessId = $curr\" -ErrorAction SilentlyContinue; if (-not $proc -or $proc.ParentProcessId -le 1 -or $proc.ParentProcessId -eq $curr) {{ break }}; $curr = $proc.ParentProcessId }}; if ($ws.AppActivate('WindowsTerminal')) {{ Write-Output 'focused:wt'; exit 0 }}; exit 1"
             );
 
             if let Ok(out) = std::process::Command::new("powershell")
@@ -3585,46 +3562,47 @@ fn try_acquire_watcher_lock(lock_path: &Path) -> Option<fs::File> {
 /// Ensures a background file watcher (`tes watch --auto-daemon`) is running for `repo_root`
 /// so rapid concurrent file writes are captured in `.git/objects` before `post-tool` hooks execute.
 pub fn ensure_background_watcher(repo_root: &Path, git_dir: &Path) {
-    let lock_file = git_dir.join("tessera").join("watch.lock");
     #[cfg(unix)]
     {
+        let lock_file = git_dir.join("tessera").join("watch.lock");
         let probe = try_acquire_watcher_lock(&lock_file);
         if probe.is_none() {
             return;
         }
         drop(probe);
-    }
 
-    let pid_file = git_dir.join("tessera").join("watch.pid");
-    if let Ok(raw_pid) = fs::read_to_string(&pid_file) {
-        if let Ok(pid) = raw_pid.trim().parse::<i32>() {
-            if is_process_alive(pid) {
-                return;
+        let pid_file = git_dir.join("tessera").join("watch.pid");
+        if let Ok(raw_pid) = fs::read_to_string(&pid_file) {
+            if let Ok(pid) = raw_pid.trim().parse::<i32>() {
+                if is_process_alive(pid) {
+                    return;
+                }
             }
         }
-    }
 
-    let exe_opt = std::env::current_exe().ok().filter(|p| {
-        p.file_stem()
-            .and_then(|s| s.to_str())
-            .is_some_and(|stem| stem == "tes")
-    });
-    if let Some(bin) = exe_opt {
-        let mut cmd = std::process::Command::new(bin);
-        cmd.args(["watch", "--auto-daemon"])
-            .current_dir(repo_root)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
+        let exe_opt = std::env::current_exe().ok().filter(|p| {
+            p.file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(|stem| stem == "tes")
+        });
 
-        #[cfg(unix)]
-        {
+        if let Some(bin) = exe_opt {
             use std::os::unix::process::CommandExt;
-            cmd.process_group(0);
-        }
 
-        let _ = cmd.spawn();
+            let mut cmd = std::process::Command::new(bin);
+            cmd.args(["watch", "--auto-daemon"])
+                .current_dir(repo_root)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .process_group(0);
+
+            let _ = cmd.spawn();
+        }
     }
+
+    #[cfg(not(unix))]
+    let _ = (repo_root, git_dir);
 }
 
 /// Runs the lightweight background micro-watcher that records intermediate disk blobs for

@@ -3768,7 +3768,17 @@ _tes_sync
 
                         println!("setenv TES_SHIM_BIN {};", tcsh_quote(&shim_bin_str));
                     } else {
-                        println!("unsetenv TES_PORT_ISOLATION; unsetenv TES_SHIM_BIN; unsetenv PORT;");
+                        let mut unset_cmds = String::from(
+                            "unsetenv TES_PORT_ISOLATION; unsetenv TES_SHIM_BIN; unsetenv PORT;",
+                        );
+
+                        for k in workspace::POLYGLOT_PORT_ENV_KEYS {
+                            if *k != "TES_PORT" && *k != "PORT" && std::env::var_os(k).is_some() {
+                                let _ = write!(unset_cmds, " unsetenv {k};");
+                            }
+                        }
+
+                        println!("{unset_cmds}");
                     }
 
                     println!("setenv TES_REPO_ROOT {};", tcsh_quote(&repo_root_str));
