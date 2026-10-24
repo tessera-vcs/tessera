@@ -5,21 +5,63 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
-    inputs:
-      tag:
-        description: "Release tag (e.g. v0.1.0)"
-        required: false
-        default: "v0.1.0"
 
 permissions:
   contents: write
+  actions: read
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  prepare:
+    name: Verify CI & Resolve Version
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract version from Cargo.toml and verify CI passed
+        id: meta
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          CARGO_VER="$(grep -m1 '^version =' src/Cargo.toml | cut -d'"' -f2)"
+          VSCODE_VER="$(node -p "require('./extensions/vscode/package.json').version")"
+
+          if [ -z "$CARGO_VER" ]; then
+            echo "❌ Failed to extract workspace version from src/Cargo.toml"
+            exit 1
+          fi
+
+          if [ "$CARGO_VER" != "$VSCODE_VER" ]; then
+            echo "❌ Version mismatch: src/Cargo.toml ($CARGO_VER) != extensions/vscode/package.json ($VSCODE_VER)"
+            exit 1
+          fi
+
+          TAG="v${CARGO_VER}"
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]] && [ "${GITHUB_REF_NAME}" != "$TAG" ]; then
+            echo "❌ Pushed git tag (${GITHUB_REF_NAME}) does not match src/Cargo.toml version ($TAG)"
+            exit 1
+          fi
+
+          PASSED_RUNS="$(gh api "/repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${GITHUB_SHA}&status=completed" --jq '.workflow_runs | map(select(.conclusion == "success")) | length')"
+          if [ "${PASSED_RUNS}" -lt 1 ]; then
+            echo "❌ Cannot release commit ${GITHUB_SHA}: no passed CI workflow run found for this commit."
+            exit 1
+          fi
+
+          echo "✅ Verified passed CI run for ${GITHUB_SHA}. Releasing ${TAG}."
+          echo "version=${CARGO_VER}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
   build-binaries:
     name: Build (${{ matrix.target }})
+    needs: prepare
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -131,6 +173,7 @@ jobs:
 
   build-bsd-binaries:
     name: Build BSD (${{ matrix.target }})
+    needs: prepare
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -180,6 +223,7 @@ jobs:
 
   build-vscode-extension:
     name: Package VS Code Extension (.vsix)
+    needs: prepare
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -188,7 +232,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "24"
 
       - name: Compile and package VSIX
         working-directory: extensions/vscode
@@ -208,6 +252,7 @@ jobs:
   publish-release:
     name: Publish GitHub Release
     needs:
+      - prepare
       - build-binaries
       - build-bsd-binaries
       - build-vscode-extension
@@ -233,9 +278,9 @@ jobs:
           ls -lh release-assets
 
       - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || inputs.tag }}
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          target_commitish: ${{ github.sha }}
           generate_release_notes: true
           files: release-assets/*

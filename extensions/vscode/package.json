@@ -4,7 +4,7 @@
   "description": "Run multiple AI agents and terminal sessions in the same Git repository.",
   "publisher": "Lunaris",
   "license": "MIT",
-  "version": "0.1.0",
+  "version": "0.0.1",
   "icon": "resources/logo.png",
   "homepage": "https://tessera.getlunaris.dev",
   "preview": true,
