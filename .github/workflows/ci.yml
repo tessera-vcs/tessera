@@ -10,8 +10,37 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  changes:
+    name: Detect Changed Paths
+    runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+      vscode: ${{ steps.filter.outputs.vscode }}
+      docs: ${{ steps.filter.outputs.docs }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check modified paths
+        uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            rust:
+              - 'src/**'
+              - 'scripts/**'
+              - '.github/workflows/ci.yml'
+            vscode:
+              - 'extensions/vscode/**'
+              - '.github/workflows/ci.yml'
+            docs:
+              - 'docs/**'
+              - '.github/workflows/ci.yml'
+
   rust-matrix:
     name: Rust Lint & Test (${{ matrix.os }})
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.rust == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -140,6 +169,8 @@ jobs:
 
   bsd-matrix:
     name: BSD Cross-Platform Tests (FreeBSD & OpenBSD)
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -183,6 +214,8 @@ jobs:
 
   vscode-and-docs:
     name: VS Code Extension & Docs Build
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.vscode == 'true' || needs.changes.outputs.docs == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -194,12 +227,14 @@ jobs:
           node-version: "24"
 
       - name: Build & Typecheck VS Code Extension
+        if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.vscode == 'true'
         working-directory: extensions/vscode
         run: |
           npm ci
           npm run compile
 
       - name: Build VitePress Documentation
+        if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.docs == 'true'
         working-directory: docs
         run: |
           npm ci
