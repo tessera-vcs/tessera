@@ -1,5 +1,5 @@
 #!/bin/sh
-# Cross-platform installer for Tessera (`tes`) across macOS, Linux, FreeBSD, OpenBSD, and NetBSD.
+# Cross-platform installer for Tessera (`tes`) across macOS, Linux, FreeBSD, and OpenBSD.
 set -eu
 
 REPO="${TES_GITHUB_REPO:-tessera-vcs/tessera}"
@@ -152,9 +152,6 @@ case "$OS" in
     ;;
   OpenBSD)
     TARGET="${RUST_ARCH}-unknown-openbsd"
-    ;;
-  NetBSD)
-    TARGET="${RUST_ARCH}-unknown-netbsd"
     ;;
   *)
     error "Unsupported operating system: $OS"

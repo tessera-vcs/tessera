@@ -24,7 +24,7 @@ tes env [options]
 
 The `env` command configures your shell so each terminal tab displays its active Tessera branch (`(tes:<branch>)`) in the prompt, enables `<TAB>` completion for subcommands, branches, and checkpoints, and routes commands in switched terminals to the active branch's Copy-on-Write sandbox.
 
-Even without `tes env` installed in your shell profile, Tessera automatically isolates terminal tabs across macOS, Linux, FreeBSD, OpenBSD, NetBSD, and Windows using terminal session environment variables (`TERM_SESSION_ID`, `ITERM_SESSION_ID`, `TMUX_PANE`, `ZELLIJ_PANE_ID`, `WEZTERM_PANE`, `KITTY_WINDOW_ID`, `GHOSTTY_SURFACE_ID`, `ALACRITTY_WINDOW_ID`, `GNOME_TERMINAL_SCREEN`, `KONSOLE_DBUS_SESSION`, `TILIX_ID`, `WT_SESSION`), POSIX session leader (`getsid(0)`), and Windows console/process tree tracking.
+Even without `tes env` installed in your shell profile, Tessera automatically isolates terminal tabs across macOS, Linux, FreeBSD, OpenBSD, and Windows using terminal session environment variables (`TERM_SESSION_ID`, `ITERM_SESSION_ID`, `TMUX_PANE`, `ZELLIJ_PANE_ID`, `WEZTERM_PANE`, `KITTY_WINDOW_ID`, `GHOSTTY_SURFACE_ID`, `ALACRITTY_WINDOW_ID`, `GNOME_TERMINAL_SCREEN`, `KONSOLE_DBUS_SESSION`, `TILIX_ID`, `WT_SESSION`), POSIX session leader (`getsid(0)`), and Windows console/process tree tracking.
 
 ## Examples
 

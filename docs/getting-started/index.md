@@ -4,7 +4,7 @@ Tessera works on top of your existing Git repository so multiple AI coding agent
 
 ## Prerequisites
 
-- **OS**: macOS, Linux, Windows, FreeBSD, OpenBSD, or NetBSD
+- **OS**: macOS, Linux, Windows, FreeBSD, or OpenBSD
 - **Git**: Standard Git 2.23+
 
 ## Installation
