@@ -148,7 +148,7 @@ pub fn is_ignored_or_secret_path(
 
 /// Parsed `.gitignore` or `.git/info/exclude` rule entry.
 #[derive(Debug, Clone)]
-struct IgnoreRule {
+pub(crate) struct IgnoreRule {
     /// Relative directory prefix where this rule was defined (empty for repository root).
     base_dir: String,
     /// `true` if the rule starts with `!` and re-includes previously ignored paths.
@@ -160,7 +160,7 @@ struct IgnoreRule {
 }
 
 /// Loads ignore rules from `.git/info/exclude` and `<working_dir>/.gitignore`.
-fn load_ignore_rules(working_dir: &Path, git_dir: &Path) -> Vec<IgnoreRule> {
+pub(crate) fn load_ignore_rules(working_dir: &Path, git_dir: &Path) -> Vec<IgnoreRule> {
     let mut rules = Vec::new();
     for path in [
         git_dir.join("info/exclude"),
@@ -172,11 +172,24 @@ fn load_ignore_rules(working_dir: &Path, git_dir: &Path) -> Vec<IgnoreRule> {
 }
 
 /// Appends parsed `.gitignore` rules from `path` scoped to `base_dir`.
-fn append_ignore_rules_from_file(path: &Path, base_dir: &str, rules: &mut Vec<IgnoreRule>) {
+pub(crate) fn append_ignore_rules_from_file(
+    path: &Path,
+    base_dir: &str,
+    rules: &mut Vec<IgnoreRule>,
+) {
     let Ok(raw) = fs::read_to_string(path) else {
         return;
     };
 
+    append_ignore_rules_from_str(&raw, base_dir, rules);
+}
+
+/// Appends parsed `.gitignore` rules from `raw` text scoped to `base_dir`.
+pub(crate) fn append_ignore_rules_from_str(
+    raw: &str,
+    base_dir: &str,
+    rules: &mut Vec<IgnoreRule>,
+) {
     for line in raw.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -207,7 +220,7 @@ fn append_ignore_rules_from_file(path: &Path, base_dir: &str, rules: &mut Vec<Ig
 }
 
 /// Evaluates whether `rel_path` is ignored according to `rules` (and built-in OS metadata and secret exclusions).
-fn is_path_ignored(rel_path: &str, is_dir: bool, rules: &[IgnoreRule]) -> bool {
+pub(crate) fn is_path_ignored(rel_path: &str, is_dir: bool, rules: &[IgnoreRule]) -> bool {
     let file_name = rel_path.rsplit('/').next().unwrap_or(rel_path);
     if file_name == ".DS_Store" {
         return true;
