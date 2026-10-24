@@ -1084,10 +1084,14 @@ impl GitBackend {
         message: &str,
     ) -> CoreResult<ObjectId> {
         let secs = now_millis() / 1000;
-        let clean_author: String = author_ident
+        let raw_clean: String = author_ident
             .chars()
             .filter(|c| !matches!(c, '\n' | '\r' | '\0'))
             .collect();
+        let clean_author = match raw_clean.rfind('>') {
+            Some(idx) => raw_clean[..=idx].trim(),
+            None => raw_clean.trim(),
+        };
         let mut body = String::new();
         body.push_str(&format!("tree {}\n", tree_id.as_str()));
 
