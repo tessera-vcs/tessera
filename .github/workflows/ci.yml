@@ -34,6 +34,20 @@ jobs:
         with:
           workspaces: src
 
+      - name: Install shells on Linux (zsh, bash, fish, dash, ksh, mksh, yash, tcsh, csh, elvish)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zsh bash fish dash ksh mksh yash tcsh csh elvish
+
+      - name: Install shells on macOS (bash 5, fish, dash, mksh, oksh, yash, elvish, nushell)
+        if: runner.os == 'macOS'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+        run: |
+          brew install --formula bash fish dash mksh oksh yash elvish nushell
+
       - name: Configure Git identity for tests
         run: |
           git config --global user.name "Tessera CI"
@@ -46,83 +60,20 @@ jobs:
 
       - name: Run workspace unit & integration tests
         working-directory: src
-        run: cargo test --workspace
+        run: cargo test --workspace --bins --lib --tests
 
-  multi-shell-e2e:
-    name: Multi-Shell Real-World E2E (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os:
-          - ubuntu-latest
-          - macos-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Cargo registry and target
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: src
-
-      - name: Install shells on Linux (zsh, bash, fish, dash, ksh, mksh, yash, tcsh, csh, elvish)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y zsh bash fish dash ksh mksh yash tcsh csh elvish
-
-      - name: Install shells on macOS (bash 5, fish, dash, mksh, oksh, yash, elvish, nushell)
-        if: runner.os == 'macOS'
-        run: |
-          brew install --formula bash fish dash mksh oksh yash elvish nushell
-
-      - name: Configure Git identity for multi-shell E2E
-        run: |
-          git config --global user.name "Tessera CI"
-          git config --global user.email "ci@tessera.getlunaris.dev"
-          git config --global init.defaultBranch main
-
-      - name: Build release binary
-        working-directory: src
-        run: cargo build --release -p cli
-
-      - name: Run multi-shell E2E suite
+      - name: Run multi-shell E2E suite (Linux & macOS)
+        if: runner.os != 'Windows'
         env:
-          TES_BIN: ${{ github.workspace }}/src/target/release/tes
+          TES_BIN: ${{ github.workspace }}/src/target/debug/tes
         run: ./scripts/ci_multi_shell_e2e.sh
 
-  windows-pwsh-e2e:
-    name: Windows PowerShell E2E (windows-latest)
-    runs-on: windows-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Cargo registry and target
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: src
-
-      - name: Build release binary
-        working-directory: src
-        run: cargo build --release -p cli
-
       - name: Run Windows PowerShell E2E lifecycle test
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          git config --global user.name "Tessera CI"
-          git config --global user.email "ci@tessera.getlunaris.dev"
-          git config --global init.defaultBranch main
-
-          $tesBin = Join-Path $PWD "src\target\release\tes.exe"
+          $tesBin = Join-Path $PWD "src\target\debug\tes.exe"
           $env:PATH = (Split-Path $tesBin -Parent) + ";" + $env:PATH
 
           $workDir = Join-Path $env:TEMP ("tes-win-e2e-" + [guid]::NewGuid().ToString("N"))
@@ -214,9 +165,8 @@ jobs:
             git config --global user.name "Tessera BSD CI"
             git config --global user.email "ci@tessera.getlunaris.dev"
             git config --global init.defaultBranch main
-            cargo test --manifest-path src/Cargo.toml --workspace
-            cargo build --manifest-path src/Cargo.toml --release -p cli
-            TES_BIN=./src/target/release/tes bash ./scripts/ci_multi_shell_e2e.sh
+            cargo test --manifest-path src/Cargo.toml --workspace --bins --lib --tests
+            TES_BIN=./src/target/debug/tes bash ./scripts/ci_multi_shell_e2e.sh
 
       - name: Run tests on OpenBSD
         if: matrix.os == 'openbsd'
@@ -228,9 +178,8 @@ jobs:
             git config --global user.name "Tessera BSD CI"
             git config --global user.email "ci@tessera.getlunaris.dev"
             git config --global init.defaultBranch main
-            cargo test --manifest-path src/Cargo.toml --workspace
-            cargo build --manifest-path src/Cargo.toml --release -p cli
-            TES_BIN=./src/target/release/tes bash ./scripts/ci_multi_shell_e2e.sh
+            cargo test --manifest-path src/Cargo.toml --workspace --bins --lib --tests
+            TES_BIN=./src/target/debug/tes bash ./scripts/ci_multi_shell_e2e.sh
 
   vscode-and-docs:
     name: VS Code Extension & Docs Build
@@ -242,7 +191,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "24"
 
       - name: Build & Typecheck VS Code Extension
         working-directory: extensions/vscode
