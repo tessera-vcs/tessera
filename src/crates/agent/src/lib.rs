@@ -1662,12 +1662,18 @@ impl Coordinator {
         let branch_cid = match self.git.resolve_ref(&ref_name)? {
             Some(cid) => cid,
             None => {
-                let head_cid = self
+                let target_cid = match self
                     .git
-                    .resolve_head_commit()?
-                    .ok_or_else(|| CoreError::NotFound("HEAD commit".to_string()))?;
-                self.git.update_ref(&ref_name, &head_cid)?;
-                head_cid
+                    .resolve_ref(&format!("refs/remotes/origin/{clean_branch}"))?
+                {
+                    Some(remote_cid) => remote_cid,
+                    None => self
+                        .git
+                        .resolve_head_commit()?
+                        .ok_or_else(|| CoreError::NotFound("HEAD commit".to_string()))?,
+                };
+                self.git.update_ref(&ref_name, &target_cid)?;
+                target_cid
             }
         };
         let branch_commit = self.git.read_commit(&branch_cid)?;
@@ -1762,12 +1768,18 @@ impl Coordinator {
         let branch_cid = match self.git.resolve_ref(&ref_name)? {
             Some(cid) => cid,
             None => {
-                let head_cid = self
+                let target_cid = match self
                     .git
-                    .resolve_head_commit()?
-                    .ok_or_else(|| CoreError::NotFound("HEAD commit".to_string()))?;
-                self.git.update_ref(&ref_name, &head_cid)?;
-                head_cid
+                    .resolve_ref(&format!("refs/remotes/origin/{clean_branch}"))?
+                {
+                    Some(remote_cid) => remote_cid,
+                    None => self
+                        .git
+                        .resolve_head_commit()?
+                        .ok_or_else(|| CoreError::NotFound("HEAD commit".to_string()))?,
+                };
+                self.git.update_ref(&ref_name, &target_cid)?;
+                target_cid
             }
         };
         let branch_commit = self.git.read_commit(&branch_cid)?;
@@ -6293,11 +6305,10 @@ impl Coordinator {
             .unwrap_or_else(|| current_head_branch.clone());
         validate_ref_name(&target_branch)?;
 
-        let old_cid = self
+        let existing_local_cid = self
             .git
-            .resolve_ref(&format!("refs/heads/{target_branch}"))?
-            .or_else(|| self.git.resolve_head_commit().ok().flatten())
-            .ok_or_else(|| CoreError::NotFound(format!("branch '{target_branch}'")))?;
+            .resolve_ref(&format!("refs/heads/{target_branch}"))?;
+        let fallback_head_cid = self.git.resolve_head_commit().ok().flatten();
 
         let fetch_out = Command::new("git")
             .env_remove("GIT_DIR")
@@ -6325,9 +6336,15 @@ impl Coordinator {
                 CoreError::NotFound(format!("remote ref '{clean_remote}/{target_branch}'"))
             })?;
 
-        let (new_cid, fast_forward) = if old_cid == remote_cid
-            || self.git.is_ancestor(&remote_cid, &old_cid)
-        {
+        let old_cid = existing_local_cid
+            .or(fallback_head_cid)
+            .unwrap_or(remote_cid);
+
+        let (new_cid, fast_forward) = if existing_local_cid.is_none() {
+            self.git
+                .update_ref(&format!("refs/heads/{target_branch}"), &remote_cid)?;
+            (remote_cid, true)
+        } else if old_cid == remote_cid || self.git.is_ancestor(&remote_cid, &old_cid) {
             (old_cid, true)
         } else if self.git.is_ancestor(&old_cid, &remote_cid) {
             self.git
