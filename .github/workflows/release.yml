@@ -210,7 +210,7 @@ jobs:
         working-directory: extensions/vscode
         run: |
           mkdir -p ../../dist
-          npm ci
+          npm i
           npm run compile
           npx --yes @vscode/vsce package --no-dependencies -o ../../dist/tessera-vscode.vsix
           (cd ../../dist && sha256sum tessera-vscode.vsix > tessera-vscode.vsix.sha256)
