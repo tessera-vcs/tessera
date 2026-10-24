@@ -11,12 +11,12 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.99"
+rust-version = "1.98"
 description = "Run multiple AI agents and terminal sessions in the same Git repository."
 license = "MIT"
 authors = ["Donald Pakkies <donaldpakkies@gmail.com>"]
 homepage = "https://tessera.getlunaris.dev"
-repository = "https://github.com/getLunaris/tessera"
+repository = "https://github.com/tessera-vcs/tessera"
 
 [workspace.dependencies]
 anyhow = "1.0.104"

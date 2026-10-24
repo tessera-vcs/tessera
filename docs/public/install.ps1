@@ -1,7 +1,7 @@
 # Cross-platform PowerShell installer for Tessera (`tes.exe`) on Windows (x86_64 and ARM64).
 $ErrorActionPreference = "Stop"
 
-$Repo = if ($env:TES_GITHUB_REPO) { $env:TES_GITHUB_REPO } else { "getLunaris/tessera" }
+$Repo = if ($env:TES_GITHUB_REPO) { $env:TES_GITHUB_REPO } else { "tessera-vcs/tessera" }
 $Version = if ($env:TES_VERSION) { $env:TES_VERSION } else { "latest" }
 $InstallDir = if ($env:TES_INSTALL_DIR) { $env:TES_INSTALL_DIR } else { Join-Path $HOME ".local\bin" }
 

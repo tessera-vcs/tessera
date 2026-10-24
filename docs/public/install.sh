@@ -2,7 +2,7 @@
 # Cross-platform installer for Tessera (`tes`) across macOS, Linux, FreeBSD, OpenBSD, and NetBSD.
 set -eu
 
-REPO="${TES_GITHUB_REPO:-getLunaris/tessera}"
+REPO="${TES_GITHUB_REPO:-tessera-vcs/tessera}"
 VERSION="${TES_VERSION:-latest}"
 INSTALL_DIR="${TES_INSTALL_DIR:-$HOME/.local/bin}"
 

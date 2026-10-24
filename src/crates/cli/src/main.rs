@@ -3595,66 +3595,10 @@ _tes_sync
 "#;
                 print!("{elvish_plugin}");
             } else if pwsh {
-                let pwsh_plugin = r#"# Tessera branch prompt integration for PowerShell (pwsh)
-$env:TES_SESSION_ID = "term-$PID"
-
-function global:_TesSyncEnv {
-    $env:TES_SESSION_ID = "term-$PID"
-    $tesCmd = Get-Command tes -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($tesCmd) {
-        $info = (& $tesCmd.Source env --json 2>$null | ConvertFrom-Json -ErrorAction SilentlyContinue)
-        if ($info -and $info.branch) {
-            $env:TES_BRANCH = $info.branch
-            $env:TES_PORT = "$($info.port)"
-            $env:TES_REPO_ROOT = $info.repo_root
-            if ($info.workspace) {
-                $env:TES_WORKSPACE = $info.workspace
-            } else {
-                Remove-Item Env:\TES_WORKSPACE -ErrorAction SilentlyContinue
-            }
-            return
-        }
-    }
-    Remove-Item Env:\TES_BRANCH -ErrorAction SilentlyContinue
-    Remove-Item Env:\TES_PORT -ErrorAction SilentlyContinue
-    Remove-Item Env:\TES_WORKSPACE -ErrorAction SilentlyContinue
-    Remove-Item Env:\TES_REPO_ROOT -ErrorAction SilentlyContinue
-}
-
-function global:tes {
-    $env:TES_SESSION_ID = "term-$PID"
-    $tesCmd = Get-Command tes -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($tesCmd) {
-        & $tesCmd.Source @args
-    }
-    _TesSyncEnv
-}
-
-Register-ArgumentCompleter -Native -CommandName tes -ScriptBlock {
-    param($wordToComplete, $commandAst, $cursorPosition)
-    $tokens = $commandAst.CommandElements | ForEach-Object { $_.Extent.Text }
-    $sub = if ($tokens.Count -ge 2) { $tokens[1] } else { "" }
-    $tesCmd = Get-Command tes -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($tesCmd) {
-        & $tesCmd.Source completions --current "$wordToComplete" --prev "$sub" --words ($tokens -join " ") 2>$null | ForEach-Object {
-            [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_)
-        }
-    }
-}
-
-if (-not (Test-Path Function:\_TesOrigPrompt)) {
-    Copy-Item Function:\prompt Function:\_TesOrigPrompt
-    function global:prompt {
-        _TesSyncEnv
-        if ($env:TES_BRANCH) {
-            Write-Host "(tes:$($env:TES_BRANCH)) " -NoNewline -ForegroundColor Cyan
-        }
-        _TesOrigPrompt
-    }
-}
-_TesSyncEnv
-"#;
-                print!("{pwsh_plugin}");
+                // Single-line output so `Invoke-Expression (& tes env --pwsh)` receives a single
+                // `System.String` rather than `System.Object[]` across Windows PowerShell and pwsh 7+.
+                let pwsh_plugin = r#"$env:TES_SESSION_ID = "term-$PID"; function global:_TesSyncEnv { $env:TES_SESSION_ID = "term-$PID"; $tesCmd = Get-Command tes -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1; if ($tesCmd) { $raw = (& $tesCmd.Source env --json 2>$null | Out-String); if ($raw) { $info = ($raw | ConvertFrom-Json -ErrorAction SilentlyContinue); if ($info -and $info.branch) { $env:TES_BRANCH = $info.branch; $env:TES_PORT = "$($info.port)"; $env:TES_REPO_ROOT = $info.repo_root; if ($info.workspace) { $env:TES_WORKSPACE = $info.workspace } else { Remove-Item Env:\TES_WORKSPACE -ErrorAction SilentlyContinue }; return } } }; Remove-Item Env:\TES_BRANCH -ErrorAction SilentlyContinue; Remove-Item Env:\TES_PORT -ErrorAction SilentlyContinue; Remove-Item Env:\TES_WORKSPACE -ErrorAction SilentlyContinue; Remove-Item Env:\TES_REPO_ROOT -ErrorAction SilentlyContinue }; function global:tes { $env:TES_SESSION_ID = "term-$PID"; $tesCmd = Get-Command tes -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1; if ($tesCmd) { & $tesCmd.Source @args }; _TesSyncEnv }; Register-ArgumentCompleter -Native -CommandName tes -ScriptBlock { param($wordToComplete, $commandAst, $cursorPosition); $tokens = $commandAst.CommandElements | ForEach-Object { $_.Extent.Text }; $sub = if ($tokens.Count -ge 2) { $tokens[1] } else { "" }; $tesCmd = Get-Command tes -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1; if ($tesCmd) { & $tesCmd.Source completions --current "$wordToComplete" --prev "$sub" --words ($tokens -join " ") 2>$null | ForEach-Object { [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_) } } }; if (-not (Test-Path Function:\_TesOrigPrompt)) { Copy-Item Function:\prompt Function:\_TesOrigPrompt; function global:prompt { _TesSyncEnv; if ($env:TES_BRANCH) { Write-Host "(tes:$($env:TES_BRANCH)) " -NoNewline -ForegroundColor Cyan }; _TesOrigPrompt } }; _TesSyncEnv"#;
+                println!("{pwsh_plugin}");
             } else if let Ok(coord) = Coordinator::open(&cwd) {
                 let session_id = detect_session_id(agent.as_deref());
                 let cfg = coord.oplog().load_config()?;

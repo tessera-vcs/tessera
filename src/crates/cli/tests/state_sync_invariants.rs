@@ -1195,12 +1195,21 @@ fn switch_cherry_pick_pull_resolve_and_stash_apply_preserve_git_status_parity() 
     let remote_tmp = tempfile::tempdir().expect("remote tempdir");
     let bare_path = remote_tmp.path().join("origin.git");
     let clone_path = remote_tmp.path().join("clone");
-    repo.git(&["init", "--bare", "-q", bare_path.to_str().expect("bare path")]);
+    repo.git(&[
+        "init",
+        "--bare",
+        "-b",
+        "main",
+        "-q",
+        bare_path.to_str().expect("bare path"),
+    ]);
     repo.git(&["remote", "add", "origin", bare_path.to_str().expect("bare path")]);
     repo.git(&["push", "-q", "-u", "origin", "main"]);
     repo.git(&[
         "clone",
         "-q",
+        "-b",
+        "main",
         bare_path.to_str().expect("bare path"),
         clone_path.to_str().expect("clone path"),
     ]);

@@ -16,10 +16,10 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/getLunaris/tessera.git"
+    "url": "git+https://github.com/tessera-vcs/tessera.git"
   },
   "bugs": {
-    "url": "https://github.com/getLunaris/tessera/issues"
+    "url": "https://github.com/tessera-vcs/tessera/issues"
   },
   "engines": {
     "vscode": "^1.107.0"

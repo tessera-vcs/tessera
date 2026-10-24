@@ -22,7 +22,7 @@ REMOTE="$WORK_ROOT/remote.git"
 mkdir -p "$REPO/src"
 unset GIT_DIR GIT_WORK_TREE
 
-git init --bare "$REMOTE" >/dev/null 2>&1
+git init --bare -b main "$REMOTE" >/dev/null 2>&1
 
 cat << 'EOF' > "$REPO/package.json"
 {

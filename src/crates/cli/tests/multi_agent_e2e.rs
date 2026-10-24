@@ -1693,7 +1693,7 @@ fn real_shell_binaries_zsh_bash_sh_dash_ksh_tcsh_fish_nu_elvish_e2e() {
                 .env_remove("GIT_WORK_TREE")
                 .env_remove("TES_SESSION_ID")
                 .env_remove("ANTIGRAVITY_CONVERSATION_ID")
-                .args(["-c", script])
+                .args(["-f", "-c", script])
                 .output()
                 .expect("run tcsh");
             let stdout = String::from_utf8_lossy(&out.stdout);

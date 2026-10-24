@@ -140,8 +140,6 @@ jobs:
             target: x86_64-unknown-freebsd
           - os: openbsd
             target: x86_64-unknown-openbsd
-          - os: netbsd
-            target: x86_64-unknown-netbsd
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -173,20 +171,6 @@ jobs:
             chmod +x stage/tes
             tar -C stage -czf "dist/tes-${{ matrix.target }}.tar.gz" tes
             (cd dist && sha256 -r "tes-${{ matrix.target }}.tar.gz" | awk '{print $1 "  " $2}' > "tes-${{ matrix.target }}.tar.gz.sha256")
-
-      - name: Build on NetBSD
-        if: matrix.os == 'netbsd'
-        uses: vmactions/netbsd-vm@v1
-        with:
-          usesh: true
-          prepare: pkgin -y install rust mozilla-rootcerts-openssl
-          run: |
-            cargo build --manifest-path src/Cargo.toml --release -p cli
-            mkdir -p dist stage
-            cp src/target/release/tes stage/tes
-            chmod +x stage/tes
-            tar -C stage -czf "dist/tes-${{ matrix.target }}.tar.gz" tes
-            (cd dist && cksum -a sha256 -n "tes-${{ matrix.target }}.tar.gz" | awk '{print $1 "  " $2}' > "tes-${{ matrix.target }}.tar.gz.sha256")
 
       - name: Upload BSD artifact
         uses: actions/upload-artifact@v4

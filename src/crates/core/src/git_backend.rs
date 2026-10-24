@@ -383,20 +383,7 @@ impl GitBackend {
                 source,
             })?;
 
-            let default_branch = Command::new("git")
-                .args(["config", "--get", "init.defaultBranch"])
-                .output()
-                .ok()
-                .filter(|o| o.status.success())
-                .and_then(|o| String::from_utf8(o.stdout).ok())
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty() && validate_ref_name(s).is_ok())
-                .unwrap_or_else(|| "main".to_string());
-
-            atomic_write_file(
-                &git_dir.join("HEAD"),
-                format!("ref: refs/heads/{default_branch}\n").as_bytes(),
-            )?;
+            atomic_write_file(&git_dir.join("HEAD"), b"ref: refs/heads/main\n")?;
         }
 
         let backend = Self::with_paths(repo_root.to_path_buf(), git_dir);

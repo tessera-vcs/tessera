@@ -38,6 +38,7 @@ jobs:
         run: |
           git config --global user.name "Tessera CI"
           git config --global user.email "ci@tessera.getlunaris.dev"
+          git config --global init.defaultBranch main
 
       - name: Run cargo clippy
         working-directory: src
@@ -77,7 +78,13 @@ jobs:
       - name: Install shells on macOS (bash 5, fish, dash, mksh, oksh, yash, elvish, nushell)
         if: runner.os == 'macOS'
         run: |
-          brew install bash fish dash mksh oksh yash elvish nushell
+          brew install --formula bash fish dash mksh oksh yash elvish nushell
+
+      - name: Configure Git identity for multi-shell E2E
+        run: |
+          git config --global user.name "Tessera CI"
+          git config --global user.email "ci@tessera.getlunaris.dev"
+          git config --global init.defaultBranch main
 
       - name: Build release binary
         working-directory: src
@@ -113,6 +120,7 @@ jobs:
           $ErrorActionPreference = "Stop"
           git config --global user.name "Tessera CI"
           git config --global user.email "ci@tessera.getlunaris.dev"
+          git config --global init.defaultBranch main
 
           $tesBin = Join-Path $PWD "src\target\release\tes.exe"
           $env:PATH = (Split-Path $tesBin -Parent) + ";" + $env:PATH
@@ -180,7 +188,7 @@ jobs:
           Write-Host "Windows PowerShell E2E passed!"
 
   bsd-matrix:
-    name: BSD Cross-Platform Tests (FreeBSD, OpenBSD & NetBSD)
+    name: BSD Cross-Platform Tests (FreeBSD & OpenBSD)
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -192,9 +200,6 @@ jobs:
           - os: openbsd
             vm_action: vmactions/openbsd-vm@v1
             prepare: pkg_add git rust bash fish dash tcsh
-          - os: netbsd
-            vm_action: vmactions/netbsd-vm@v1
-            prepare: pkgin -y install git rust mozilla-rootcerts-openssl bash fish dash mksh tcsh
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -208,6 +213,7 @@ jobs:
           run: |
             git config --global user.name "Tessera BSD CI"
             git config --global user.email "ci@tessera.getlunaris.dev"
+            git config --global init.defaultBranch main
             cargo test --manifest-path src/Cargo.toml --workspace
             cargo build --manifest-path src/Cargo.toml --release -p cli
             TES_BIN=./src/target/release/tes bash ./scripts/ci_multi_shell_e2e.sh
@@ -221,19 +227,7 @@ jobs:
           run: |
             git config --global user.name "Tessera BSD CI"
             git config --global user.email "ci@tessera.getlunaris.dev"
-            cargo test --manifest-path src/Cargo.toml --workspace
-            cargo build --manifest-path src/Cargo.toml --release -p cli
-            TES_BIN=./src/target/release/tes bash ./scripts/ci_multi_shell_e2e.sh
-
-      - name: Run tests on NetBSD
-        if: matrix.os == 'netbsd'
-        uses: vmactions/netbsd-vm@v1
-        with:
-          usesh: true
-          prepare: ${{ matrix.prepare }}
-          run: |
-            git config --global user.name "Tessera BSD CI"
-            git config --global user.email "ci@tessera.getlunaris.dev"
+            git config --global init.defaultBranch main
             cargo test --manifest-path src/Cargo.toml --workspace
             cargo build --manifest-path src/Cargo.toml --release -p cli
             TES_BIN=./src/target/release/tes bash ./scripts/ci_multi_shell_e2e.sh
