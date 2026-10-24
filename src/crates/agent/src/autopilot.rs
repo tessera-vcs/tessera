@@ -2267,7 +2267,7 @@ pub fn handle_post_tool_hook(
             }
         } else if disk_is_foreign_peer_own_blob {
             if let Some(obs_list) = current_op.view.observed_blobs.get(&normalized_path) {
-                let mut best_rescued: Option<(usize, ObjectId, String)> = None;
+                let mut best_rescued: Option<(isize, usize, ObjectId, String)> = None;
                 for obs_blob in obs_list.iter().rev() {
                     let owned_by_other = current_op
                         .view
@@ -2283,24 +2283,46 @@ pub fn handle_post_tool_hook(
                         if let Ok(obs_bytes) = coord.git().read_blob(obs_blob) {
                             let obs_str = String::from_utf8_lossy(&obs_bytes).into_owned();
                             if !crate::has_git_conflict_markers(&obs_str) {
-                                let score = score_blob_for_agent(
+                                let my_score = score_blob_for_agent(
                                     &base_str,
                                     &obs_str,
                                     &my_agent.intent,
                                     Some(my_eff_branch),
                                 );
-                                if best_rescued
-                                    .as_ref()
-                                    .is_none_or(|(best_s, _, _)| score > *best_s)
-                                {
-                                    best_rescued = Some((score, *obs_blob, obs_str));
+                                let max_other_score = current_op
+                                    .view
+                                    .agents
+                                    .iter()
+                                    .filter(|(other_id, other_agent)| {
+                                        is_active_peer(other_id, other_agent)
+                                            && !is_same_branch_peer(other_id, other_agent)
+                                            && !other_agent.owns_path(&normalized_path)
+                                    })
+                                    .map(|(_, other_agent)| {
+                                        score_blob_for_agent(
+                                            &base_str,
+                                            &obs_str,
+                                            &other_agent.intent,
+                                            Some(other_agent.effective_branch(&default_branch)),
+                                        )
+                                    })
+                                    .max()
+                                    .unwrap_or(0);
+                                let net_score =
+                                    (my_score as isize) - (max_other_score as isize);
+
+                                if best_rescued.as_ref().is_none_or(|(best_net, best_raw, _, _)| {
+                                    (net_score, my_score) > (*best_net, *best_raw)
+                                }) {
+                                    best_rescued =
+                                        Some((net_score, my_score, *obs_blob, obs_str));
                                 }
                             }
                         }
                     }
                 }
 
-                if let Some((_, rescued_blob, rescued_str)) = best_rescued {
+                if let Some((_, _, rescued_blob, rescued_str)) = best_rescued {
                     effective_my_blob = rescued_blob;
                     current_my_str = rescued_str;
                     untangled_cross_branch = true;
@@ -2663,6 +2685,16 @@ pub fn handle_post_tool_hook(
     let mut conflict_to_save: Option<ConflictRecord> = None;
     let mut merged_peer_blobs: Vec<ObjectId> = Vec::new();
 
+    let preserve_head_baseline_for_peer = my_eff_branch != default_branch
+        && current_op.view.agents.iter().any(|(other_id, other)| {
+            is_active_peer(other_id, other)
+                && !is_same_branch_peer(other_id, other)
+                && (other.targets_head_branch(&default_branch)
+                    || (!other.owns_path(&normalized_path)
+                        && !assigned_own_blobs.contains_key(other_id)
+                        && other.base_commit == my_agent.base_commit))
+        });
+
     if candidate_blobs.len() >= 2 {
         let (first_id, first_intent, first_blob_id) = &candidate_blobs[0];
         let first_bytes = coord.git().read_blob(first_blob_id)?;
@@ -2737,9 +2769,15 @@ pub fn handle_post_tool_hook(
                     && other.targets_head_branch(&default_branch)
                     && other.owns_path(&normalized_path)
             });
-        if !default_branch_peer_owns_path {
+        if !default_branch_peer_owns_path && !preserve_head_baseline_for_peer {
             atomic_write_file(&full_path, acc_str.as_bytes())?;
             crate::set_worktree_executable(&full_path, executable);
+        } else if preserve_head_baseline_for_peer {
+            if let Some(b_id) = base_blob {
+                if disk_after_blob != b_id && !crate::has_git_conflict_markers(&disk_after_str) {
+                    let _ = atomic_write_file(&full_path, &base_bytes);
+                }
+            }
         }
 
         final_disk_bytes = acc_str.into_bytes();
@@ -2749,6 +2787,12 @@ pub fn handle_post_tool_hook(
                 "[Tessera Auto-Merge]: Cleanly AST-merged concurrent edits to '{}'.",
                 normalized_path
             ));
+        }
+    } else if preserve_head_baseline_for_peer {
+        if let Some(b_id) = base_blob {
+            if disk_after_blob != b_id && !crate::has_git_conflict_markers(&disk_after_str) {
+                let _ = atomic_write_file(&full_path, &base_bytes);
+            }
         }
     } else if my_own_blob != disk_after_blob && !crate::has_git_conflict_markers(&disk_after_str) {
         let default_branch_peer_owns_path = edited_in_branch_sandbox
@@ -3689,6 +3733,11 @@ pub fn run_auto_watch_daemon(coord: &Coordinator) -> CoreResult<()> {
             break;
         }
 
+        let default_branch = coord
+            .git()
+            .current_branch_name()
+            .unwrap_or_else(|_| "main".to_string());
+
         let mut watched_paths = std::collections::BTreeSet::new();
         for agent in current.view.agents.values() {
             for p in agent.read_blobs.keys() {
@@ -3784,6 +3833,64 @@ pub fn run_auto_watch_daemon(coord: &Coordinator) -> CoreResult<()> {
                         Ok(())
                     },
                 );
+            }
+
+            let active_on_path: Vec<&core::AgentMetadata> = current
+                .view
+                .agents
+                .values()
+                .filter(|a| {
+                    let is_passive = (a.agent_id.starts_with("term-")
+                        || a.agent_id.starts_with("session-")
+                        || a.agent_id == "editor")
+                        && a.intent_inferred
+                        && a.claimed_symbols.is_empty()
+                        && !a.has_own_changes();
+                    !is_passive
+                        && (a.owns_path(&clean_rel)
+                            || a.read_blobs.contains_key(&clean_rel)
+                            || a.claimed_symbols.iter().any(|s| {
+                                s.split("::").next().unwrap_or(s.as_str()).trim() == clean_rel
+                            }))
+                })
+                .collect();
+
+            let distinct_branches: std::collections::BTreeSet<&str> = active_on_path
+                .iter()
+                .map(|a| a.effective_branch(&default_branch))
+                .collect();
+
+            if distinct_branches.len() >= 2
+                && !active_on_path
+                    .iter()
+                    .any(|a| a.targets_head_branch(&default_branch))
+            {
+                let baseline_opt = active_on_path
+                    .iter()
+                    .filter(|a| !a.owns_path(&clean_rel))
+                    .find_map(|a| a.read_blobs.get(&clean_rel).copied());
+
+                if let Some(base_b) = baseline_opt {
+                    if base_b != blob_id {
+                        if let Ok(base_bytes) = coord.git().read_blob(&base_b) {
+                            if atomic_write_file(&full_path, &base_bytes).is_ok() {
+                                if let Ok(restored_meta) = fs::symlink_metadata(&full_path) {
+                                    let r_size = restored_meta.len();
+                                    let (r_secs, r_nanos) = restored_meta
+                                        .modified()
+                                        .ok()
+                                        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                                        .map(|d| (d.as_secs(), d.subsec_nanos()))
+                                        .unwrap_or((0, 0));
+                                    last_stat.insert(
+                                        clean_rel.clone(),
+                                        (r_size, r_secs, r_nanos, base_b),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -4748,6 +4855,11 @@ mod tests {
         let pomodoro_code = "<script setup lang=\"ts\">\nconst mode = 'pomodoro'\n</script>\n<template>\n  <div>Pomodoro Focus Timer</div>\n</template>\n";
         fs::write(&app_vue, pomodoro_code).expect("write pomodoro");
         handle_post_tool_hook(&coord, "agent-pomodoro", "src/App.vue").expect("post-tool pomodoro");
+        assert_eq!(
+            fs::read_to_string(&app_vue).expect("read app_vue after first post-tool"),
+            "<script setup lang=\"ts\">\nimport HelloWorld from './components/HelloWorld.vue'\n</script>\n<template>\n  <HelloWorld />\n</template>\n",
+            "post-tool must restore HEAD baseline to repo_root while a cross-branch peer is still awaiting its first edit"
+        );
 
         // Simulate `tes exec` restoring `main` to `repo_root/src/App.vue`, followed by `agent-habit`
         // writing its Habit Tracker on disk and the background watcher recording it in `observed_blobs`

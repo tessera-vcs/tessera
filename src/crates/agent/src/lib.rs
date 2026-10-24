@@ -3032,44 +3032,68 @@ impl Coordinator {
 
         let mut outcomes = Vec::new();
         for (rel_path, entry) in &snap.files {
-            if base_files.get(rel_path).map(|e| &e.blob_id) == Some(&entry.blob_id) {
-                continue;
-            }
+            let claimed_by_me = session_claims_path(&meta, rel_path, &base_files);
+            let has_unreconciled_observed_blob = !meta.own_blobs.contains_key(rel_path)
+                && claimed_by_me
+                && current
+                    .view
+                    .observed_blobs
+                    .get(rel_path)
+                    .is_some_and(|obs_list| {
+                        obs_list.iter().any(|obs_b| {
+                            base_files.get(rel_path).map(|e| &e.blob_id) != Some(obs_b)
+                                && meta.read_blobs.get(rel_path) != Some(obs_b)
+                                && !committed_branch_trees
+                                    .iter()
+                                    .any(|bm| bm.get(rel_path).map(|e| &e.blob_id) == Some(obs_b))
+                                && !current
+                                    .view
+                                    .agents
+                                    .values()
+                                    .any(|a| a.own_blobs.get(rel_path) == Some(obs_b))
+                        })
+                    });
 
-            if meta.own_blobs.get(rel_path) == Some(&entry.blob_id) {
-                continue;
-            }
+            if !has_unreconciled_observed_blob {
+                if base_files.get(rel_path).map(|e| &e.blob_id) == Some(&entry.blob_id) {
+                    continue;
+                }
 
-            let baseline_blob = meta
-                .read_blobs
-                .get(rel_path)
-                .or_else(|| base_files.get(rel_path).map(|e| &e.blob_id));
-            if baseline_blob == Some(&entry.blob_id) {
-                continue;
-            }
+                if meta.own_blobs.get(rel_path) == Some(&entry.blob_id) {
+                    continue;
+                }
 
-            if committed_branch_trees
-                .iter()
-                .any(|bm| bm.get(rel_path).map(|e| &e.blob_id) == Some(&entry.blob_id))
-            {
-                continue;
-            }
+                let baseline_blob = meta
+                    .read_blobs
+                    .get(rel_path)
+                    .or_else(|| base_files.get(rel_path).map(|e| &e.blob_id));
+                if baseline_blob == Some(&entry.blob_id) {
+                    continue;
+                }
 
-            // If this exact disk blob was already reconciled into an active session's `own_blobs`
-            // (or is the post-hook merged `read_blobs` baseline of a session that already owns `rel_path`),
-            // skip it so we do not re-run `post-tool` on an already-reconciled file.
-            let already_reconciled = current.view.agents.values().any(|a| {
-                a.own_blobs.get(rel_path) == Some(&entry.blob_id)
-                    || (a.owns_path(rel_path) && a.read_blobs.get(rel_path) == Some(&entry.blob_id))
-            });
-            if already_reconciled {
-                continue;
+                if committed_branch_trees
+                    .iter()
+                    .any(|bm| bm.get(rel_path).map(|e| &e.blob_id) == Some(&entry.blob_id))
+                {
+                    continue;
+                }
+
+                // If this exact disk blob was already reconciled into an active session's `own_blobs`
+                // (or is the post-hook merged `read_blobs` baseline of a session that already owns `rel_path`),
+                // skip it so we do not re-run `post-tool` on an already-reconciled file.
+                let already_reconciled = current.view.agents.values().any(|a| {
+                    a.own_blobs.get(rel_path) == Some(&entry.blob_id)
+                        || (a.owns_path(rel_path)
+                            && a.read_blobs.get(rel_path) == Some(&entry.blob_id))
+                });
+                if already_reconciled {
+                    continue;
+                }
             }
 
             // If this session has explicit claims and did not claim `rel_path`, while another active
             // session did claim `rel_path` (or this session targets a non-HEAD branch), do not steal
             // unclaimed working-tree files from `repo_root`.
-            let claimed_by_me = session_claims_path(&meta, rel_path, &base_files);
             let claimed_by_other = current.view.agents.values().any(|a| {
                 a.agent_id != session_id && session_claims_path(a, rel_path, &base_files)
             });
