@@ -46,7 +46,9 @@ case "$OS" in
 esac
 
 ARCHIVE="tes-${TARGET}.tar.gz"
-if [ "$VERSION" = "latest" ]; then
+if [ -n "${TES_BASE_URL:-}" ]; then
+  BASE_URL="${TES_BASE_URL%/}"
+elif [ "$VERSION" = "latest" ]; then
   BASE_URL="https://github.com/${REPO}/releases/latest/download"
 else
   BASE_URL="https://github.com/${REPO}/releases/download/${VERSION}"
@@ -55,19 +57,25 @@ fi
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/tes-install.XXXXXX")"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
-echo "==> Downloading ${ARCHIVE} from ${BASE_URL}..."
+echo "Downloading ${ARCHIVE}..."
 if command -v curl >/dev/null 2>&1; then
-  curl -fsSL "${BASE_URL}/${ARCHIVE}" -o "${TMP_DIR}/${ARCHIVE}"
+  curl -fL --progress-bar "${BASE_URL}/${ARCHIVE}" -o "${TMP_DIR}/${ARCHIVE}"
   if [ "${TES_SKIP_CHECKSUM:-0}" != "1" ]; then
     curl -fsSL "${BASE_URL}/${ARCHIVE}.sha256" -o "${TMP_DIR}/${ARCHIVE}.sha256"
   fi
 elif command -v wget >/dev/null 2>&1; then
-  wget -qO "${TMP_DIR}/${ARCHIVE}" "${BASE_URL}/${ARCHIVE}"
+  wget --show-progress -qO "${TMP_DIR}/${ARCHIVE}" "${BASE_URL}/${ARCHIVE}" 2>/dev/null || \
+    wget -O "${TMP_DIR}/${ARCHIVE}" "${BASE_URL}/${ARCHIVE}"
   if [ "${TES_SKIP_CHECKSUM:-0}" != "1" ]; then
     wget -qO "${TMP_DIR}/${ARCHIVE}.sha256" "${BASE_URL}/${ARCHIVE}.sha256"
   fi
+elif command -v ftp >/dev/null 2>&1; then
+  ftp -o "${TMP_DIR}/${ARCHIVE}" "${BASE_URL}/${ARCHIVE}"
+  if [ "${TES_SKIP_CHECKSUM:-0}" != "1" ]; then
+    ftp -V -o "${TMP_DIR}/${ARCHIVE}.sha256" "${BASE_URL}/${ARCHIVE}.sha256"
+  fi
 else
-  echo "Error: curl or wget is required to download Tessera." >&2
+  echo "Error: curl, wget, or ftp is required." >&2
   exit 1
 fi
 
@@ -106,6 +114,5 @@ mkdir -p "${INSTALL_DIR}"
 cp "${TMP_DIR}/tes" "${INSTALL_DIR}/tes"
 chmod +x "${INSTALL_DIR}/tes"
 
-echo "✓ Installed tes to ${INSTALL_DIR}/tes"
-"${INSTALL_DIR}/tes" env --install || true
-echo "✓ Configured shell prompt integration (restart your terminal or reload your shell profile)."
+"${INSTALL_DIR}/tes" env --install >/dev/null 2>&1 || true
+echo "Installed tes to ${INSTALL_DIR}/tes"

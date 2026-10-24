@@ -19,7 +19,9 @@ switch ($Arch) {
 }
 
 $Archive = "tes-$Target.zip"
-if ($Version -eq "latest") {
+if ($env:TES_BASE_URL) {
+    $BaseUrl = $env:TES_BASE_URL.TrimEnd("/")
+} elseif ($Version -eq "latest") {
     $BaseUrl = "https://github.com/$Repo/releases/latest/download"
 } else {
     $BaseUrl = "https://github.com/$Repo/releases/download/$Version"
@@ -32,10 +34,27 @@ try {
     $ZipPath = Join-Path $TmpDir $Archive
     $ShaPath = Join-Path $TmpDir "$Archive.sha256"
 
-    Write-Host "==> Downloading $Archive from $BaseUrl..."
-    Invoke-WebRequest -Uri "$BaseUrl/$Archive" -OutFile $ZipPath -UseBasicParsing
+    Write-Host "Downloading $Archive..."
+    if (Get-Command curl.exe -ErrorAction SilentlyContinue) {
+        & curl.exe -fL --progress-bar "$BaseUrl/$Archive" -o $ZipPath
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to download $BaseUrl/$Archive"
+        }
+        if ($env:TES_SKIP_CHECKSUM -ne "1") {
+            & curl.exe -fsSL "$BaseUrl/$Archive.sha256" -o $ShaPath
+            if ($LASTEXITCODE -ne 0) {
+                throw "Failed to download $BaseUrl/$Archive.sha256"
+            }
+        }
+    } else {
+        $ProgressPreference = "Continue"
+        Invoke-WebRequest -Uri "$BaseUrl/$Archive" -OutFile $ZipPath -UseBasicParsing
+        if ($env:TES_SKIP_CHECKSUM -ne "1") {
+            Invoke-WebRequest -Uri "$BaseUrl/$Archive.sha256" -OutFile $ShaPath -UseBasicParsing
+        }
+    }
+
     if ($env:TES_SKIP_CHECKSUM -ne "1") {
-        Invoke-WebRequest -Uri "$BaseUrl/$Archive.sha256" -OutFile $ShaPath -UseBasicParsing
         if (-not (Test-Path $ShaPath)) {
             throw "Missing SHA-256 checksum file for $Archive"
         }
@@ -52,26 +71,27 @@ try {
     $DestBin = Join-Path $InstallDir "tes.exe"
     Copy-Item -Path (Join-Path $TmpDir "tes.exe") -Destination $DestBin -Force
 
-    $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
-    if (-not $UserPath) {
-        $UserPath = ""
+    if (-not $env:TES_INSTALL_DIR) {
+        $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
+        if (-not $UserPath) {
+            $UserPath = ""
+        }
+        $PathEntries = $UserPath -split ";" | Where-Object { $_ -ne "" }
+        if ($PathEntries -notcontains $InstallDir) {
+            $NewUserPath = if ($UserPath) { "$UserPath;$InstallDir" } else { $InstallDir }
+            [Environment]::SetEnvironmentVariable("Path", $NewUserPath, "User")
+        }
     }
-    $PathEntries = $UserPath -split ";" | Where-Object { $_ -ne "" }
-    if ($PathEntries -notcontains $InstallDir) {
-        $NewUserPath = if ($UserPath) { "$UserPath;$InstallDir" } else { $InstallDir }
-        [Environment]::SetEnvironmentVariable("Path", $NewUserPath, "User")
-    }
+
     if (($env:PATH -split ";") -notcontains $InstallDir) {
         $env:PATH = "$InstallDir;$env:PATH"
     }
 
-    Write-Host "✓ Installed tes to $DestBin"
     try {
-        & $DestBin env --install
+        & $DestBin env --install *>$null
     } catch {
-        # Ignore profile write warnings
     }
-    Write-Host "✓ Configured PowerShell prompt integration (restart your terminal or reload `$PROFILE)."
+    Write-Host "Installed tes to $DestBin"
 } finally {
     Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue
 }
