@@ -303,8 +303,17 @@ impl Repo {
     }
 
     fn sandbox_dir(&self, session: &str) -> PathBuf {
-        let out = self.tes(session, &["exec", "-b", "main", "--", "pwd"]);
-        PathBuf::from(out.lines().last().expect("pwd line").trim())
+        let _ = self.tes(session, &["exec", "-b", "main", "--", "git", "--version"]);
+        let canonical = fs::canonicalize(&self.root).unwrap_or_else(|_| self.root.clone());
+        let coord = agent::Coordinator::open(&canonical).expect("open coord for sandbox_dir");
+        let dir = coord.branch_sandbox_dir("main");
+        if dir.is_dir() {
+            dir
+        } else {
+            agent::Coordinator::open(&self.root)
+                .expect("open coord fallback")
+                .branch_sandbox_dir("main")
+        }
     }
 }
 
@@ -492,6 +501,7 @@ fn peer_deletions_survive_concurrent_peer_edits_in_every_commit_order() {
 /// Unhooked `chmod +x` / `chmod -x` must show up in `tes status`, be committed with the right Git
 /// modes (`100755` / `100644`), and leave the index and working tree in parity.
 #[test]
+#[cfg(unix)]
 fn unhooked_chmod_changes_are_tracked_and_committed_with_exact_modes() {
     let repo = Repo::new(&[
         ("tool.sh", "#!/bin/sh\necho tool\n", false),
@@ -575,6 +585,7 @@ fn stale_head_branch_sandbox_never_shadows_repo_root() {
     );
     assert_eq!(repo.head_content("c.rs"), "pub fn c() -> i32 { 3 }\n");
     assert!(!head.contains_key("d.rs"));
+    #[cfg(unix)]
     assert_eq!(head["e.sh"].0, "100755");
     assert!(!head.contains_key("r1.rs") && head.contains_key("r2.rs"));
     assert_eq!(repo.read("a.rs"), "pub fn a() -> u8 { 1 }\n");
@@ -700,6 +711,7 @@ fn git_index_parity_after_undo_restore_stash_and_sync() {
     repo.write("scratch.rs", "pub fn scratch() {}\n");
     repo.rm("scratch.rs");
     repo.tes("cycler", &["restore", "."]);
+    #[cfg(unix)]
     assert!(
         repo.is_executable("bin.sh"),
         "restore lost the executable bit"
@@ -1145,8 +1157,11 @@ fn off_head_branch_session_deletions_moves_chmod_and_exec_merge_cleanly() {
     assert!(!head.contains_key("obsolete.txt"), "{head:?}");
     assert!(!head.contains_key("legacy/mod.rs"), "{head:?}");
     assert!(head.contains_key("modern/mod.rs"), "{head:?}");
-    assert_eq!(head["scripts/deploy.sh"].0, "100755", "{head:?}");
-    assert!(repo.is_executable("scripts/deploy.sh"));
+    #[cfg(unix)]
+    {
+        assert_eq!(head["scripts/deploy.sh"].0, "100755", "{head:?}");
+        assert!(repo.is_executable("scripts/deploy.sh"));
+    }
 }
 
 /// `switch --root`, `cherry-pick`, `pull`, `resolve`, and `stash apply` must maintain `.git/index`
@@ -1271,12 +1286,14 @@ fn switch_cherry_pick_pull_resolve_and_stash_apply_preserve_git_status_parity() 
     repo.hook("right", "run.sh");
 
     repo.tes("right", &["resolve", "run.sh", "--strategy", "theirs"]);
+    #[cfg(unix)]
     assert!(
         repo.is_executable("run.sh"),
         "tes resolve must preserve executable permissions on run.sh"
     );
     repo.tes("right", &["commit", "-m", "fix: resolve run.sh"]);
     repo.assert_git_clean("after resolving and committing run.sh");
+    #[cfg(unix)]
     assert_eq!(repo.head_tree()["run.sh"].0, "100755");
 }
 
