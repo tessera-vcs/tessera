@@ -268,7 +268,7 @@ jobs:
         working-directory: extensions/vscode
         run: |
           mkdir -p ../../dist
-          npm i
+          npm ci
           npm run compile
           npx --yes @vscode/vsce package --no-dependencies -o ../../dist/tessera-vscode.vsix
           (cd ../../dist && sha256sum tessera-vscode.vsix > tessera-vscode.vsix.sha256)
@@ -290,6 +290,26 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Generate CHANGELOG.md
+        uses: orhun/git-cliff-action@v4
+        with:
+          args: --verbose --tag "${{ needs.prepare.outputs.tag }}" --output CHANGELOG.md
+
+      - name: Commit and push CHANGELOG.md
+        id: changelog_commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add CHANGELOG.md
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(release): update CHANGELOG.md for ${{ needs.prepare.outputs.tag }} [skip ci]"
+            git push origin main
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Download all release artifacts
         uses: actions/download-artifact@v4
@@ -297,10 +317,8 @@ jobs:
           path: release-assets
           merge-multiple: true
 
-      - name: Prepare SHA256SUMS.txt, install.sh, and install.ps1
+      - name: Prepare SHA256SUMS.txt
         run: |
-          cp docs/public/install.sh release-assets/install.sh
-          cp docs/public/install.ps1 release-assets/install.ps1
           (
             cd release-assets
             cat *.sha256 > SHA256SUMS.txt
@@ -311,6 +329,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.prepare.outputs.tag }}
-          target_commitish: ${{ github.sha }}
+          target_commitish: ${{ steps.changelog_commit.outputs.sha }}
           generate_release_notes: true
           files: release-assets/*

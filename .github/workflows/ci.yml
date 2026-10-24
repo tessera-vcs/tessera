@@ -196,11 +196,11 @@ jobs:
       - name: Build & Typecheck VS Code Extension
         working-directory: extensions/vscode
         run: |
-          npm i
+          npm ci
           npm run compile
 
       - name: Build VitePress Documentation
         working-directory: docs
         run: |
-          npm i
+          npm ci
           npm run docs:build
