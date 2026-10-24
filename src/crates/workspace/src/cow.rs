@@ -198,7 +198,7 @@ fn try_macos_clonefile(src: &Path, dst: &Path) -> std::io::Result<()> {
 #[cfg(target_os = "linux")]
 fn try_linux_reflink_file(src: &Path, dst: &Path) -> std::io::Result<()> {
     use std::os::unix::io::AsRawFd;
-    const FICLONE: libc::c_ulong = 0x4004_9409;
+    const FICLONE: libc::Ioctl = 0x4004_9409 as libc::Ioctl;
 
     let src_file = fs::File::open(src)?;
     let dst_file = fs::File::create(dst)?;
