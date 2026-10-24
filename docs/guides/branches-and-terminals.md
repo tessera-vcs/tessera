@@ -29,7 +29,7 @@ In a switched terminal tab:
 
 When you want your IDE file explorer and language server to display a different branch's files in your main repository folder, switch the editor branch:
 
-- **In VS Code / Antigravity IDE**: Click the branch name in the bottom-left status bar and select the branch from the dropdown.
+- **In VS Code or any VS Code-based IDE**: Click the branch name in the bottom-left status bar and select the branch from the dropdown.
 - **From the CLI**: Pass `--editor` (or `-e`) to `tes switch`:
 
 ```bash:no-line-numbers

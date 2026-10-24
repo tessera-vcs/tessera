@@ -46,7 +46,7 @@ You can also download prebuilt archives directly from GitHub Releases:
 | **Windows**                        | `ARM64` (MSVC)                          | [`tes-aarch64-pc-windows-msvc.zip`](https://github.com/tessera-vcs/tessera/releases/latest/download/tes-aarch64-pc-windows-msvc.zip) |
 | **FreeBSD**                        | `x86_64`                                | [`tes-x86_64-unknown-freebsd.tar.gz`](https://github.com/tessera-vcs/tessera/releases/latest/download/tes-x86_64-unknown-freebsd.tar.gz) |
 | **OpenBSD**                        | `x86_64`                                | [`tes-x86_64-unknown-openbsd.tar.gz`](https://github.com/tessera-vcs/tessera/releases/latest/download/tes-x86_64-unknown-openbsd.tar.gz) |
-| **VS Code / Antigravity / Cursor** | Universal `.vsix`                       | [`tessera-vscode.vsix`](https://github.com/tessera-vcs/tessera/releases/latest/download/tessera-vscode.vsix) |
+| **VS Code & VS Code-based IDEs**   | Universal `.vsix`                       | [`tessera-vscode.vsix`](https://github.com/tessera-vcs/tessera/releases/latest/download/tessera-vscode.vsix) |
 
 Verify the installation:
 

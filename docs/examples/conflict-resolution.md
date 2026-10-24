@@ -24,7 +24,7 @@ All non-overlapping files and components merge automatically, and Tessera report
 
 ## 2. Resolving in Your Editor
 
-If you have the VS Code / Antigravity IDE extension installed:
+If you have the Tessera IDE extension installed (in VS Code or any VS Code-based editor):
 
 1. `index.html` opens in your editor at the `<<<<<<<` line:
    ```html

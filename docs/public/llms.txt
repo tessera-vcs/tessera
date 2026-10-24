@@ -20,7 +20,7 @@ Tessera (`tes`) does not replace Git. It works on top of your existing Git check
 
 - [Guides Overview](https://tessera.getlunaris.dev/guides/): Index of step-by-step guides and tutorials.
 - [Configuration (`tessera.toml`)](https://tessera.getlunaris.dev/guides/configuration): Customize `trunk_branch`, `base_port`, `port_stride`, `port_isolation`, `verify_command`, `co_author`, `cow_cache_dirs`, `extra_bin_dirs`, `[custom_env]`, and repository trust (`tes config`).
-- [Editor Support (VS Code & Antigravity IDE)](https://tessera.getlunaris.dev/guides/ide-extension): Status bar branch switcher, live multi-agent line attribution, 2D Branch Graph, and one-click Conflict Resolver.
+- [Editor Support (VS Code & VS Code-based IDEs)](https://tessera.getlunaris.dev/guides/ide-extension): Status bar branch switcher, live multi-agent line attribution, 2D Branch Graph, and one-click Conflict Resolver across VS Code, Antigravity, Cursor, Windsurf, Kiro, and VSCodium.
 - [Agents (Multi-Agent Workflow)](https://tessera.getlunaris.dev/guides/multi-agent-workflow): How AI agents coordinate automatically using `tes claim`, `tes hook post-tool`, `tes exec`, and `tes commit` on the same branch or separate branches.
 - [Branches & Terminals](https://tessera.getlunaris.dev/guides/branches-and-terminals): How per-terminal branches (`tes switch`), per-agent branches (`tes claim --branch`), and the editor working tree (`tes switch --editor`) stay isolated in one folder.
 - [Sandboxes (Running Tests & Dev Servers)](https://tessera.getlunaris.dev/guides/running-tests-and-servers): Copy-on-Write dependency cloning (`node_modules`, `target`, `.venv`, `vendor`) and isolated `PORT` / `DATABASE_URL` slots.

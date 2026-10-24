@@ -81,7 +81,7 @@ npm --prefix docs run docs:build   # Build static documentation site
 Tessera is organized into three main workspaces:
 
 - [`src/`](./src) - Rust workspace containing the `tes` CLI (`crates/cli`) and core libraries (`crates/core`, `crates/git-backend`, `crates/oplog`, `crates/merge`, `crates/workspace`, `crates/agent`, `crates/mcp`).
-- [`extensions/vscode/`](./extensions/vscode) - VS Code and Antigravity IDE extension providing live branch switching, multi-agent line attribution, 2D Branch Graph, and conflict resolution.
+- [`extensions/vscode/`](./extensions/vscode) - Extension for VS Code and VS Code-based editors (Antigravity, Cursor, Windsurf, Kiro, VSCodium) providing live branch switching, multi-agent line attribution, 2D Branch Graph, and conflict resolution.
 - [`docs/`](./docs) - VitePress documentation site and machine-readable agent bundles (`agents.txt`, `llms.txt`, `llms-full.txt`).
 
 ### Building & Testing From Source
@@ -93,7 +93,7 @@ cargo test --manifest-path src/Cargo.toml --workspace
 # Run Clippy lints
 cargo clippy --manifest-path src/Cargo.toml --workspace --all-targets
 
-# Build the VS Code / Antigravity IDE extension
+# Build the VS Code extension
 npm --prefix extensions/vscode ci
 npm --prefix extensions/vscode run compile
 

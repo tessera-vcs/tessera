@@ -6,7 +6,7 @@ A conflict is recorded **only** when two sessions or branches modify the exact s
 
 ## Resolving in the Editor
 
-When a merge conflict occurs while using the VS Code / Antigravity IDE extension:
+When a merge conflict occurs while using the Tessera IDE extension (in VS Code, Antigravity, Cursor, Windsurf, Kiro, or VSCodium):
 
 1. Tessera writes standard Git conflict markers (`<<<<<<<`, `=======`, `>>>>>>>`) into the file.
 2. The extension opens the conflicted file in your editor and jumps to the `<<<<<<<` line.

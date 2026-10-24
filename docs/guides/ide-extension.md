@@ -1,6 +1,6 @@
 # Editor Support
 
-The Tessera extension for **VS Code** and **Antigravity IDE** provides real-time branch switching, a 2D commit graph, active session monitoring, and one-click conflict resolution.
+The Tessera extension (`tessera-vscode.vsix`) works in **VS Code** and all **VS Code-based editors** (including **Antigravity**, **Cursor**, **Windsurf**, **Kiro**, and **VSCodium**), providing real-time branch switching, a 2D commit graph, active session monitoring, and one-click conflict resolution.
 
 ## Status Bar
 

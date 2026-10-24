@@ -56,7 +56,7 @@ const SAME_BRANCH_AST_ASCII = [
 const BRANCHES_AND_TERMINALS_ASCII = [
   '```text',
   '[Architecture: Editor, Terminal & Agent Branches in One Folder]',
-  '- Editor Working Tree : .git/HEAD stays on main in VS Code / Antigravity IDE',
+  '- Editor Working Tree : .git/HEAD stays on main in VS Code and VS Code-based IDEs',
   '- Terminal Tabs       : tes switch feat/pricing (:3100) | tes switch feat/faq (:3200)',
   '- Agent Branches      : tes claim --branch isolates agent edits inside .git/tessera/',
   '- Switch or Merge     : tes switch <branch> --editor  OR  tes merge ... --into main',

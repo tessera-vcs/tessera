@@ -366,7 +366,7 @@ You can also download prebuilt archives directly from GitHub Releases:
 | **Windows**                        | `ARM64` (MSVC)                          | [`tes-aarch64-pc-windows-msvc.zip`](https://github.com/tessera-vcs/tessera/releases/latest/download/tes-aarch64-pc-windows-msvc.zip) |
 | **FreeBSD**                        | `x86_64`                                | [`tes-x86_64-unknown-freebsd.tar.gz`](https://github.com/tessera-vcs/tessera/releases/latest/download/tes-x86_64-unknown-freebsd.tar.gz) |
 | **OpenBSD**                        | `x86_64`                                | [`tes-x86_64-unknown-openbsd.tar.gz`](https://github.com/tessera-vcs/tessera/releases/latest/download/tes-x86_64-unknown-openbsd.tar.gz) |
-| **VS Code / Antigravity / Cursor** | Universal `.vsix`                       | [`tessera-vscode.vsix`](https://github.com/tessera-vcs/tessera/releases/latest/download/tessera-vscode.vsix) |
+| **VS Code & VS Code-based IDEs**   | Universal `.vsix`                       | [`tessera-vscode.vsix`](https://github.com/tessera-vcs/tessera/releases/latest/download/tessera-vscode.vsix) |
 
 Verify the installation:
 
@@ -785,7 +785,7 @@ Tessera separates **per-terminal branches**, **per-agent branches**, and your **
 
 ```text
 [Architecture: Editor, Terminal & Agent Branches in One Folder]
-- Editor Working Tree : .git/HEAD stays on main in VS Code / Antigravity IDE
+- Editor Working Tree : .git/HEAD stays on main in VS Code and VS Code-based IDEs
 - Terminal Tabs       : tes switch feat/pricing (:3100) | tes switch feat/faq (:3200)
 - Agent Branches      : tes claim --branch isolates agent edits inside .git/tessera/
 - Switch or Merge     : tes switch <branch> --editor  OR  tes merge ... --into main
@@ -814,7 +814,7 @@ In a switched terminal tab:
 
 When you want your IDE file explorer and language server to display a different branch's files in your main repository folder, switch the editor branch:
 
-- **In VS Code / Antigravity IDE**: Click the branch name in the bottom-left status bar and select the branch from the dropdown.
+- **In VS Code or any VS Code-based IDE**: Click the branch name in the bottom-left status bar and select the branch from the dropdown.
 - **From the CLI**: Pass `--editor` (or `-e`) to `tes switch`:
 
 ```bash
@@ -1001,7 +1001,7 @@ A conflict is recorded **only** when two sessions or branches modify the exact s
 
 ## Resolving in the Editor
 
-When a merge conflict occurs while using the VS Code / Antigravity IDE extension:
+When a merge conflict occurs while using the Tessera IDE extension (in VS Code, Antigravity, Cursor, Windsurf, Kiro, or VSCodium):
 
 1. Tessera writes standard Git conflict markers (`<<<<<<<`, `=======`, `>>>>>>>`) into the file.
 2. The extension opens the conflicted file in your editor and jumps to the `<<<<<<<` line.
@@ -1101,7 +1101,7 @@ tes undo --op <operation-id>
 
 # Editor Support
 
-The Tessera extension for **VS Code** and **Antigravity IDE** provides real-time branch switching, a 2D commit graph, active session monitoring, and one-click conflict resolution.
+The Tessera extension (`tessera-vscode.vsix`) works in **VS Code** and all **VS Code-based editors** (including **Antigravity**, **Cursor**, **Windsurf**, **Kiro**, and **VSCodium**), providing real-time branch switching, a 2D commit graph, active session monitoring, and one-click conflict resolution.
 
 ## Status Bar
 
@@ -1677,7 +1677,7 @@ All non-overlapping files and components merge automatically, and Tessera report
 
 ## 2. Resolving in Your Editor
 
-If you have the VS Code / Antigravity IDE extension installed:
+If you have the Tessera IDE extension installed (in VS Code or any VS Code-based editor):
 
 1. `index.html` opens in your editor at the `<<<<<<<` line:
    ```html
