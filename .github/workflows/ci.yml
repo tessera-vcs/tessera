@@ -187,8 +187,6 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -206,21 +204,3 @@ jobs:
         run: |
           npm i
           npm run docs:build
-
-      - name: Deploy docs to Vercel
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        working-directory: docs
-        env:
-          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
-          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
-          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
-        run: |
-          set -euo pipefail
-          BEFORE_SHA="${{ github.event.before }}"
-          if [ -z "$BEFORE_SHA" ] || [ "$BEFORE_SHA" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "$BEFORE_SHA" 2>/dev/null; then
-            BEFORE_SHA="HEAD~1"
-          fi
-
-          if git diff --name-only "$BEFORE_SHA" "${{ github.sha }}" -- . | grep -q .; then
-            npx --yes vercel deploy --prod --yes --token="$VERCEL_TOKEN"
-          fi
