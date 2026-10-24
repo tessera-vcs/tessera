@@ -6,33 +6,35 @@ pageClass: why-tessera
 
 # Why Tessera?
 
-Git assumes one person is editing one branch in one folder at a time. Every terminal tab and editor window in your project reads from the same `.git/HEAD` and writes to the same working tree on disk.
+A Git checkout has a single `.git/HEAD` pointer and a single working tree on disk. Every terminal tab, background process, and AI coding agent opened in your project directory reads and writes that shared state.
 
-That works fine when you write code by hand in a single editor, but it breaks down when you run two or three AI coding agents in parallel.
+When you run two or three AI coding agents in parallel inside the same project, three things break down:
 
-If two agents edit `src/App.vue` at the same time, the second agent to save overwrites the first agent's lines, or sees unfamiliar code and reverts it. If one agent runs `git checkout feat/pricing` to test its work, it switches the branch underneath your editor, your running dev server, and every other agent in the folder.
+1. **Working tree and branch collisions**: If two agents edit `src/App.vue` concurrently, the second agent to save overwrites the first agent's lines, or sees unfamiliar edits and reverts them. If one agent switches branches to test its work, it changes `.git/HEAD` underneath your editor, your running dev server, and every other session in the folder.
+2. **Line-based merge conflicts**: Concurrent tasks frequently touch adjacent lines in shared files, such as adding imports at the top of a module, registering routes or components, or updating dependencies in `package.json` and lockfiles. Line-based diffing flags these compatible additions as conflicts.
+3. **Runtime collisions**: Running tests or dev servers for two tasks at the same time collides on hardcoded ports (`localhost:3000`), build caches (`target/`, `node_modules/`), and local test databases.
 
-The usual workaround is `git worktree`: creating a separate copy of the repository in another folder for every agent. That requires duplicating `node_modules` or `target` directories, waiting on fresh builds, configuring different ports by hand so dev servers do not collide on `localhost:3000`, and jumping between separate editor windows.
+## One Folder, Isolated Sessions
 
-## One Folder, Multiple Branches and Dev Servers
-
-Tessera lets multiple agents and terminal tabs work in the **same repository folder** at the same time, either on separate branches or on the same branch.
+Tessera lets multiple AI agents and terminal tabs work in the **same repository folder** at the same time, either on separate branches or on the same branch.
 
 <HowTesseraWorks />
 
-When an agent claims a branch like `feat/pricing`, Tessera isolates that session inside `.git/tessera/` without changing `.git/HEAD` for the rest of your workspace. Both agents can edit `src/App.vue` on their own branches in `~/acme-web` at the same time without touching each other's uncommitted files.
+When an agent claims a branch like `feat/pricing`, Tessera isolates that session inside `.git/tessera/` without changing `.git/HEAD` for the rest of your workspace. Concurrent agents can edit `src/App.vue` on their own branches in `~/acme-web` at the same time without touching each other's uncommitted files.
 
-When you want to preview or test a branch, `tes exec -b feat/pricing -- npm run dev` starts the dev server inside a copy-on-write sandbox. It clones your existing `node_modules`, `target`, or `.venv` directory in milliseconds using filesystem reflinks and assigns each branch its own port (`localhost:3100`, `localhost:3200`) so you can open both branches side by side in your browser.
+When you want to build, test, or preview a branch, `tes exec -b feat/pricing -- npm run dev` executes inside a Copy-on-Write sandbox. It clones your existing `node_modules`, `target`, or `.venv` directories (including monorepo workspace symlinks), preserves your untracked `.env*` secrets and `.gitignore`d local files (such as local SQLite databases or `.dev.vars`), and assigns each session its own port (`localhost:3100`, `localhost:3200`) and local database slot so you can run multiple branches side by side.
 
-## Merging by Syntax Tree
+## Structural Merging Across Code, Configs, and Lockfiles
 
-Line-based Git merges fail whenever two branches touch adjacent lines, like when two agents add imports at the top of `src/App.vue` or register two new components in the same template.
+When you run `tes merge feat/pricing feat/faq --into main`, Tessera merges changes structurally rather than line by line:
 
-When you run `tes merge feat/pricing feat/faq --into main`, Tessera parses each file into a syntax tree with Tree-sitter and merges functions, imports, JSX/Vue templates, and lockfiles structurally. Compatible edits merge without manual conflict resolution.
+- **Source code**: Parses modules into syntax trees with Tree-sitter to merge functions, class methods, imports, and JSX/Vue templates.
+- **Manifests and lockfiles**: Merges JSON, TOML, `Cargo.lock`, `pnpm-lock.yaml`, `yarn.lock`, and `poetry.lock` blocks by key and stanza.
+- **Universal block structure**: Recognizes braced blocks (`{ ... }`), HTML/XML tags, indentation-scoped blocks (YAML, Python), keyword-delimited blocks (`def ... end`, `if ... fi`), and `[section]` stanzas so compatible additions merge cleanly across any language or configuration format.
 
 ## Editing on the Same Branch
 
-You do not always want separate branches. When two agents work directly on `main` at the same time, Tessera runs a 3-way AST merge on disk every time an agent saves a file.
+You do not always want separate branches. When two agents work directly on `main` at the same time, Tessera runs a 3-way structural merge on disk every time an agent saves a file.
 
 <SameBranchAstIllustration />
 

@@ -12,7 +12,7 @@ Tessera (`tes`) does not replace Git. It works on top of your existing Git check
 ## Getting Started
 
 - [Introduction](https://tessera.getlunaris.dev/getting-started/): Install `tes`, initialize a repository with `tes init`, and run your first multi-branch workflow.
-- [Why Tessera?](https://tessera.getlunaris.dev/getting-started/why-tessera): How Tessera works on top of Git to eliminate `.git/HEAD` collisions and `git worktree` overhead when running parallel AI agents.
+- [Why Tessera?](https://tessera.getlunaris.dev/getting-started/why-tessera): How Tessera works on top of Git to eliminate `.git/HEAD` collisions, merge conflicts, and port/database collisions when running parallel AI agents.
 - [Installation](https://tessera.getlunaris.dev/getting-started/installation): Install on macOS, Linux, Windows, FreeBSD, OpenBSD, or NetBSD, enable `(tes:<branch>)` shell prompts (`tes env --install`), and configure AI editor harnesses.
 - [Your First Workflow](https://tessera.getlunaris.dev/getting-started/first-workflow): Walk through parallel feature branches (`feat/pricing` and `feat/faq`), live session inspection (`tes radar`), and 3-way AST merging (`tes merge`).
 

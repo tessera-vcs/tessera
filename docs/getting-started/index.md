@@ -73,9 +73,9 @@ tes merge feat/pricing --into main -m "feat: add pricing calculator"
 
 ## Working in a Single Folder
 
-In standard Git, running two AI agents on two different branches requires creating separate `git worktree` folders, reinstalling dependencies in each folder, and configuring different ports by hand.
+Because every terminal tab and AI agent in a project normally shares `.git/HEAD` and the same working tree on disk, running two agents on separate tasks at the same time risks overwriting uncommitted files or colliding on `localhost` ports.
 
-With Tessera, you work inside a **single repository folder**:
+With Tessera, every session works inside a **single repository folder** with its own isolated branch state and port slot:
 
 ```bash:no-line-numbers
 # Terminal 1 works on feat/pricing (assigned port 3100)
@@ -97,7 +97,7 @@ The workspace rules installed by `tes init` instruct the agent to claim the bran
 
 ## Next Steps
 
-- [Why Tessera?](/getting-started/why-tessera) - See how Tessera compares to standard Git and `git worktree`
+- [Why Tessera?](/getting-started/why-tessera) - Understand the core problems Tessera solves for parallel AI agents
 - [Installation](/getting-started/installation) - Set up `(tes:<branch>)` in your terminal prompt and tab completion
 - [Your First Workflow](/getting-started/first-workflow) - Walk through a multi-agent example step by step
 - [Guides](/guides/) - Learn about multi-agent workflows, dev servers, conflicts, and editor integration
