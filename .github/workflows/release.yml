@@ -260,6 +260,13 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
 
       - name: Download all release artifacts
         uses: actions/download-artifact@v4
@@ -284,3 +291,21 @@ jobs:
           target_commitish: ${{ github.sha }}
           generate_release_notes: true
           files: release-assets/*
+
+      - name: Deploy Docs to Vercel (if docs/ changed since previous release)
+        working-directory: docs
+        env:
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          CURRENT_TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          PREV_TAG="$(git tag --list 'v*' --sort=-creatordate | grep -vxF "$CURRENT_TAG" | head -n1 || true)"
+
+          if [ -z "$PREV_TAG" ] || git diff --name-only "$PREV_TAG" "${{ github.sha }}" -- . | grep -q .; then
+            echo "Deploying docs/ to Vercel production for release ${CURRENT_TAG}..."
+            npx --yes vercel deploy --prod --yes --token="$VERCEL_TOKEN"
+          else
+            echo "No changes in docs/ since ${PREV_TAG} — skipping Vercel deploy."
+          fi
