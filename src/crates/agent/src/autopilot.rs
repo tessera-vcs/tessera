@@ -1108,7 +1108,12 @@ fn activate_host_terminal_window(wp: &SessionWaypoint) -> Option<(String, String
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd"
+    ))]
     {
         if let Some(start_pid) = wp.shell_pid.and_then(|p| i32::try_from(p).ok()) {
             let mut ancestor_pids = Vec::new();

@@ -1590,7 +1590,7 @@ fn real_shell_binaries_zsh_bash_sh_dash_ksh_tcsh_fish_nu_elvish_e2e() {
     // Use a directory name containing single quotes and `$()` (without colons so it is legal on all filesystems)
     // to prove `eval "$(tes env)"` never executes command substitutions.
     let pwn_marker = tmp.path().join("pwned_marker");
-    let tricky_name = "repo 'quoted' $(touch ../pwned_marker)";
+    let tricky_name = "repo 'quoted' $(touch pwned_marker)";
     let root = tmp.path().join(tricky_name);
     fs::create_dir_all(&root).expect("mkdir tricky root");
     fs::write(root.join("app.rs"), "pub fn main() {}\n").expect("write app.rs");
@@ -1778,7 +1778,7 @@ fn real_shell_binaries_zsh_bash_sh_dash_ksh_tcsh_fish_nu_elvish_e2e() {
     }
 
     assert!(
-        !pwn_marker.exists(),
+        !pwn_marker.exists() && !root.join("pwned_marker").exists(),
         "shell hook executed injected command substitution from path!"
     );
 }

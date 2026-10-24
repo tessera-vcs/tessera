@@ -1115,6 +1115,21 @@ fn parse_stash_index(raw: Option<&str>) -> core::CoreResult<usize> {
 
 /// Entrypoint for the `tes` CLI and built-in MCP server.
 fn main() -> anyhow::Result<()> {
+    // Spawn the CLI dispatcher on a dedicated 16 MiB stack thread so unoptimized debug builds
+    // (`cargo test`) never overflow Windows MSVC's 1 MiB default main-thread stack.
+    let handle = std::thread::Builder::new()
+        .name("tes-main".to_string())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(run_cli)?;
+
+    match handle.join() {
+        Ok(res) => res,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
+/// Executes the parsed `tes` CLI command or built-in MCP server.
+fn run_cli() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let cwd = match &cli.repo {
         Some(p) => p.clone(),
@@ -3753,16 +3768,7 @@ _tes_sync
 
                         println!("setenv TES_SHIM_BIN {};", tcsh_quote(&shim_bin_str));
                     } else {
-                        let mut unset_cmds =
-                            String::from("unsetenv TES_PORT_ISOLATION; unsetenv TES_SHIM_BIN;");
-
-                        for k in workspace::POLYGLOT_PORT_ENV_KEYS {
-                            if *k != "TES_PORT" {
-                                let _ = write!(unset_cmds, " unsetenv {k};");
-                            }
-                        }
-
-                        println!("{unset_cmds}");
+                        println!("unsetenv TES_PORT_ISOLATION; unsetenv TES_SHIM_BIN; unsetenv PORT;");
                     }
 
                     println!("setenv TES_REPO_ROOT {};", tcsh_quote(&repo_root_str));
