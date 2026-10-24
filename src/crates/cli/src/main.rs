@@ -1917,6 +1917,7 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
                 AgentCommands::Focus { name } => {
+                    #[allow(unused_mut)]
                     let mut report = coord.focus_session(&name)?;
 
                     #[cfg(target_os = "macos")]

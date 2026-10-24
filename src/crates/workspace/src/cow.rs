@@ -11,6 +11,7 @@ use core::{
 use walkdir::WalkDir;
 
 /// Returns `true` if `link_dest` is a relative path that does not contain `..` or root prefixes.
+#[cfg(unix)]
 fn is_safe_relative_symlink_target(link_dest: &Path) -> bool {
     !link_dest.is_absolute()
         && !link_dest.components().any(|c| {
@@ -22,6 +23,7 @@ fn is_safe_relative_symlink_target(link_dest: &Path) -> bool {
 }
 
 /// Returns `true` if `link_dest` resolved from `link_path` stays strictly within `root_dir`.
+#[cfg(unix)]
 fn is_safe_symlink_within_root(link_path: &Path, link_dest: &Path, root_dir: &Path) -> bool {
     if link_dest.is_absolute() {
         return false;
@@ -239,7 +241,7 @@ fn copy_or_reflink_file(src: &Path, dst: &Path) -> CoreResult<bool> {
 fn copy_recursive_fallback(
     src: &Path,
     dst: &Path,
-    confinement_root: &Path,
+    _confinement_root: &Path,
 ) -> CoreResult<bool> {
     let src_meta = fs::symlink_metadata(src).map_err(|source| CoreError::Io {
         path: src.display().to_string(),
@@ -250,7 +252,7 @@ fn copy_recursive_fallback(
         #[cfg(unix)]
         {
             if let Ok(target_link) = fs::read_link(src) {
-                if is_safe_symlink_within_root(dst, &target_link, confinement_root) {
+                if is_safe_symlink_within_root(dst, &target_link, _confinement_root) {
                     let _ = fs::remove_file(dst);
                     std::os::unix::fs::symlink(&target_link, dst).map_err(|source| {
                         CoreError::Io {
@@ -295,7 +297,7 @@ fn copy_recursive_fallback(
                 }
 
                 if let Ok(link_dest) = fs::read_link(entry.path()) {
-                    if is_safe_symlink_within_root(&target, &link_dest, confinement_root) {
+                    if is_safe_symlink_within_root(&target, &link_dest, _confinement_root) {
                         let _ = fs::remove_file(&target);
                         let _ = std::os::unix::fs::symlink(&link_dest, &target);
                     }

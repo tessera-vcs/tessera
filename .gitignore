@@ -3,7 +3,6 @@
 /.tes
 .DS_Store
 readme/
-scripts/
 node_modules/
 docs/.vitepress/cache/
 docs/.vitepress/dist/

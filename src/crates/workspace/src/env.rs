@@ -1,10 +1,13 @@
 //! Deterministic per-agent runtime environment variable computation (`PORT`, `DATABASE_URL`, `TMPDIR`).
 
 use std::collections::BTreeMap;
+#[cfg(unix)]
 use std::fs;
 use std::path::Path;
 
-use core::{atomic_write_file, resolve_confined_repo_path, AgentMetadata, RepoConfig};
+#[cfg(unix)]
+use core::atomic_write_file;
+use core::{resolve_confined_repo_path, AgentMetadata, RepoConfig};
 
 /// Returns the polyglot set of port environment variables (`PORT`, `TES_PORT`, `SERVER_PORT`,
 /// `FLASK_RUN_PORT`, `UVICORN_PORT`, `ROCKET_PORT`, `NITRO_PORT`, etc.) mapped to `port` so
