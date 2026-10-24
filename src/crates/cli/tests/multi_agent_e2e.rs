@@ -15,8 +15,6 @@ fn init_installs_all_harness_discovery_and_hook_files() {
             .expect("init antigravity");
     for expected in [
         ".agents/rules/tessera.md",
-        ".mcp.json",
-        "AGENTS.md",
         ".git/hooks/post-commit",
         ".git/hooks/post-merge",
         ".git/hooks/post-checkout",
@@ -26,6 +24,8 @@ fn init_installs_all_harness_discovery_and_hook_files() {
             .harness_files_installed
             .contains(&expected.to_string()));
     }
+    assert!(!tmp_default.path().join(".mcp.json").exists());
+    assert!(!tmp_default.path().join("AGENTS.md").exists());
     assert!(!tmp_default.path().join(".claude/settings.json").exists());
     assert!(!tmp_default.path().join("CLAUDE.md").exists());
     assert!(!tmp_default.path().join(".cursor/mcp.json").exists());

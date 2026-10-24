@@ -1398,7 +1398,7 @@ Multiple AI agents may be editing this codebase concurrently in separate chat ta
         installed.push(".claude/settings.json".to_string());
     }
 
-    if want_antigravity || want_claude || want_windsurf {
+    if want_claude {
         upsert_mcp_json(&repo_root.join(".mcp.json"))?;
         installed.push(".mcp.json".to_string());
     }
@@ -1456,13 +1456,10 @@ This repository uses Tessera (`tes`) for concurrent multi-agent source control (
         installed.push(".vscode/mcp.json".to_string());
     }
 
-    if want_antigravity
-        || want_cursor
-        || want_windsurf
-        || want_kiro
-        || want_opencode
+    if want_opencode
         || want_codex
         || want_vscode
+        || repo_root.join("AGENTS.md").exists()
     {
         upsert_marked_section(&repo_root.join("AGENTS.md"), doc_block)?;
         installed.push("AGENTS.md".to_string());
@@ -3808,9 +3805,8 @@ mod tests {
         git.update_ref("refs/heads/main", &c0).expect("update main");
         git.sync_git_index(&c0);
 
-        // Now run `tes init` on the existing repo (so AGENTS.md and .agents/rules/tessera.md are untracked).
+        // Now run `tes init` on the existing repo (so .agents/rules/tessera.md is untracked).
         let (coord, _) = Coordinator::init_repo(root).expect("init_repo");
-        assert!(root.join("AGENTS.md").is_file());
         assert!(root.join(".agents/rules/tessera.md").is_file());
 
         // Agent 1 claims `feat/pricing-calculator` and Agent 2 claims `feat/testimonials-faq`.
@@ -3869,8 +3865,7 @@ mod tests {
             )
             .expect("commit faq");
 
-        // Verify harness files (`AGENTS.md` and `.agents/rules/tessera.md`) were NOT deleted by materialization!
-        assert!(root.join("AGENTS.md").is_file());
+        // Verify harness files (`.agents/rules/tessera.md`) were NOT deleted by materialization!
         assert!(root.join(".agents/rules/tessera.md").is_file());
 
         // Verify `feat/pricing-calculator` has ONLY pricing and NOT testimonials.
