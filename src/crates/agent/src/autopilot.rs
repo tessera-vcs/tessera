@@ -2265,6 +2265,47 @@ pub fn handle_post_tool_hook(
                     }
                 }
             }
+        } else if disk_is_foreign_peer_own_blob {
+            if let Some(obs_list) = current_op.view.observed_blobs.get(&normalized_path) {
+                let mut best_rescued: Option<(usize, ObjectId, String)> = None;
+                for obs_blob in obs_list.iter().rev() {
+                    let owned_by_other = current_op
+                        .view
+                        .agents
+                        .values()
+                        .any(|a| a.own_blobs.get(&normalized_path) == Some(obs_blob));
+                    if *obs_blob != disk_after_blob
+                        && Some(obs_blob) != base_blob.as_ref()
+                        && Some(obs_blob) != base_tree_blob.as_ref()
+                        && !foreign_blobs.contains(obs_blob)
+                        && !owned_by_other
+                    {
+                        if let Ok(obs_bytes) = coord.git().read_blob(obs_blob) {
+                            let obs_str = String::from_utf8_lossy(&obs_bytes).into_owned();
+                            if !crate::has_git_conflict_markers(&obs_str) {
+                                let score = score_blob_for_agent(
+                                    &base_str,
+                                    &obs_str,
+                                    &my_agent.intent,
+                                    Some(my_eff_branch),
+                                );
+                                if best_rescued
+                                    .as_ref()
+                                    .is_none_or(|(best_s, _, _)| score > *best_s)
+                                {
+                                    best_rescued = Some((score, *obs_blob, obs_str));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if let Some((_, rescued_blob, rescued_str)) = best_rescued {
+                    effective_my_blob = rescued_blob;
+                    current_my_str = rescued_str;
+                    untangled_cross_branch = true;
+                }
+            }
         }
     }
 
@@ -2995,6 +3036,16 @@ pub fn handle_post_tool_hook(
                     executable,
                 }),
             );
+
+            if let Some(peer_meta) = current_op.view.agents.get(aid) {
+                let peer_branch = peer_meta.effective_branch(&default_branch);
+                let peer_ws = coord.branch_sandbox_dir(peer_branch);
+                if peer_ws.is_dir() {
+                    if let Ok(peer_bytes) = coord.git().read_blob(own_b) {
+                        crate::write_worktree_rel(&peer_ws, &normalized_path, &peer_bytes, executable);
+                    }
+                }
+            }
         }
     }
 
@@ -4647,5 +4698,113 @@ mod tests {
             fs::read_to_string(tmp.path().join("README.md")).expect("README.md on main"),
             "# Main Updated\n"
         );
+    }
+
+    #[test]
+    fn peer_non_head_commit_preserves_watcher_observed_in_flight_edit() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let app_vue = tmp.path().join("src/App.vue");
+        fs::create_dir_all(app_vue.parent().expect("parent")).expect("mkdir src");
+        fs::write(
+            &app_vue,
+            "<script setup lang=\"ts\">\nimport HelloWorld from './components/HelloWorld.vue'\n</script>\n<template>\n  <HelloWorld />\n</template>\n",
+        )
+        .expect("write initial App.vue");
+
+        let (coord, _) = Coordinator::init_repo(tmp.path()).expect("init_repo");
+        coord
+            .claim_intent_and_symbols_with_branch(
+                "agent-init",
+                Some("Initial App.vue"),
+                &["src/App.vue".to_string()],
+                Some("main"),
+            )
+            .expect("claim main");
+        handle_post_tool_hook(&coord, "agent-init", "src/App.vue").expect("post-tool init");
+        coord
+            .merge_agents(&["agent-init".to_string()], Some("main"), None, false)
+            .expect("commit main");
+
+        coord
+            .claim_intent_and_symbols_with_branch(
+                "agent-pomodoro",
+                Some("Build Pomodoro Focus Timer dashboard in src/App.vue"),
+                &["src/App.vue".to_string()],
+                Some("feat/pomodoro-timer"),
+            )
+            .expect("claim pomodoro");
+        handle_pre_tool_hook(&coord, "agent-pomodoro", "src/App.vue").expect("pre-tool pomodoro");
+
+        coord
+            .claim_intent_and_symbols_with_branch(
+                "agent-habit",
+                Some("Build Daily Habit & Streak Tracker in src/App.vue"),
+                &["src/App.vue".to_string()],
+                Some("feat/habit-tracker"),
+            )
+            .expect("claim habit");
+        handle_pre_tool_hook(&coord, "agent-habit", "src/App.vue").expect("pre-tool habit");
+
+        let pomodoro_code = "<script setup lang=\"ts\">\nconst mode = 'pomodoro'\n</script>\n<template>\n  <div>Pomodoro Focus Timer</div>\n</template>\n";
+        fs::write(&app_vue, pomodoro_code).expect("write pomodoro");
+        handle_post_tool_hook(&coord, "agent-pomodoro", "src/App.vue").expect("post-tool pomodoro");
+
+        // Simulate `tes exec` restoring `main` to `repo_root/src/App.vue`, followed by `agent-habit`
+        // writing its Habit Tracker on disk and the background watcher recording it in `observed_blobs`
+        // right before `agent-pomodoro` runs `tes commit`!
+        let habit_code = "<script setup lang=\"ts\">\nconst tracker = 'habit'\n</script>\n<template>\n  <div>Daily Habit & Streak Tracker</div>\n</template>\n";
+        fs::write(&app_vue, habit_code).expect("write habit");
+        let habit_blob = coord
+            .git()
+            .write_blob(habit_code.as_bytes())
+            .expect("write habit blob");
+        coord
+            .oplog()
+            .record_tx(
+                "watcher",
+                "observe intermediate blob for src/App.vue",
+                true,
+                |view| {
+                    view.observed_blobs
+                        .entry("src/App.vue".to_string())
+                        .or_default()
+                        .push(habit_blob);
+                    Ok(())
+                },
+            )
+            .expect("record watcher observed_blob");
+
+        // Now `agent-pomodoro` commits onto `feat/pomodoro-timer` before `agent-habit` runs `post-tool`.
+        coord
+            .merge_agents(
+                &["agent-pomodoro".to_string()],
+                Some("feat/pomodoro-timer"),
+                None,
+                false,
+            )
+            .expect("commit feat/pomodoro-timer");
+
+        // `agent-habit` now runs `tes hook post-tool` and commits onto `feat/habit-tracker`.
+        handle_post_tool_hook(&coord, "agent-habit", "src/App.vue").expect("post-tool habit");
+        let report = coord
+            .merge_agents(
+                &["agent-habit".to_string()],
+                Some("feat/habit-tracker"),
+                None,
+                false,
+            )
+            .expect("commit feat/habit-tracker");
+        let committed_tree = coord
+            .git()
+            .read_commit(&report.merged_commit_id)
+            .expect("read habit commit")
+            .tree_id;
+        let entry = coord
+            .git()
+            .read_tree_entry_at_path(&committed_tree, "src/App.vue")
+            .expect("read entry")
+            .expect("App.vue exists");
+        let committed_bytes = coord.git().read_blob(&entry.blob_id).expect("read blob");
+        assert_eq!(String::from_utf8_lossy(&committed_bytes), habit_code);
     }
 }

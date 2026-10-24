@@ -3055,18 +3055,13 @@ impl Coordinator {
                 continue;
             }
 
-            // If this exact disk blob was already reconciled by a previous `post-tool` hook, skip it.
-            let already_reconciled = current
-                .view
-                .observed_blobs
-                .get(rel_path)
-                .and_then(|v| v.last())
-                == Some(&entry.blob_id)
-                || current
-                    .view
-                    .agents
-                    .values()
-                    .any(|a| a.own_blobs.get(rel_path) == Some(&entry.blob_id));
+            // If this exact disk blob was already reconciled into an active session's `own_blobs`
+            // (or is the post-hook merged `read_blobs` baseline of a session that already owns `rel_path`),
+            // skip it so we do not re-run `post-tool` on an already-reconciled file.
+            let already_reconciled = current.view.agents.values().any(|a| {
+                a.own_blobs.get(rel_path) == Some(&entry.blob_id)
+                    || (a.owns_path(rel_path) && a.read_blobs.get(rel_path) == Some(&entry.blob_id))
+            });
             if already_reconciled {
                 continue;
             }
@@ -3285,6 +3280,7 @@ impl Coordinator {
             Some(raw) if !raw.trim().is_empty() => Some(validate_author_override(raw)?),
             _ => None,
         };
+        self.reconcile_in_flight_sessions();
         let cfg = self.oplog.load_config()?;
         let current = self.oplog.load_current_reconciled()?;
         let caller_id = detect_session_id(None);

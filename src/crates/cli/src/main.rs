@@ -3219,7 +3219,11 @@ prompt_tes() {
 }
 
 _tes_preexec() {
+  unset _TES_CHAINED_AFTER_TES
   if [[ "$1" == tes\ * || "$1" == "tes" || "$1" == git\ * || "$1" == "git" || "$1" == cd\ * || "$1" == "cd" ]]; then
+    if [[ "$1" == (tes\ *)*((\&\&|\;|\|\|))* ]]; then
+      _TES_CHAINED_AFTER_TES=1
+    fi
     return
   fi
   local phys_pwd="${PWD:A}"
@@ -3236,6 +3240,7 @@ _tes_preexec() {
 
 _tes_precmd() {
   export TES_SESSION_ID="term-$$"
+  unset _TES_CHAINED_AFTER_TES
   if [[ -n "$_TES_PREV_PWD" ]]; then
     if [[ -d "$_TES_PREV_PWD" ]]; then
       builtin cd -q "$_TES_PREV_PWD"
@@ -3266,10 +3271,28 @@ _tes_ensure_prompt() {
 
 tes() {
   export TES_SESSION_ID="term-$$"
+  local chained="$_TES_CHAINED_AFTER_TES"
+  if [[ -n "$_TES_PREV_PWD" && -d "$_TES_PREV_PWD" ]]; then
+    builtin cd -q "$_TES_PREV_PWD"
+    unset _TES_PREV_PWD
+  fi
   command tes "$@"
   local ret=$?
   if [[ "$1" != "env" ]]; then
     _tes_precmd
+    if [[ -n "$chained" ]]; then
+      _TES_CHAINED_AFTER_TES=1
+      local phys_pwd="${PWD:A}"
+      if [[ -n "$TES_WORKSPACE" && -d "$TES_WORKSPACE" && -n "$TES_REPO_ROOT" && "$TES_WORKSPACE" != "$TES_REPO_ROOT" && -d "$TES_REPO_ROOT/.git/tessera" && "$phys_pwd" == "$TES_REPO_ROOT"* ]]; then
+        _TES_PREV_PWD="$PWD"
+        local rel_sub="${phys_pwd#$TES_REPO_ROOT}"
+        if [[ -d "${TES_WORKSPACE}${rel_sub}" ]]; then
+          builtin cd -q "${TES_WORKSPACE}${rel_sub}"
+        else
+          builtin cd -q "$TES_WORKSPACE"
+        fi
+      fi
+    fi
   fi
   return $ret
 }
@@ -3657,7 +3680,7 @@ _tes_sync
                 let port_vars = workspace::polyglot_port_env_vars(port);
                 let repo_root_str = coord.git().repo_root().display().to_string();
 
-                let ws_path_opt = if branch_name == default_branch {
+                let ws_path_opt = if branch_name == default_branch && branch_name == cfg.trunk_branch {
                     Some(repo_root_str.clone())
                 } else {
                     let sb_dir = coord.branch_sandbox_dir(&branch_name);
@@ -3685,6 +3708,9 @@ _tes_sync
                     if stamp_fresh && !has_active_branch_edits {
                         Some(sb_dir.display().to_string())
                     } else {
+                        if has_active_branch_edits {
+                            coord.reconcile_in_flight_sessions();
+                        }
                         coord
                             .prepare_branch_sandbox(&session_id, Some(&branch_name))
                             .ok()
@@ -3874,7 +3900,11 @@ _tes_sync
                         r#"if [ -n "${{ZSH_VERSION:-}}" ]; then
   eval '
   _tes_preexec() {{
-    if [[ "$1" == tes\ * || "$1" == "tes" || "$1" == git\ * || "$1" == "git" || "$1" == cd\ * || "$1" == "cd" ]]; then return; fi
+    unset _TES_CHAINED_AFTER_TES
+    if [[ "$1" == tes\ * || "$1" == "tes" || "$1" == git\ * || "$1" == "git" || "$1" == cd\ * || "$1" == "cd" ]]; then
+      if [[ "$1" == (tes\ *)*((\&\&|\;|\|\|))* ]]; then _TES_CHAINED_AFTER_TES=1; fi
+      return
+    fi
     local phys_pwd="${{PWD:A}}"
     if [[ -n "$TES_WORKSPACE" && -d "$TES_WORKSPACE" && -n "$TES_REPO_ROOT" && "$TES_WORKSPACE" != "$TES_REPO_ROOT" && -d "$TES_REPO_ROOT/.git/tessera" && "$phys_pwd" == "$TES_REPO_ROOT"* ]]; then
       _TES_PREV_PWD="$PWD"
@@ -3884,6 +3914,7 @@ _tes_sync
   }}
   _tes_precmd() {{
     export TES_SESSION_ID="term-$$"
+    unset _TES_CHAINED_AFTER_TES
     if [[ -n "$_TES_PREV_PWD" ]]; then
       if [[ -d "$_TES_PREV_PWD" ]]; then builtin cd -q "$_TES_PREV_PWD"; fi
       unset _TES_PREV_PWD
@@ -3897,6 +3928,29 @@ _tes_sync
     else
       unset TES_BRANCH TES_PORT PORT TES_PORT_ISOLATION TES_SHIM_BIN TES_WORKSPACE TES_REPO_ROOT
     fi
+  }}
+  tes() {{
+    export TES_SESSION_ID="term-$$"
+    local chained="$_TES_CHAINED_AFTER_TES"
+    if [[ -n "$_TES_PREV_PWD" && -d "$_TES_PREV_PWD" ]]; then
+      builtin cd -q "$_TES_PREV_PWD"
+      unset _TES_PREV_PWD
+    fi
+    command tes "$@"
+    local ret=$?
+    if [[ "$1" != "env" ]]; then
+      _tes_precmd
+      if [[ -n "$chained" ]]; then
+        _TES_CHAINED_AFTER_TES=1
+        local phys_pwd="${{PWD:A}}"
+        if [[ -n "$TES_WORKSPACE" && -d "$TES_WORKSPACE" && -n "$TES_REPO_ROOT" && "$TES_WORKSPACE" != "$TES_REPO_ROOT" && -d "$TES_REPO_ROOT/.git/tessera" && "$phys_pwd" == "$TES_REPO_ROOT"* ]]; then
+          _TES_PREV_PWD="$PWD"
+          local rel_sub="${{phys_pwd#$TES_REPO_ROOT}}"
+          if [[ -d "${{TES_WORKSPACE}}${{rel_sub}}" ]]; then builtin cd -q "${{TES_WORKSPACE}}${{rel_sub}}"; else builtin cd -q "$TES_WORKSPACE"; fi
+        fi
+      fi
+    fi
+    return $ret
   }}
   if (( ! ${{preexec_functions[(I)_tes_preexec]}} )); then
     preexec_functions=(_tes_preexec "${{preexec_functions[@]}}")
