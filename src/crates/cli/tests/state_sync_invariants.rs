@@ -735,13 +735,18 @@ fn git_index_parity_after_undo_restore_stash_and_sync() {
     repo.hook("cycler", "old.rs");
     repo.chmod("bin.sh", false);
     let before_stash = repo.git_status_paths();
-    assert_eq!(before_stash.len(), 3, "{before_stash:?}");
+    assert_eq!(
+        before_stash.len(),
+        if cfg!(unix) { 3 } else { 2 },
+        "{before_stash:?}"
+    );
 
     repo.tes("cycler", &["stash", "push", "-m", "wip"]);
     assert!(
         repo.path("old.rs").is_file(),
         "stash push did not restore the deleted file"
     );
+    #[cfg(unix)]
     assert!(
         repo.is_executable("bin.sh"),
         "stash push did not restore the mode"
