@@ -12,7 +12,7 @@ aside: false
   </p>
 
   <p style="font-size: 1.2rem; opacity: 0.85; margin-bottom: 2.5rem; line-height: 1.6;">
-    Tessera works on top of your existing Git repository so concurrent AI agents and terminal sessions can share one checkout, work on independent branches, and merge edits at the AST level without manual worktrees, lockfile collisions, or overwritten files.
+    Tessera works on top of your existing Git repository so concurrent AI agents and terminal sessions can share one checkout, work on independent branches, and merge edits structurally without lockfile collisions, port conflicts, or overwritten files.
   </p>
 
   <div style="display: flex; gap: 1rem; justify-content: center; flex-wrap: wrap;">
@@ -26,7 +26,7 @@ aside: false
 
 ## Why Tessera?
 
-In standard Git, every open terminal and AI agent shares a single `.git/HEAD` and working directory. Running two agents at once overwrites files or forces you to maintain separate `git worktree` folders. Tessera does not replace Git. It coordinates sessions inside `.git/tessera` and writes standard Git commits so you stay in one folder while each session owns its own branch, dev server, and AST-merged changes. [Read Why Tessera? →](/getting-started/why-tessera)
+In a standard Git checkout, every open terminal and AI agent shares a single `.git/HEAD` and working directory on disk. Running multiple agents at once overwrites uncommitted files, switches branches underneath active processes, and collides on local ports and databases. Tessera coordinates sessions inside `.git/tessera` and writes standard Git commits so you stay in one folder while each session owns its own branch, sandbox environment, and structurally merged changes. [Read Why Tessera? →](/getting-started/why-tessera)
 
 <HowTesseraWorks />
 

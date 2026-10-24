@@ -1,8 +1,8 @@
 # Sandboxes
 
-Running commands on another branch usually requires stashing uncommitted work or maintaining a separate `git worktree` with its own dependencies.
+Running builds, tests, or dev servers on another branch normally requires stashing uncommitted work or switching `.git/HEAD` underneath your editor and other running processes.
 
-Tessera creates Copy-on-Write branch sandboxes that reuse your existing dependencies and assign each session its own port and test database.
+Tessera creates Copy-on-Write branch sandboxes that reuse your existing dependencies, preserve your untracked `.env*` secrets and `.gitignore`d files, and assign each session its own port and local database slot.
 
 ## Running Commands
 

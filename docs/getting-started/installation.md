@@ -6,11 +6,11 @@ This guide covers installing the `tes` CLI, enabling shell prompt integration, a
 
 Tessera is lightweight and self-contained:
 
-- **OS**: macOS (APFS), Linux (Btrfs / XFS / bcachefs / ext4), FreeBSD, OpenBSD, NetBSD, or Windows (WSL2 and native Windows with PowerShell / Windows Terminal)
+- **OS**: macOS (APFS), Linux (Btrfs / XFS / bcachefs / ext4), FreeBSD, OpenBSD, or Windows (WSL2 and native Windows with PowerShell / Windows Terminal)
 - **Git**: Standard Git 2.23+
 
 > [!INFO]
-> On macOS (APFS) and Linux (Btrfs / XFS / bcachefs), Tessera uses native Copy-on-Write filesystem clones (`clonefile` and `FICLONE`) to duplicate `node_modules` and `target` directories in milliseconds without using extra disk space. On ext4, FreeBSD, OpenBSD, NetBSD, and Windows, Tessera automatically falls back to portable recursive sandbox cloning.
+> On macOS (APFS) and Linux (Btrfs / XFS / bcachefs), Tessera uses native Copy-on-Write filesystem clones (`clonefile` and `FICLONE`) to duplicate `node_modules` and `target` directories in milliseconds without using extra disk space. On ext4, FreeBSD, OpenBSD, and Windows, Tessera automatically falls back to portable recursive sandbox cloning.
 
 ## Installing the CLI
 

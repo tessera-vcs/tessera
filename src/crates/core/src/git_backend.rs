@@ -327,6 +327,16 @@ impl GitBackend {
                 return Ok(Self::with_paths(curr, dot_git));
             }
 
+            if curr.file_name().and_then(|s| s.to_str()) == Some("tmp")
+                && curr
+                    .parent()
+                    .and_then(|p| p.file_name())
+                    .and_then(|s| s.to_str())
+                    == Some(".tessera")
+            {
+                return Err(CoreError::RepoNotFound(start_dir.display().to_string()));
+            }
+
             if let Some(target_root) = is_valid_sandbox_repo_root(&curr, None) {
                 let target_git = target_root.join(".git");
 
@@ -1074,10 +1084,14 @@ impl GitBackend {
         message: &str,
     ) -> CoreResult<ObjectId> {
         let secs = now_millis() / 1000;
-        let clean_author: String = author_ident
+        let raw_clean: String = author_ident
             .chars()
             .filter(|c| !matches!(c, '\n' | '\r' | '\0'))
             .collect();
+        let clean_author = match raw_clean.rfind('>') {
+            Some(idx) => raw_clean[..=idx].trim(),
+            None => raw_clean.trim(),
+        };
         let mut body = String::new();
         body.push_str(&format!("tree {}\n", tree_id.as_str()));
 

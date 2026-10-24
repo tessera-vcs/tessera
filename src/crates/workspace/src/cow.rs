@@ -2,13 +2,17 @@
 //! build cache path sanitization, and working-tree materialization.
 
 use std::fs;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 use core::{
     resolve_confined_repo_path, write_working_tree_file_safe, CoreError, CoreResult, GitBackend,
     ObjectId,
 };
 use walkdir::WalkDir;
+
+use crate::snapshot::{
+    append_ignore_rules_from_file, append_ignore_rules_from_str, is_path_ignored, load_ignore_rules,
+};
 
 /// Returns `true` if `link_dest` is a relative path that does not contain `..` or root prefixes.
 #[cfg(unix)]
@@ -326,13 +330,14 @@ fn copy_recursive_fallback(
 }
 
 /// Ensures any warm dependency or build caches (`node_modules`, `target`, `.venv`, `vendor`, plus
-/// configured `cow_cache_dirs`) that exist in `src_root` are COW-cloned into `dst_root` if missing.
+/// configured `cow_cache_dirs`), as well as untracked `.gitignore`d and secret files, that exist in
+/// `src_root` are COW-cloned into `dst_root` if missing.
 ///
 /// This handles the common workflow where a branch sandbox is created before `npm install` / `pnpm install`
-/// is executed in `repo_root` (or vice versa).
+/// or `.env` / local SQLite setup is executed in `repo_root` (or vice versa).
 ///
 /// # Errors
-/// Returns [`CoreError::Io`] if cloning a cache directory fails.
+/// Returns [`CoreError::Io`] if cloning a cache directory or ignored file fails.
 pub fn sync_missing_cow_caches(
     src_root: &Path,
     dst_root: &Path,
@@ -380,7 +385,126 @@ pub fn sync_missing_cow_caches(
             if dst_cache.exists() {
                 let _ = fs::remove_dir_all(&dst_cache);
             }
-            clone_path_cow(&src_cache, &dst_cache)?;
+            clone_path_cow_within(&src_cache, &dst_cache, dst_root)?;
+            synced += 1;
+        }
+    }
+
+    let is_sandbox_to_repo = !src_root.join(".git").is_dir() && dst_root.join(".git").is_dir();
+
+    if !is_sandbox_to_repo {
+        let git_dir = if src_root.join(".git").is_dir() {
+            src_root.join(".git")
+        } else if dst_root.join(".git").is_dir() {
+            dst_root.join(".git")
+        } else {
+            src_root.join(".git")
+        };
+
+        let mut init_rules = load_ignore_rules(src_root, &git_dir);
+        if !src_root.join(".gitignore").is_file() && dst_root.join(".gitignore").is_file() {
+            append_ignore_rules_from_file(&dst_root.join(".gitignore"), "", &mut init_rules);
+        }
+        let ignore_rules = std::cell::RefCell::new(init_rules);
+        let pending_clones: std::cell::RefCell<Vec<(PathBuf, PathBuf)>> =
+            std::cell::RefCell::new(Vec::new());
+
+        let walker = WalkDir::new(src_root)
+            .max_depth(3)
+            .into_iter()
+            .filter_entry(|e| {
+                if e.depth() == 0 {
+                    return true;
+                }
+
+                let Some(name) = e.file_name().to_str() else {
+                    return false;
+                };
+
+                if name == ".git"
+                    || name == ".tessera"
+                    || name.eq_ignore_ascii_case("git~1")
+                    || name == ".DS_Store"
+                {
+                    return false;
+                }
+
+                let Ok(rel) = e.path().strip_prefix(src_root) else {
+                    return false;
+                };
+                let rel_str = rel.to_string_lossy().replace('\\', "/");
+
+                if e.file_type().is_dir() {
+                    let is_cache_or_ignored = PRESERVED_CACHE_DIRS.contains(&name)
+                        || cow_cache_dirs
+                            .iter()
+                            .any(|d| d == name || d.trim_matches('/') == rel_str)
+                        || is_path_ignored(&rel_str, true, &ignore_rules.borrow());
+
+                    if is_cache_or_ignored {
+                        if let Ok((_, dst_dir)) = resolve_confined_repo_path(dst_root, &rel_str) {
+                            let needs_clone = if !dst_dir.exists() {
+                                true
+                            } else if name == "node_modules" {
+                                e.path().join(".bin").is_dir() && !dst_dir.join(".bin").exists()
+                            } else {
+                                false
+                            };
+
+                            if needs_clone {
+                                pending_clones
+                                    .borrow_mut()
+                                    .push((e.path().to_path_buf(), dst_dir));
+                            }
+                        }
+                        return false;
+                    }
+
+                    let nested_gi = e.path().join(".gitignore");
+                    if nested_gi.is_file() {
+                        append_ignore_rules_from_file(
+                            &nested_gi,
+                            &rel_str,
+                            &mut ignore_rules.borrow_mut(),
+                        );
+                    }
+                }
+
+                true
+            });
+
+        for entry in walker.flatten() {
+            if entry.depth() == 0 || entry.file_type().is_dir() {
+                continue;
+            }
+
+            let Ok(rel) = entry.path().strip_prefix(src_root) else {
+                continue;
+            };
+            let rel_str = rel.to_string_lossy().replace('\\', "/");
+
+            if rel_str.is_empty() {
+                continue;
+            }
+
+            if PRESERVED_ROOT_FILES.contains(&rel_str.as_str())
+                || is_path_ignored(&rel_str, false, &ignore_rules.borrow())
+            {
+                if let Ok((_, dst_file)) = resolve_confined_repo_path(dst_root, &rel_str) {
+                    if !dst_file.exists() {
+                        pending_clones
+                            .borrow_mut()
+                            .push((entry.path().to_path_buf(), dst_file));
+                    }
+                }
+            }
+        }
+
+        for (src_item, dst_item) in pending_clones.into_inner() {
+            if dst_item.exists() {
+                let _ = fs::remove_dir_all(&dst_item);
+            }
+            clone_path_cow_within(&src_item, &dst_item, dst_root)?;
             synced += 1;
         }
     }
@@ -552,6 +676,35 @@ pub fn sanitize_build_cache(workspace_dir: &Path, parent_repo_root: &Path) -> Co
     Ok(sanitized_count)
 }
 
+/// Build and dependency cache directory names cloned wholesale across workspaces without descending inside.
+const PRESERVED_CACHE_DIRS: &[&str] = &[
+    "target",
+    "node_modules",
+    ".pnpm-store",
+    ".turbo",
+    ".next",
+    ".nuxt",
+    ".svelte-kit",
+    "dist",
+    "build",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    "vendor",
+    "_build",
+    "deps",
+    ".gradle",
+    ".build",
+    ".zig-cache",
+    "zig-out",
+    ".dart_tool",
+    "cmake-build-debug",
+    "cmake-build-release",
+];
+
 /// Top-level dependency, build-cache, and IDE/agent configuration directories preserved across tree materializations.
 const PRESERVED_TOP_DIRS: &[&str] = &[
     ".git",
@@ -602,7 +755,7 @@ const PRESERVED_ROOT_FILES: &[&str] = &[
 ];
 
 /// Materializes all files from `tree_id` into `target_dir` atomically, removing tracked files
-/// that are no longer present in `tree_id`.
+/// that are no longer present in `tree_id` while preserving untracked `.gitignore`d and secret files.
 ///
 /// # Errors
 /// Returns [`CoreError`] if any path escapes `target_dir` or if reading blobs or writing files fails.
@@ -622,7 +775,23 @@ pub fn materialize_tree_to_dir(
         .map(|c| c.cow_cache_dirs)
         .unwrap_or_default();
 
-    // Remove stale files on disk that are not present in `tree_files` (skipping `.git`, `.tessera`, harness configs, and build caches).
+    let mut init_rules = load_ignore_rules(target_dir, git.git_dir());
+    if target_dir != git.repo_root() {
+        append_ignore_rules_from_file(&git.repo_root().join(".gitignore"), "", &mut init_rules);
+    }
+
+    if let Some(gi_entry) = tree_files.get(".gitignore") {
+        if let Ok(bytes) = git.read_blob(&gi_entry.blob_id) {
+            if let Ok(text) = std::str::from_utf8(&bytes) {
+                append_ignore_rules_from_str(text, "", &mut init_rules);
+            }
+        }
+    }
+
+    let ignore_rules = std::cell::RefCell::new(init_rules);
+
+    // Remove stale tracked files on disk that are not present in `tree_files`
+    // (skipping `.git`, `.tessera`, harness configs, build caches, and `.gitignore`d or secret files).
     let walker = WalkDir::new(target_dir).into_iter().filter_entry(|e| {
         if e.depth() == 0 {
             return true;
@@ -636,6 +805,41 @@ pub fn materialize_tree_to_dir(
                     || extra_preserved.iter().any(|d| d == name)
                 {
                     return false;
+                }
+            }
+
+            if let Ok(rel) = e.path().strip_prefix(target_dir) {
+                let rel_str = rel.to_string_lossy().replace('\\', "/");
+                let prefix = format!("{rel_str}/");
+                let has_tracked_descendant = tree_files
+                    .range(prefix.clone()..)
+                    .next()
+                    .is_some_and(|(k, _)| k.starts_with(&prefix));
+
+                if !has_tracked_descendant && is_path_ignored(&rel_str, true, &ignore_rules.borrow())
+                {
+                    return false;
+                }
+
+                let nested_gi = e.path().join(".gitignore");
+                if nested_gi.is_file() {
+                    append_ignore_rules_from_file(
+                        &nested_gi,
+                        &rel_str,
+                        &mut ignore_rules.borrow_mut(),
+                    );
+                }
+
+                if let Some(tree_gi) = tree_files.get(&format!("{rel_str}/.gitignore")) {
+                    if let Ok(bytes) = git.read_blob(&tree_gi.blob_id) {
+                        if let Ok(text) = std::str::from_utf8(&bytes) {
+                            append_ignore_rules_from_str(
+                                text,
+                                &rel_str,
+                                &mut ignore_rules.borrow_mut(),
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -656,6 +860,7 @@ pub fn materialize_tree_to_dir(
             if !rel_str.is_empty()
                 && !tree_files.contains_key(&rel_str)
                 && !PRESERVED_ROOT_FILES.contains(&rel_str.as_str())
+                && !is_path_ignored(&rel_str, false, &ignore_rules.borrow())
             {
                 stale_files.push(entry.path().to_path_buf());
             }
@@ -725,6 +930,7 @@ pub fn materialize_tree_to_dir(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     #[test]
     fn cow_workspace_clones_files_and_sanitizes_d_files() {
@@ -762,5 +968,101 @@ mod tests {
         // Warm `.rlib` is preserved while poisoned `.d` file is sanitized!
         assert!(dst_dir.join("target/debug/deps/libapp.rlib").is_file());
         assert!(!dst_dir.join("target/debug/deps/app.d").exists());
+    }
+
+    #[test]
+    fn materialize_and_sync_preserve_gitignored_secrets_and_monorepo_symlinks() {
+        let repo_dir = tempfile::tempdir().expect("repo tempdir");
+        let ws_dir = tempfile::tempdir().expect("ws tempdir");
+
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(repo_dir.path())
+            .output()
+            .expect("git init");
+        let git = GitBackend::discover(repo_dir.path()).expect("discover git");
+
+        let gitignore_content = b"*.db\n.dev.vars\nlocal.properties\nstorage/\n";
+        let gi_blob = git.write_blob(gitignore_content).expect("write .gitignore");
+        let main_blob = git.write_blob(b"fn main() {}\n").expect("write main.rs");
+
+        let mut tree_map = BTreeMap::new();
+        tree_map.insert(
+            ".gitignore".to_string(),
+            core::FileEntry {
+                blob_id: gi_blob,
+                executable: false,
+            },
+        );
+        tree_map.insert(
+            "src/main.rs".to_string(),
+            core::FileEntry {
+                blob_id: main_blob,
+                executable: false,
+            },
+        );
+        let tree_id = git.write_tree_from_map(&tree_map).expect("write tree");
+
+        fs::write(repo_dir.path().join(".gitignore"), gitignore_content).expect("write gi");
+        fs::write(repo_dir.path().join(".env"), "SECRET=1\n").expect("write .env");
+        fs::write(repo_dir.path().join(".env.local"), "LOCAL=1\n").expect("write .env.local");
+        fs::write(repo_dir.path().join(".dev.vars"), "CF_KEY=1\n").expect("write .dev.vars");
+        fs::write(repo_dir.path().join("local.properties"), "sdk.dir=/sdk\n")
+            .expect("write local.properties");
+        fs::create_dir_all(repo_dir.path().join("prisma")).expect("mkdir prisma");
+        fs::write(repo_dir.path().join("prisma/dev.db"), b"sqlite3_data").expect("write dev.db");
+        fs::create_dir_all(repo_dir.path().join("packages/ui")).expect("mkdir packages/ui");
+        fs::create_dir_all(repo_dir.path().join("packages/web/node_modules/pkg"))
+            .expect("mkdir nested node_modules");
+        fs::write(
+            repo_dir
+                .path()
+                .join("packages/web/node_modules/pkg/index.js"),
+            "module.exports = {};\n",
+        )
+        .expect("write nested pkg");
+
+        #[cfg(unix)]
+        {
+            fs::create_dir_all(repo_dir.path().join("node_modules/@scope")).expect("mkdir scope");
+            std::os::unix::fs::symlink(
+                Path::new("../../packages/ui"),
+                repo_dir.path().join("node_modules/@scope/ui"),
+            )
+            .expect("create monorepo symlink");
+        }
+
+        // Sync missing caches and gitignored/secret files into `ws_dir`.
+        let synced =
+            sync_missing_cow_caches(repo_dir.path(), ws_dir.path(), &[]).expect("sync caches");
+        assert!(synced >= 5);
+        assert!(ws_dir.path().join(".env").is_file());
+        assert!(ws_dir.path().join(".env.local").is_file());
+        assert!(ws_dir.path().join(".dev.vars").is_file());
+        assert!(ws_dir.path().join("local.properties").is_file());
+        assert!(ws_dir.path().join("prisma/dev.db").is_file());
+        assert!(ws_dir
+            .path()
+            .join("packages/web/node_modules/pkg/index.js")
+            .is_file());
+
+        #[cfg(unix)]
+        {
+            let link_meta = fs::symlink_metadata(ws_dir.path().join("node_modules/@scope/ui"))
+                .expect("monorepo symlink must survive sync_missing_cow_caches");
+            assert!(link_meta.file_type().is_symlink());
+        }
+
+        // Write a stale tracked file into `ws_dir` and run `materialize_tree_to_dir`.
+        fs::write(ws_dir.path().join("obsolete.txt"), "remove me\n").expect("write obsolete");
+        materialize_tree_to_dir(&git, &tree_id, ws_dir.path()).expect("materialize tree");
+
+        assert!(!ws_dir.path().join("obsolete.txt").exists());
+        assert!(ws_dir.path().join("src/main.rs").is_file());
+        assert!(ws_dir.path().join(".env").is_file());
+        assert!(ws_dir.path().join(".env.local").is_file());
+        assert!(ws_dir.path().join(".dev.vars").is_file());
+        assert!(ws_dir.path().join("local.properties").is_file());
+        assert!(ws_dir.path().join("prisma/dev.db").is_file());
     }
 }

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Cross-platform Multi-Shell & Full Lifecycle E2E Test Suite for Linux, macOS, FreeBSD, OpenBSD, and NetBSD.
+# Cross-platform Multi-Shell & Full Lifecycle E2E Test Suite for Linux, macOS, FreeBSD, and OpenBSD.
 # Tests `tes` across every installed shell (`zsh`, `bash`, `fish`, `sh`, `dash`, `ksh`, `mksh`, `oksh`,
 # `yash`, `tcsh`, `csh`, `nu`, `elvish`, `pwsh`) plus zero-hook POSIX session isolation.
 
