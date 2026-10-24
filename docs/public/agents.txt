@@ -1,0 +1,127 @@
+# Tessera (tes): Autonomous AI Agent Protocol & Reference
+
+> URL: https://tessera.getlunaris.dev/agents.txt | Related: https://tessera.getlunaris.dev/llms.txt | https://tessera.getlunaris.dev/llms-full.txt
+
+Tessera (`tes`) is a multi-agent coordination layer built on top of your existing Git repository (`.git/tessera`). It does not replace Git. Every commit, branch, and merge is stored as standard Git objects and refs. Instead, Tessera isolates concurrent AI coding agents and terminal sessions inside a single Git checkout, provides Copy-on-Write branch sandboxes with isolated ports and test databases, and merges concurrent edits structurally using 3-way Tree-sitter AST merging.
+
+---
+
+## 1. Critical Rules for AI Coding Agents
+
+1. **NEVER run raw `git` commands** (`git status`, `git diff`, `git log`, `git branch`, `git checkout`, `git switch`, `git stash`, `git reset`, `git add`, `git commit`).
+   - Standard Git mutates `.git/HEAD` globally across the folder and overwrites concurrent agent work.
+   - Always use `tes` CLI equivalents (`tes status`, `tes diff`, `tes log`, `tes branch`, `tes switch`, `tes stash`, `tes restore`, `tes pull`, `tes push`, `tes commit`, `tes merge`).
+2. **Never Revert Concurrent Peer Edits**:
+   - When multiple agents edit the same file on the same branch, `tes hook post-tool` automatically 3-way AST-merges their edits on disk.
+   - `tes status` and `tes diff` show only your session's own changes (`Staged / Session Changes`) and list concurrent `Peer Session Changes` separately. Never delete or revert code authored by a peer session.
+3. **Prefer `tes` CLI Commands in Terminal Tool Calls**:
+   - Running `tes` via terminal automatically binds to your per-tab session ID (`ANTIGRAVITY_CONVERSATION_ID`, `CLAUDE_SESSION_ID`, `CODEX_THREAD_ID`, `CURSOR_TRACE_ID`, `TERM_SESSION_ID`, etc.).
+
+---
+
+## 2. Mandatory Autonomous Workflow (4 Steps)
+
+### Step 1: Before Editing Files (Claim Intent, Branch & Paths)
+```bash
+tes claim [--branch <branch>] --intent "<concise summary of your task>" <target-file-paths...>
+```
+- If `--branch <branch>` is passed, Tessera automatically creates `<branch>` (if needed) and binds your agent session to `<branch>` without changing `.git/HEAD` for the user's editor or other agents.
+- Records base file snapshots so your edits can be 3-way AST-reconciled.
+
+### Step 2: Immediately After Editing Each File (Reconcile Edits)
+```bash
+tes hook post-tool --path <edited-file>
+```
+- Runs a 3-way Tree-sitter AST and token merge against the branch state and any concurrent same-branch peer edits.
+- Preserves per-branch isolation so edits on a feature branch never leak into `main`.
+
+### Step 3: Running Builds, Tests, Linters, or Dev Servers (Execute in CoW Sandbox)
+```bash
+tes exec [-b <branch>] -- <command>
+```
+- Materializes the branch's committed + uncommitted files inside a Copy-on-Write sandbox (`clonefile` on macOS APFS, `FICLONE` on Linux Btrfs/XFS/bcachefs).
+- Reuses `node_modules`, `target`, `.venv`, and `vendor` in milliseconds without extra disk space.
+- Injects isolated environment variables per session slot:
+  - `PORT` / `TES_PORT` (`4100`, `4200`, ...)
+  - `TES_BRANCH` (`<branch>`)
+  - `TES_DB_NAME` (`tessera_slot_<N>`)
+  - `DATABASE_URL` (`sqlite:///.../tessera_slot_<N>.db` or custom template from `tessera.toml`)
+
+### Step 4: When Task Is Complete (Commit or Merge)
+```bash
+# Commit your session's isolated changes onto its target branch
+tes commit -m "<type>(<scope>): <description>"
+
+# Or AST-merge one or more feature branches into a target branch (e.g. main)
+tes merge <branch1> [<branch2> ...] --into main -m "<commit message>"
+```
+
+---
+
+## 3. Handling Conflicts, Checkpoints & Rollbacks
+
+- **If a Conflict Is Reported**:
+  - Standard Git conflict markers (`<<<<<<<`, `=======`, `>>>>>>>`) are written into the conflicted file.
+  - Either edit the file to remove the conflict markers and run `tes hook post-tool --path <file>`, or resolve via CLI:
+    ```bash
+    tes conflicts [--json]
+    tes resolve <path> --strategy <working|ast-union|ours|theirs>
+    ```
+  - Never manually delete files inside `.git/tessera/`.
+- **Checkpoints, Restore & Undo**:
+  ```bash
+  tes checkpoint <name>                  # Save a named checkpoint in the operation log
+  tes restore [<rev>] [<paths...>]       # Restore branch or specific files to checkpoint/SHA/HEAD~N
+  tes oplog                              # View chronological operation log
+  tes undo [--op <op-id>]                # Roll back the most recent operation or merge
+  ```
+
+---
+
+## 4. Complete CLI Command Cheatsheet
+
+| Command | Usage & Flags |
+|---------|---------------|
+| `tes init` | `tes init [--harness <antigravity\|claude\|cursor\|codex\|windsurf\|kiro\|opencode\|vscode\|all>]` |
+| `tes env` | `tes env --install` or `tes env --zsh \| --bash \| --fish \| --sh \| --tcsh \| --nu \| --elvish \| --pwsh` |
+| `tes claim` | `tes claim [-b <branch>] --intent "<goal>" <files...>` |
+| `tes switch` | `tes switch <branch> [-c] [--editor \| -e]` (`--editor` switches the IDE working tree) |
+| `tes branch` | `tes branch [-l] [-v] [-d <branch>] [-D <branch>] [-m <old> <new>] [--json]` |
+| `tes status` | `tes status [-s \| --short \| --porcelain] [-b \| --branch] [--json]` |
+| `tes diff` | `tes diff [<revA>..<revB>] [--staged \| --cached] [--all] [--stat] [--name-only] [--name-status] [-U <N>] [-w] [-b <branch>] [-- <paths...>]` |
+| `tes stash` | `tes stash [push [-m "<msg>"] [<paths...>]] \| pop \| apply \| list \| drop \| clear` |
+| `tes radar` | `tes radar [--json]` (lists all active sessions, ports, branches, and claimed files) |
+| `tes exec` | `tes exec [-b <branch>] -- <cmd> [args...]` |
+| `tes commit` | `tes commit [-m "<msg>"] [--amend] [--no-edit] [--author "<Name <email>>"] [--co-author \| --no-co-author]` |
+| `tes merge` | `tes merge [<branches...>] [--into <target>] [-m "<msg>"] [--co-author \| --no-co-author]` |
+| `tes cherry-pick` | `tes cherry-pick <rev> [-b <target-branch>]` |
+| `tes pull` | `tes pull [<remote>] [<branch>]` |
+| `tes push` | `tes push [-u] [<remote>] [<branch>]` |
+| `tes log` | `tes log [-n <count>] [-b <branch>] [--oneline] [-p] [--stat] [--name-only] [--name-status] [--graph] [--all] [--grep <pat>] [-S <str>] [-- <paths...>]` |
+| `tes conflicts` | `tes conflicts [--json]` |
+| `tes resolve` | `tes resolve <path> --strategy <ast-union\|ours\|theirs\|working>` |
+| `tes checkpoint` | `tes checkpoint <name>` |
+| `tes restore` | `tes restore [<rev>] [<paths...>] [-b <branch>] [--source <rev>]` |
+| `tes undo` | `tes undo [--op <operation-id>]` |
+| `tes config` | `tes config show \| set <k> <v> \| add-cache-dir <d> \| add-bin-dir <d> \| set-env <k> <v> \| trust \| untrust` |
+| `tes session` | `tes session focus <session-id>` (jumps to the terminal tab, tmux/zellij/kitty/wezterm pane, or IDE window) |
+
+---
+
+## 5. Model Context Protocol (MCP) Tools (`tes mcp`)
+
+When connected via MCP (`tes mcp`), the following tools are available:
+- `claim`: `{ intent: string, symbols?: string[], branch?: string }`
+- `status`: `{}`
+- `radar`: `{}`
+- `branch`: `{ action?: "list" | "delete" | "force_delete" | "rename", name?: string, new_name?: string }`
+- `stash`: `{ action?: "push" | "pop" | "apply" | "list" | "drop" | "clear", message?: string, index?: number, paths?: string[] }`
+- `pull`: `{ remote?: string, branch?: string }`
+- `cherry-pick`: `{ rev: string, branch?: string }`
+- `conflicts`: `{}`
+- `resolve`: `{ file_path: string, strategy?: "ast-union" | "ours" | "theirs" | "working" }`
+- `checkpoint`: `{ name: string }`
+- `restore`: `{ target?: string, paths?: string[], branch?: string, source?: string }`
+- `undo`: `{ op_id?: string }`
+- `sync`: `{}`
+- `merge`: `{ message?: string, sources?: string[], into?: string }`

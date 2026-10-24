@@ -1,0 +1,21 @@
+<svg width="720" height="560" viewBox="0 0 720 560" xmlns="http://www.w3.org/2000/svg">
+  <rect width="720" height="560" fill="none"/>
+
+  <g transform="translate(104, 16)">
+    <polygon points="256,52 368,124 256,196 144,124" fill="#93C5FD"/>
+    <polygon points="132,164 244,236 132,308 20,236" fill="#60A5FA"/>
+    <polygon points="380,164 492,236 380,308 268,236" fill="#2563EB"/>
+    <polygon points="256,276 368,348 256,420 144,348" fill="#1E3A8A"/>
+  </g>
+
+  <text
+    x="360"
+    y="500"
+    text-anchor="middle"
+    font-family="Inter, system-ui, -apple-system, Segoe UI, sans-serif"
+    font-size="72"
+    letter-spacing="8"
+    fill="#FFFFFF">
+    TESSERA
+  </text>
+</svg>

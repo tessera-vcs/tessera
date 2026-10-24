@@ -1,0 +1,263 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust-matrix:
+    name: Rust Lint & Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Cargo registry and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src
+
+      - name: Configure Git identity for tests
+        run: |
+          git config --global user.name "Tessera CI"
+          git config --global user.email "ci@tessera.getlunaris.dev"
+
+      - name: Run cargo clippy
+        working-directory: src
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run workspace unit & integration tests
+        working-directory: src
+        run: cargo test --workspace
+
+  multi-shell-e2e:
+    name: Multi-Shell Real-World E2E (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src
+
+      - name: Install shells on Linux (zsh, bash, fish, dash, ksh, mksh, yash, tcsh, csh, elvish)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zsh bash fish dash ksh mksh yash tcsh csh elvish
+
+      - name: Install shells on macOS (bash 5, fish, dash, mksh, oksh, yash, elvish, nushell)
+        if: runner.os == 'macOS'
+        run: |
+          brew install bash fish dash mksh oksh yash elvish nushell
+
+      - name: Build release binary
+        working-directory: src
+        run: cargo build --release -p cli
+
+      - name: Run multi-shell E2E suite
+        env:
+          TES_BIN: ${{ github.workspace }}/src/target/release/tes
+        run: ./scripts/ci_multi_shell_e2e.sh
+
+  windows-pwsh-e2e:
+    name: Windows PowerShell E2E (windows-latest)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src
+
+      - name: Build release binary
+        working-directory: src
+        run: cargo build --release -p cli
+
+      - name: Run Windows PowerShell E2E lifecycle test
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          git config --global user.name "Tessera CI"
+          git config --global user.email "ci@tessera.getlunaris.dev"
+
+          $tesBin = Join-Path $PWD "src\target\release\tes.exe"
+          $env:PATH = (Split-Path $tesBin -Parent) + ";" + $env:PATH
+
+          $workDir = Join-Path $env:TEMP ("tes-win-e2e-" + [guid]::NewGuid().ToString("N"))
+          New-Item -ItemType Directory -Force -Path (Join-Path $workDir "src") | Out-Null
+          Set-Location $workDir
+
+          @"
+          pub fn alpha() -> i32 {
+              10
+          }
+
+          pub fn beta() -> i32 {
+              20
+          }
+          "@ | Set-Content -Path "src\lib.rs" -Encoding UTF8
+
+          & $tesBin init --branch main
+          Invoke-Expression (& $tesBin env --pwsh)
+
+          tes switch feat/win-pwsh
+          if ($env:TES_BRANCH -ne "feat/win-pwsh") {
+              throw "Expected TES_BRANCH=feat/win-pwsh, got $($env:TES_BRANCH)"
+          }
+          tes switch main
+
+          $env:TES_SESSION_ID = "win-agent-a"
+          & $tesBin claim --branch feat/win-a --intent "Update alpha" src/lib.rs
+          @"
+          pub fn alpha() -> i32 {
+              100
+          }
+
+          pub fn beta() -> i32 {
+              20
+          }
+          "@ | Set-Content -Path "src\lib.rs" -Encoding UTF8
+          & $tesBin hook post-tool --path src/lib.rs
+          & $tesBin commit -m "feat(win-a): update alpha"
+
+          $env:TES_SESSION_ID = "win-agent-b"
+          & $tesBin claim --branch feat/win-b --intent "Update beta" src/lib.rs
+          @"
+          pub fn alpha() -> i32 {
+              10
+          }
+
+          pub fn beta() -> i32 {
+              200
+          }
+          "@ | Set-Content -Path "src\lib.rs" -Encoding UTF8
+          & $tesBin hook post-tool --path src/lib.rs
+          & $tesBin commit -m "feat(win-b): update beta"
+
+          $env:TES_SESSION_ID = "editor"
+          & $tesBin merge feat/win-a feat/win-b --into main -m "feat: merge win-a and win-b"
+
+          $merged = Get-Content -Path "src\lib.rs" -Raw
+          if (($merged -notmatch "100") -or ($merged -notmatch "200")) {
+              throw "3-way AST merge failed on Windows: $merged"
+          }
+
+          git fsck --full
+          Write-Host "Windows PowerShell E2E passed!"
+
+  bsd-matrix:
+    name: BSD Cross-Platform Tests (FreeBSD, OpenBSD & NetBSD)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: freebsd
+            vm_action: vmactions/freebsd-vm@v1
+            prepare: pkg install -y git rust bash fish dash mksh yash
+          - os: openbsd
+            vm_action: vmactions/openbsd-vm@v1
+            prepare: pkg_add git rust bash fish dash tcsh
+          - os: netbsd
+            vm_action: vmactions/netbsd-vm@v1
+            prepare: pkgin -y install git rust mozilla-rootcerts-openssl bash fish dash mksh tcsh
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run tests on FreeBSD
+        if: matrix.os == 'freebsd'
+        uses: vmactions/freebsd-vm@v1
+        with:
+          usesh: true
+          prepare: ${{ matrix.prepare }}
+          run: |
+            git config --global user.name "Tessera BSD CI"
+            git config --global user.email "ci@tessera.getlunaris.dev"
+            cargo test --manifest-path src/Cargo.toml --workspace
+            cargo build --manifest-path src/Cargo.toml --release -p cli
+            TES_BIN=./src/target/release/tes bash ./scripts/ci_multi_shell_e2e.sh
+
+      - name: Run tests on OpenBSD
+        if: matrix.os == 'openbsd'
+        uses: vmactions/openbsd-vm@v1
+        with:
+          usesh: true
+          prepare: ${{ matrix.prepare }}
+          run: |
+            git config --global user.name "Tessera BSD CI"
+            git config --global user.email "ci@tessera.getlunaris.dev"
+            cargo test --manifest-path src/Cargo.toml --workspace
+            cargo build --manifest-path src/Cargo.toml --release -p cli
+            TES_BIN=./src/target/release/tes bash ./scripts/ci_multi_shell_e2e.sh
+
+      - name: Run tests on NetBSD
+        if: matrix.os == 'netbsd'
+        uses: vmactions/netbsd-vm@v1
+        with:
+          usesh: true
+          prepare: ${{ matrix.prepare }}
+          run: |
+            git config --global user.name "Tessera BSD CI"
+            git config --global user.email "ci@tessera.getlunaris.dev"
+            cargo test --manifest-path src/Cargo.toml --workspace
+            cargo build --manifest-path src/Cargo.toml --release -p cli
+            TES_BIN=./src/target/release/tes bash ./scripts/ci_multi_shell_e2e.sh
+
+  vscode-and-docs:
+    name: VS Code Extension & Docs Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Build & Typecheck VS Code Extension
+        working-directory: extensions/vscode
+        run: |
+          npm ci
+          npm run compile
+
+      - name: Build VitePress Documentation
+        working-directory: docs
+        run: |
+          npm ci
+          npm run docs:build

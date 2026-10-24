@@ -1,0 +1,12 @@
+/target
+/src/target
+/.tes
+.DS_Store
+readme/
+scripts/
+node_modules/
+docs/.vitepress/cache/
+docs/.vitepress/dist/
+extensions/vscode/out/
+**/*/package-lock.json
+*.vsix

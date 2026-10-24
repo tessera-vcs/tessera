@@ -1,0 +1,317 @@
+{
+  "name": "tessera",
+  "displayName": "Tessera",
+  "description": "Run multiple AI agents and terminal sessions in the same Git repository.",
+  "publisher": "Lunaris",
+  "license": "MIT",
+  "version": "0.1.0",
+  "icon": "resources/logo.png",
+  "homepage": "https://tessera.getlunaris.dev",
+  "preview": true,
+  "pricing": "Free",
+  "qna": "false",
+  "galleryBanner": {
+    "color": "#0a0a0a",
+    "theme": "dark"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/getLunaris/tessera.git"
+  },
+  "bugs": {
+    "url": "https://github.com/getLunaris/tessera/issues"
+  },
+  "engines": {
+    "vscode": "^1.107.0"
+  },
+  "categories": [
+    "SCM Providers",
+    "AI"
+  ],
+  "extensionKind": [
+    "workspace"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onUri"
+  ],
+  "main": "./out/extension.js",
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "check": "tsc --noEmit -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "sidebar",
+          "title": "Tessera",
+          "icon": "resources/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "sidebar": [
+        {
+          "id": "branches",
+          "name": "Branches"
+        },
+        {
+          "id": "sessions",
+          "name": "Sessions"
+        },
+        {
+          "id": "conflicts",
+          "name": "Conflicts & Checkpoints"
+        }
+      ],
+      "scm": [
+        {
+          "id": "scmBranches",
+          "name": "Branches"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "tes.openGraph",
+        "title": "Open Branch Graph",
+        "category": "Tessera",
+        "icon": "$(git-commit)"
+      },
+      {
+        "command": "tes.openConflictStudio",
+        "title": "Open Conflict Resolver",
+        "category": "Tessera",
+        "icon": "$(warning)"
+      },
+      {
+        "command": "tes.switchEditorBranch",
+        "title": "Switch Editor Branch",
+        "category": "Tessera",
+        "icon": "$(source-control)"
+      },
+      {
+        "command": "tes.createBranch",
+        "title": "New Branch",
+        "category": "Tessera",
+        "icon": "$(add)"
+      },
+      {
+        "command": "tes.mergeBranch",
+        "title": "Merge Branch",
+        "category": "Tessera",
+        "icon": "$(git-merge)"
+      },
+      {
+        "command": "tes.restoreBranch",
+        "title": "Restore Branch",
+        "category": "Tessera",
+        "icon": "$(history)"
+      },
+      {
+        "command": "tes.createCheckpoint",
+        "title": "Create Checkpoint",
+        "category": "Tessera",
+        "icon": "$(bookmark)"
+      },
+      {
+        "command": "tes.pushBranch",
+        "title": "Push Branch",
+        "category": "Tessera",
+        "icon": "$(cloud-upload)"
+      },
+      {
+        "command": "tes.openBranchTerminal",
+        "title": "Open Terminal on Branch",
+        "category": "Tessera",
+        "icon": "$(terminal)"
+      },
+      {
+        "command": "tes.openBranchPort",
+        "title": "Open Dev Server",
+        "category": "Tessera",
+        "icon": "$(globe)"
+      },
+      {
+        "command": "tes.diffBranchFile",
+        "title": "Diff with main",
+        "category": "Tessera",
+        "icon": "$(diff)"
+      },
+      {
+        "command": "tes.deleteBranch",
+        "title": "Delete Branch",
+        "category": "Tessera",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "tes.discardWorkingChanges",
+        "title": "Discard Working Changes",
+        "category": "Tessera",
+        "icon": "$(discard)"
+      },
+      {
+        "command": "tes.focusSession",
+        "title": "Jump to Session",
+        "category": "Tessera",
+        "icon": "$(link-external)"
+      },
+      {
+        "command": "tes.closeSession",
+        "title": "Close Session",
+        "category": "Tessera",
+        "icon": "$(close)"
+      },
+      {
+        "command": "tes.clearSessions",
+        "title": "Clear Idle Sessions",
+        "category": "Tessera",
+        "icon": "$(clear-all)"
+      },
+      {
+        "command": "tes.popStash",
+        "title": "Pop Stash (3-Way AST Merge)",
+        "category": "Tessera",
+        "icon": "$(repo-pull)"
+      },
+      {
+        "command": "tes.dropStash",
+        "title": "Drop Stash",
+        "category": "Tessera",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "tes.refresh",
+        "title": "Refresh",
+        "category": "Tessera",
+        "icon": "$(refresh)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "tes.openGraph",
+          "when": "view == branches || view == scmBranches",
+          "group": "navigation@1"
+        },
+        {
+          "command": "tes.createBranch",
+          "when": "view == branches || view == scmBranches",
+          "group": "navigation@2"
+        },
+        {
+          "command": "tes.clearSessions",
+          "when": "view == sessions",
+          "group": "navigation@1"
+        },
+        {
+          "command": "tes.refresh",
+          "when": "view == branches || view == sessions || view == conflicts || view == scmBranches",
+          "group": "navigation@3"
+        },
+        {
+          "command": "tes.createCheckpoint",
+          "when": "view == conflicts",
+          "group": "navigation@1"
+        },
+        {
+          "command": "tes.openConflictStudio",
+          "when": "view == conflicts",
+          "group": "navigation@2"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "tes.focusSession",
+          "when": "viewItem == sessionItem",
+          "group": "inline@0"
+        },
+        {
+          "command": "tes.switchEditorBranch",
+          "when": "viewItem == branchItem || viewItem == sessionItem",
+          "group": "inline@1"
+        },
+        {
+          "command": "tes.openBranchTerminal",
+          "when": "viewItem == branchItem",
+          "group": "inline@2"
+        },
+        {
+          "command": "tes.mergeBranch",
+          "when": "viewItem == branchItem || viewItem == sessionItem",
+          "group": "inline@3"
+        },
+        {
+          "command": "tes.closeSession",
+          "when": "viewItem == sessionItem",
+          "group": "inline@4"
+        },
+        {
+          "command": "tes.restoreBranch",
+          "when": "viewItem == branchItem || viewItem == checkpointItem",
+          "group": "inline@4"
+        },
+        {
+          "command": "tes.deleteBranch",
+          "when": "viewItem == branchItem",
+          "group": "inline@5"
+        },
+        {
+          "command": "tes.openConflictStudio",
+          "when": "viewItem == conflictItem",
+          "group": "inline@1"
+        },
+        {
+          "command": "tes.popStash",
+          "when": "viewItem == stashItem",
+          "group": "inline@1"
+        },
+        {
+          "command": "tes.dropStash",
+          "when": "viewItem == stashItem",
+          "group": "inline@2"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Tessera",
+      "properties": {
+        "tes.binPath": {
+          "type": "string",
+          "default": "tes",
+          "scope": "application",
+          "description": "Path to the tes executable."
+        }
+      }
+    }
+  },
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": "limited",
+      "restrictedConfigurations": [
+        "tes.binPath"
+      ]
+    }
+  },
+  "keywords": [
+    "git",
+    "vcs",
+    "multi-agent",
+    "ai",
+    "branch",
+    "ast-merge"
+  ],
+  "author": {
+    "name": "Donald Pakkies",
+    "email": "donaldpakkies@gmail.com",
+    "url": "https://getlunaris.dev"
+  },
+  "devDependencies": {
+    "@types/node": "26.6.5",
+    "@types/vscode": "1.107.0",
+    "typescript": "7.0.2"
+  }
+}

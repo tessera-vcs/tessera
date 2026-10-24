@@ -1,0 +1,2639 @@
+# Tessera: Complete Documentation (llms-full.txt)
+
+> URL: https://tessera.getlunaris.dev/llms-full.txt | Index: https://tessera.getlunaris.dev/llms.txt | Agent Protocol: https://tessera.getlunaris.dev/agents.txt
+
+---
+
+# Tessera: Multi-Agent Coordination for Git
+
+> Run multiple agents in the same Git repository.
+
+Tessera works on top of your existing Git repository so concurrent AI agents and terminal sessions can share one checkout, work on independent branches, and merge edits at the AST level without manual worktrees or overwritten files.
+
+```ts
+// Live Multi-Agent Attribution in src/currency.ts (main):
+// [CodeLens] 2 agents concurrently editing this file (main): antigravity-a1b2 · claude-c3d4
+export function formatCurrency(
+  cents: number,
+  // [antigravity-a1b2 · L3-L6: Add locale and decimals]
+  currency = "USD",
+  locale = "en-US",
+  decimals = 2
+): string {
+  const amount = (cents / 100).toFixed(decimals);
+  return `[${locale}] ${currency} ${amount}`;
+}
+// [claude-c3d4 · L10-L14: Add formatCompact helper]
+export function formatCompact(cents: number) {
+  return new Intl.NumberFormat("en-US", {
+    style: "currency", currency: "USD", notation: "compact"
+  }).format(cents / 100);
+}
+```
+
+## Why Tessera?
+
+In standard Git, every open terminal and AI agent shares a single `.git/HEAD` and working directory. Running two agents at once overwrites files or forces you to maintain separate `git worktree` folders. Tessera does not replace Git. It coordinates sessions inside `.git/tessera` and writes standard Git commits so you stay in one folder while each session owns its own branch, dev server, and AST-merged changes. [Read Why Tessera? →](/getting-started/why-tessera)
+
+```text
+[Workflow: Parallel Agents in One Repository]
+1. Prompt in One Repo (~/acme-web)
+   ├─ Agent 1: "Add Pricing"
+   └─ Agent 2: "Add FAQ"
+       │
+       ▼
+2. Own Branches (Isolated in .git/tessera while .git/HEAD stays on main)
+   ├─ feat/pricing (Agent 1 · +Pricing)
+   └─ feat/faq     (Agent 2 · +FAQ)
+       │
+       ▼
+3. Branch Dev Servers (Copy-on-Write node_modules / target)
+   ├─ http://localhost:4100 (feat/pricing)
+   └─ http://localhost:4200 (feat/faq)
+       │
+       ▼
+4. Merge into main (3-Way Tree-sitter AST Merge)
+   └─ tes merge feat/pricing feat/faq --into main -m "feat: add pricing and faq"
+```
+
+### **Semantic Merging**
+Line-based Git merges break when two agents edit the same file. Tessera parses your code with Tree-sitter to merge functions, imports, class methods, and manifest files structurally.
+
+```ts
+// Agent 1 adds `locale`, Agent 2 adds `decimals` to the same signature:
+export function formatCurrency(
+  cents: number,
+  currency: string = "USD",
+  locale: string = "en-US",
+  decimals: number = 2
+): string {
+  const amount = (cents / 100).toFixed(decimals);
+  return `[${locale}] ${currency} ${amount}`;
+}
+```
+
+### **Session Isolation**
+Each terminal tab and agent session can switch to its own branch without changing `.git/HEAD` for the rest of your workspace. Edits on the same branch combine automatically on disk, while edits on separate branches stay completely isolated.
+
+```bash
+# Terminal 1 works on feat/pricing
+tes switch feat/pricing
+
+# Terminal 2 works on feat/faq at the same time
+tes switch feat/faq
+```
+
+### **Instant Sandboxes**
+Run builds, tests, and dev servers on any branch without reinstalling dependencies. Tessera clones `node_modules`, `target`, and `.venv` using filesystem copy-on-write and assigns each session its own port and test database.
+
+```bash
+# Run builds or dev servers in isolated Copy-on-Write branch sandboxes
+tes exec -b feat/pricing -- npm run build
+tes exec -b feat/faq -- npm test
+```
+
+## Work in Parallel
+
+Run multiple agents on the same branch, split features across branches, or run two dev servers side by side from a single checkout.
+
+### 1. Multiple Agents
+
+```bash
+# Initialize Tessera and install AI editor rules
+tes init
+
+# Prompt two AI agents in parallel:
+# Tab 1: "On branch feat/pricing, build PricingCalculator.vue and add it to App.vue"
+# Tab 2: "On branch feat/faq, build TestimonialsFaq.vue and add it to App.vue"
+
+# Check live agent sessions and claimed files
+tes radar
+```
+
+### 2. Per-Terminal Branches
+
+```bash
+# Enable (tes:<branch>) in your shell prompt
+tes env --install
+
+# Terminal 1: run feat/pricing on port 4100
+tes switch feat/pricing
+npm run dev
+
+# Terminal 2: run feat/faq on port 4200
+tes switch feat/faq
+npm run dev
+```
+
+### 3. Branch Merging
+
+```bash
+# Inspect branch diffs against main
+tes diff -b feat/pricing
+tes diff -b feat/faq
+
+# Merge both branches into main using 3-way AST merge
+tes merge feat/pricing feat/faq --into main -m "feat: add pricing and faq"
+
+# Push to remote
+tes push
+```
+
+---
+
+# Getting Started
+
+Tessera works on top of your existing Git repository so multiple AI coding agents and terminal sessions can work in the same checkout without overwriting files or colliding on `.git/HEAD`. This guide covers installing the `tes` CLI, initializing a repository, and running your first multi-branch workflow.
+
+## Prerequisites
+
+- **OS**: macOS, Linux, Windows, FreeBSD, OpenBSD, or NetBSD
+- **Git**: Standard Git 2.23+
+
+## Installation
+
+Install the `tes` CLI on **macOS, Linux, or BSD**:
+
+```bash
+curl -fsSL https://tessera.getlunaris.dev/install.sh | sh
+tes --version
+```
+
+Or on **Windows (PowerShell)**:
+
+```powershell
+irm https://tessera.getlunaris.dev/install.ps1 | iex
+tes --version
+```
+
+For shell integration, prebuilt binaries, and editor setup details, see the [Installation Guide](/getting-started/installation).
+
+## Initializing Your Project
+
+Navigate to any project directory and run `tes init`:
+
+```bash
+tes init
+```
+
+This creates `.git/tessera` and installs workspace rules for your AI coding editors.
+
+> **Note:** If the directory is not yet a Git repository, `tes init` runs `git init` and creates an initial commit from your existing files before setting up Tessera.
+
+## Your First Workflow
+
+Switch your current terminal tab to a feature branch, run your tests, and merge your work:
+
+```bash
+tes switch feat/pricing
+npm test
+tes status
+tes merge feat/pricing --into main -m "feat: add pricing calculator"
+```
+
+## What Each Command Does
+
+```bash
+tes init
+```
+
+- Sets up `.git/tessera` inside your existing Git repository
+- Installs instruction rules (`AGENTS.md`, `.agents/rules/tessera.md`, `.cursor/rules`, `CLAUDE.md`) so your AI coding agents coordinate through Tessera
+
+```bash
+tes switch feat/pricing
+```
+
+- Binds your current terminal tab to the `feat/pricing` branch (creating it from `HEAD` if it does not exist yet)
+- Prepares a Copy-on-Write sandbox for `feat/pricing` that shares your existing `node_modules`, `target`, or `.venv`
+
+```bash
+tes merge feat/pricing --into main -m "feat: add pricing calculator"
+```
+
+- Merges `feat/pricing` into `main` using Tessera's 3-way AST merge engine
+- Updates your working directory on `main`
+
+## Working in a Single Folder
+
+In standard Git, running two AI agents on two different branches requires creating separate `git worktree` folders, reinstalling dependencies in each folder, and configuring different ports by hand.
+
+With Tessera, you work inside a **single repository folder**:
+
+```bash
+# Terminal 1 works on feat/pricing (assigned port 4100)
+tes switch feat/pricing
+npm run dev
+
+# Terminal 2 works on feat/faq in the same folder (assigned port 4200)
+tes switch feat/faq
+npm run dev
+```
+
+When you prompt an AI agent in your editor, you do not need to mention `tes` in your prompt:
+
+```text
+On branch feat/pricing, create PricingCalculator.vue and add it to src/App.vue.
+```
+
+The workspace rules installed by `tes init` instruct the agent to claim the branch, isolate its edits, verify the build in its branch sandbox, and commit.
+
+## Next Steps
+
+- [Why Tessera?](/getting-started/why-tessera) - See how Tessera compares to standard Git and `git worktree`
+- [Installation](/getting-started/installation) - Set up `(tes:<branch>)` in your terminal prompt and tab completion
+- [Your First Workflow](/getting-started/first-workflow) - Walk through a multi-agent example step by step
+- [Guides](/guides/) - Learn about multi-agent workflows, dev servers, conflicts, and editor integration
+
+---
+
+# Why Tessera?
+
+Git assumes one person is editing one branch in one folder at a time. Every terminal tab and editor window in your project reads from the same `.git/HEAD` and writes to the same working tree on disk.
+
+That works fine when you write code by hand in a single editor, but it breaks down when you run two or three AI coding agents in parallel.
+
+If two agents edit `src/App.vue` at the same time, the second agent to save overwrites the first agent's lines, or sees unfamiliar code and reverts it. If one agent runs `git checkout feat/pricing` to test its work, it switches the branch underneath your editor, your running dev server, and every other agent in the folder.
+
+The usual workaround is `git worktree`: creating a separate copy of the repository in another folder for every agent. That requires duplicating `node_modules` or `target` directories, waiting on fresh builds, configuring different ports by hand so dev servers do not collide on `localhost:3000`, and jumping between separate editor windows.
+
+## One Folder, Multiple Branches and Dev Servers
+
+Tessera lets multiple agents and terminal tabs work in the **same repository folder** at the same time, either on separate branches or on the same branch.
+
+```text
+[Workflow: Parallel Agents in One Repository]
+1. Prompt in One Repo (~/acme-web)
+   ├─ Agent 1: "Add Pricing"
+   └─ Agent 2: "Add FAQ"
+       │
+       ▼
+2. Own Branches (Isolated in .git/tessera while .git/HEAD stays on main)
+   ├─ feat/pricing (Agent 1 · +Pricing)
+   └─ feat/faq     (Agent 2 · +FAQ)
+       │
+       ▼
+3. Branch Dev Servers (Copy-on-Write node_modules / target)
+   ├─ http://localhost:4100 (feat/pricing)
+   └─ http://localhost:4200 (feat/faq)
+       │
+       ▼
+4. Merge into main (3-Way Tree-sitter AST Merge)
+   └─ tes merge feat/pricing feat/faq --into main -m "feat: add pricing and faq"
+```
+
+When an agent claims a branch like `feat/pricing`, Tessera isolates that session inside `.git/tessera/` without changing `.git/HEAD` for the rest of your workspace. Both agents can edit `src/App.vue` on their own branches in `~/acme-web` at the same time without touching each other's uncommitted files.
+
+When you want to preview or test a branch, `tes exec -b feat/pricing -- npm run dev` starts the dev server inside a copy-on-write sandbox. It clones your existing `node_modules`, `target`, or `.venv` directory in milliseconds using filesystem reflinks and assigns each branch its own port (`localhost:4100`, `localhost:4200`) so you can open both branches side by side in your browser.
+
+## Merging by Syntax Tree
+
+Line-based Git merges fail whenever two branches touch adjacent lines, like when two agents add imports at the top of `src/App.vue` or register two new components in the same template.
+
+When you run `tes merge feat/pricing feat/faq --into main`, Tessera parses each file into a syntax tree with Tree-sitter and merges functions, imports, JSX/Vue templates, and lockfiles structurally. Compatible edits merge without manual conflict resolution.
+
+## Editing on the Same Branch
+
+You do not always want separate branches. When two agents work directly on `main` at the same time, Tessera runs a 3-way AST merge on disk every time an agent saves a file.
+
+```text
+[Workflow: Same-Branch AST Merging on main]
+1. Prompt on main   -> Agent 1 ("Add locale") & Agent 2 ("Add decimals") target src/currency.ts
+2. Concurrent Edits -> Both agents save directly on main (no file locks)
+3. Tree-sitter AST  -> Parses FunctionDecl -> merges ParamNode[1] (locale) + ParamNode[2] (decimals)
+4. Unified on Disk  -> Both edits preserved in src/currency.ts with zero overwrites
+```
+
+If one agent updates `formatCurrency()` while another adds `formatCompact()` in `src/currency.ts`, both edits are preserved on disk. In VS Code and Cursor, the Tessera extension highlights each agent's lines so you can see which session owns each change.
+
+## Built on Top of Git, Not a Replacement
+
+Tessera is not a replacement for Git and does not use a hosted server. Instead, it gives each AI agent and terminal session its own isolated state in `.git/tessera/` so concurrent sessions can use Git branches, diffs, and commits safely in the same working directory.
+
+Every `tes commit` or `tes merge` writes standard Git blobs, trees, and commits directly into `.git/objects/` and `refs/heads/*`. Your existing `git push`, GitHub pull requests, and CI pipelines work without changes.
+
+---
+
+[Install Tessera →](/getting-started/installation)
+
+---
+
+# Installation
+
+This guide covers installing the `tes` CLI, enabling shell prompt integration, and configuring your AI coding editors.
+
+## Requirements
+
+Tessera is lightweight and self-contained:
+
+- **OS**: macOS (APFS), Linux (Btrfs / XFS / bcachefs / ext4), FreeBSD, OpenBSD, NetBSD, or Windows (WSL2 and native Windows with PowerShell / Windows Terminal)
+- **Git**: Standard Git 2.23+
+
+> [!INFO]
+> On macOS (APFS) and Linux (Btrfs / XFS / bcachefs), Tessera uses native Copy-on-Write filesystem clones (`clonefile` and `FICLONE`) to duplicate `node_modules` and `target` directories in milliseconds without using extra disk space. On ext4, FreeBSD, OpenBSD, NetBSD, and Windows, Tessera automatically falls back to portable recursive sandbox cloning.
+
+## Installing the CLI
+
+### macOS, Linux, and BSD
+
+Install `tes` on macOS (Apple Silicon & Intel), Linux (`x86_64` & `ARM64`, glibc & musl), FreeBSD, OpenBSD, or NetBSD:
+
+```bash
+curl -fsSL https://tessera.getlunaris.dev/install.sh | sh
+```
+
+### Windows (PowerShell)
+
+Install `tes.exe` on Windows (`x86_64` and `ARM64`) using PowerShell:
+
+```powershell
+irm https://tessera.getlunaris.dev/install.ps1 | iex
+```
+
+The Windows installer verifies the SHA-256 checksum, extracts `tes.exe` into `$HOME\.local\bin`, adds it to your user `Path`, and configures your PowerShell `$PROFILE`.
+
+### Prebuilt Binaries
+
+You can also download prebuilt archives directly from GitHub Releases:
+
+| Platform                           | Architecture                            | Release Archive                                                                  |
+| ---------------------------------- | --------------------------------------- | -------------------------------------------------------------------------------- |
+| **macOS**                          | Apple Silicon (`arm64`)                 | `tes-aarch64-apple-darwin.tar.gz`                                                |
+| **macOS**                          | Intel (`x86_64`)                        | `tes-x86_64-apple-darwin.tar.gz`                                                 |
+| **Linux**                          | `x86_64` (static musl / glibc)          | `tes-x86_64-unknown-linux-musl.tar.gz` / `tes-x86_64-unknown-linux-gnu.tar.gz`   |
+| **Linux**                          | `ARM64` (`aarch64` static musl / glibc) | `tes-aarch64-unknown-linux-musl.tar.gz` / `tes-aarch64-unknown-linux-gnu.tar.gz` |
+| **Windows**                        | `x86_64` (MSVC)                         | `tes-x86_64-pc-windows-msvc.zip`                                                 |
+| **Windows**                        | `ARM64` (MSVC)                          | `tes-aarch64-pc-windows-msvc.zip`                                                |
+| **FreeBSD**                        | `x86_64`                                | `tes-x86_64-unknown-freebsd.tar.gz`                                              |
+| **OpenBSD**                        | `x86_64`                                | `tes-x86_64-unknown-openbsd.tar.gz`                                              |
+| **NetBSD**                         | `x86_64`                                | `tes-x86_64-unknown-netbsd.tar.gz`                                               |
+| **VS Code / Antigravity / Cursor** | Universal `.vsix`                       | `tessera-vscode.vsix`                                                            |
+
+Verify the installation:
+
+```bash
+tes --version
+```
+
+## Shell Integration
+
+Each terminal tab can switch branches independently, so it helps to show the active branch in your prompt:
+
+```text
+~/code/my-app main (tes:feat/pricing) ❯
+```
+
+### Automatic Setup
+
+Run `tes env --install` once to configure your shell profiles (`~/.zshrc`, `~/.bashrc`, `~/.bash_profile`, `~/.profile`, `~/.kshrc`, `~/.mkshrc`, `~/.tcshrc`, `~/.cshrc`, Fish's `config.fish`, and PowerShell's `$PROFILE` on Windows) automatically:
+
+```bash
+tes env --install
+```
+
+Open a new terminal tab (or reload your shell profile) to activate the prompt indicator and `<TAB>` auto-completion for branch names, commit SHAs, and checkpoints.
+
+### Manual Shell Setup
+
+If you prefer to configure your shell manually, add the line matching your shell:
+
+**Zsh (`~/.zshrc`)** (Powerlevel10k, Oh My Zsh, Starship, and default Zsh)
+
+```bash
+eval "$(tes env --zsh)"
+```
+
+**Bash (`~/.bashrc` or `~/.bash_profile`)** (Bash 3.2+ and 5.x, Starship, Oh My Bash, and default Bash)
+
+```bash
+eval "$(tes env --bash)"
+```
+
+**Fish (`~/.config/fish/config.fish`)** (Tide, Starship, Hydro, and default Fish)
+
+```bash
+tes env --fish | source
+```
+
+**POSIX `sh` / `dash` / `ksh` / `mksh` / `oksh` / `yash` (`~/.profile`, `~/.kshrc`, or `~/.mkshrc`)**
+
+```bash
+eval "$(tes env --sh)"
+```
+
+**`tcsh` / BSD `csh` (`~/.tcshrc` or `~/.cshrc`)**
+
+```bash
+eval "`tes env --tcsh`"
+```
+
+**Nushell (`~/.config/nushell/config.nu`)**
+
+```bash
+tes env --nu | save -f ~/.config/nushell/tes.nu
+source ~/.config/nushell/tes.nu
+```
+
+**Elvish (`~/.config/elvish/rc.elv`)**
+
+```bash
+tes env --elvish >> ~/.config/elvish/rc.elv
+```
+
+**PowerShell (`$PROFILE`)**
+
+```powershell
+Invoke-Expression (& tes env --pwsh)
+```
+
+## Initializing a Repository
+
+Inside any project directory, run:
+
+```bash
+tes init
+```
+
+By default, `tes init` auto-detects which AI coding tools you use and generates their instruction files and hooks. To target a specific editor, pass `--harness`:
+
+```bash
+tes init --harness antigravity
+tes init --harness claude
+tes init --harness cursor
+tes init --harness windsurf
+tes init --harness kiro
+tes init --harness opencode
+tes init --harness codex
+tes init --harness vscode
+tes init --harness all
+```
+
+---
+
+## Next Steps
+
+- [Your First Workflow](/getting-started/first-workflow) - Walk through a multi-branch workflow step by step
+- [Guides](/guides/) - Explore in-depth guides for agents, terminals, and the IDE extension
+
+---
+
+# Your First Workflow
+
+In this guide, you will initialize Tessera in a project, work across two feature branches in parallel, and merge both branches back into `main`.
+
+```text
+[Workflow: Parallel Agents in One Repository]
+1. Prompt in One Repo (~/acme-web)
+   ├─ Agent 1: "Add Pricing"
+   └─ Agent 2: "Add FAQ"
+       │
+       ▼
+2. Own Branches (Isolated in .git/tessera while .git/HEAD stays on main)
+   ├─ feat/pricing (Agent 1 · +Pricing)
+   └─ feat/faq     (Agent 2 · +FAQ)
+       │
+       ▼
+3. Branch Dev Servers (Copy-on-Write node_modules / target)
+   ├─ http://localhost:4100 (feat/pricing)
+   └─ http://localhost:4200 (feat/faq)
+       │
+       ▼
+4. Merge into main (3-Way Tree-sitter AST Merge)
+   └─ tes merge feat/pricing feat/faq --into main -m "feat: add pricing and faq"
+```
+
+## 1. Initialize the Repository
+
+Start by running `tes init` in your project root:
+
+```bash
+tes init
+```
+
+If you have not already enabled shell prompt integration, run:
+
+```bash
+tes env --install
+```
+
+## 2. Work on Two Branches in Parallel
+
+You can work on multiple branches at the same time by prompting two AI agent tabs or opening two terminal tabs.
+
+### Option A: Prompt Two AI Agents
+
+Open two AI agent chat tabs in your editor and give each one a task on its own branch:
+
+- **Tab 1**: *"On branch `feat/pricing`, create `src/components/PricingCalculator.vue`, add it to `src/App.vue`, and verify with `npm run build`."*
+- **Tab 2**: *"On branch `feat/faq`, create `src/components/TestimonialsFaq.vue`, add it to `src/App.vue`, and verify with `npm run build`."*
+
+### Option B: Use Two Terminal Tabs
+
+Or open two terminal tabs in the same repository and switch each terminal to its own branch:
+
+**Terminal 1:**
+
+```bash
+tes switch feat/pricing
+```
+
+**Terminal 2:**
+
+```bash
+tes switch feat/faq
+```
+
+> **Tip:** Each terminal tab remembers its own branch without changing `.git/HEAD` for your editor or other terminals.
+
+## 3. Inspect Live Sessions and Changes
+
+At any point, you can view active agent sessions, modified files, and diffs:
+
+```bash
+# See all active agent and terminal sessions
+tes radar
+
+# List all branches in the repository
+tes branch
+
+# View modified files in the current session or branch
+tes status
+
+# Compare a specific branch against main
+tes diff -b feat/pricing
+tes diff -b feat/faq
+```
+
+### Command Summary
+
+**`tes radar`**
+- Shows every active AI agent or terminal session
+- Displays each session's target branch, assigned port (`:4100`, `:4200`), and claimed files
+
+**`tes status`**
+- **Staged / Session Changes**: Files recorded in the current session (`M`, `A`, `D`)
+- **Unstaged Changes**: Working tree edits on disk not yet reconciled
+- **Committed on Branch**: Files committed on the feature branch ahead of `main`
+
+**`tes diff -b <branch>`**
+- Shows a unified diff comparing `<branch>` against `main` without switching your editor branch
+
+## 4. Merge Both Branches into `main`
+
+When both features are ready, combine them into `main` with a single command:
+
+```bash
+tes merge feat/pricing feat/faq --into main -m "feat: add pricing calculator and faq"
+```
+
+Even if both `feat/pricing` and `feat/faq` added imports and components to `src/App.vue`, Tessera's 3-way AST merge engine combines both sets of imports and template blocks without conflict markers.
+
+## Key Concepts
+
+### 1. Per-Session Branches
+
+In standard Git, `git checkout feat/pricing` switches the entire folder for every open terminal and AI agent. In Tessera:
+
+- `tes switch feat/pricing` binds only the **current terminal session** to `feat/pricing`.
+- `tes claim --branch feat/pricing ...` binds only that **AI agent session** to `feat/pricing`.
+- Clicking the branch name in the IDE status bar (or running `tes switch feat/pricing --editor`) switches your **editor working tree** (`repo_root`) so your file explorer displays `feat/pricing`.
+
+### 2. Branch Sandboxes
+
+When you run commands in a switched terminal or via `tes exec -b <branch> -- <cmd>`, Tessera runs the command inside a Copy-on-Write sandbox for that branch:
+
+```bash
+tes exec -b feat/pricing -- npm run build
+tes exec -b feat/faq -- npm run build
+```
+
+Both commands reuse your existing `node_modules` (or `target` / `.venv`).
+
+### 3. Checkpoints and Undo
+
+Every operation in Tessera is recorded in an operation log inside `.git/tessera`. If an agent makes an unwanted change or you want to roll back a merge, run:
+
+```bash
+tes undo
+```
+
+## Next Steps
+
+- [Agents](/guides/multi-agent-workflow) - How same-branch and cross-branch sessions coordinate
+- [Branches](/guides/branches-and-terminals) - Managing terminal branches, editor branches, and merges
+- [Editor Support](/guides/ide-extension) - Using the branch graph and status bar switcher in VS Code
+
+---
+
+# Guides
+
+Step-by-step guides and tutorials for working with Tessera.
+
+## Available Guides
+
+- [Configuration](/guides/configuration) - Customizing ports, Copy-on-Write cache directories, and environment variables
+- [Editor Support](/guides/ide-extension) - Using the status bar branch switcher, commit graph, and conflict resolver in VS Code
+- [Agents](/guides/multi-agent-workflow) - How AI coding agents coordinate edits on the same branch or separate branches
+- [Branches](/guides/branches-and-terminals) - Switching branches per terminal, switching the editor branch, and merging
+- [Sandboxes](/guides/running-tests-and-servers) - Running test suites and dev servers in parallel across languages
+- [Conflicts](/guides/conflict-resolution) - Resolving merge conflicts, saving checkpoints, and rolling back changes
+
+---
+
+**Looking for something specific?**
+- [Getting Started](/getting-started/) - Installation and first steps
+- [CLI Commands](/cli/) - Complete command-line reference
+- [Examples](/examples/) - Step-by-step workflow examples
+
+---
+
+# Agents
+
+Once a repository is initialized with `tes init`, editors and CLI harnesses like Antigravity, Claude Code, Codex, Cursor, Windsurf, Kiro, and OpenCode can work in the same checkout simultaneously without overwriting each other's files.
+
+## Automatic Coordination
+
+You do not need to change how you prompt your AI agents or manually manage locks. The workspace rules installed by `tes init` instruct each agent to run four commands:
+
+```text
+[Workflow: How Agents Coordinate Automatically]
+1. Claim Task        -> tes claim --branch <branch> --intent "<goal>" <files...>
+2. Reconcile Edits   -> tes hook post-tool --path <file>   (3-way AST merge on save)
+3. Verify in Sandbox -> tes exec -- npm run build          (CoW sandbox on isolated port)
+4. Commit to Git     -> tes commit -m "..." / tes merge    (standard Git commit on branch)
+```
+
+1. **Claim the task (`tes claim`)**: Before editing files, the agent declares what it is working on, which files it will touch, and (optionally) which branch it is targeting:
+   ```bash
+   tes claim --branch feat/pricing --intent "Add pricing calculator" src/components/PricingCalculator.vue src/App.vue
+   ```
+2. **Reconcile edits (`tes hook post-tool`)**: Immediately after modifying a file, the agent reconciles its edit:
+   ```bash
+   tes hook post-tool --path src/App.vue
+   ```
+3. **Verify in a sandbox (`tes exec`)**: To run a compiler, type-checker, or test suite, the agent executes inside its branch's Copy-on-Write sandbox:
+   ```bash
+   tes exec -- npm run build
+   ```
+4. **Commit (`tes commit` / `tes merge`)**: When finished, the agent commits its changes cleanly onto its target branch:
+   ```bash
+   tes commit -m "feat(pricing): add pricing calculator"
+   ```
+
+## Same Branch vs. Separate Branches
+
+### Same Branch
+
+When two agents work on the **same branch** (for example, both editing on `main`), Tessera combines their edits automatically using 3-way AST merging:
+
+- **Functions and Methods**: Two agents can add or edit different functions, or add methods to the same `class` or `impl` block, in the same file.
+- **Imports and Parameters**: Both agents can add imports to the top of a file or add parameters to the same function signature.
+- **Vue and Svelte Components**: Concurrent edits to `<script setup>`, `<template>`, and `<style scoped>` blocks merge cleanly.
+- **Manifests and Lockfiles**: Concurrent additions to `package.json`, `Cargo.toml`, and `Cargo.lock` are merged structurally.
+
+### Separate Branches
+
+When you ask Agent 1 to work on `feat/pricing` and Agent 2 to work on `feat/faq`, both agents may touch shared files like `src/App.vue` or `index.html` at the same time.
+
+Tessera keeps each branch isolated:
+- Changes made on `feat/pricing` never leak into `feat/faq`'s sandbox or commit tree.
+- Two agents on different branches will never trigger a conflict against each other while building their features.
+- When both agents finish, you can inspect each branch independently or merge both into `main` with `tes merge feat/pricing feat/faq --into main`.
+
+## Status and Diffs
+
+Check modified files in your current session or branch with `tes status`:
+
+```bash
+tes status
+```
+
+`tes status` groups files into three sections:
+- **Staged Changes**: Changes recorded in the active session (`M`, `A`, `D`)
+- **Unstaged Changes**: Working tree edits on disk not yet reconciled
+- **Committed on Branch**: Files committed on the current feature branch ahead of `main`
+
+Use `tes diff` to view line-by-line diffs:
+
+```bash
+# View all changes in the current session or working tree
+tes diff
+
+# View only staged session changes
+tes diff --staged
+
+# View changes for a single file
+tes diff src/App.vue
+
+# Compare any branch against main
+tes diff -b feat/pricing
+```
+
+## Live Sessions
+
+To see all active agents and terminal sessions in real time, run:
+
+```bash
+tes radar
+```
+
+`tes radar` shows each session's ID, assigned port slot, target branch, task intent, and modified files.
+
+## See Also
+
+- [Branches](/guides/branches-and-terminals) - Switching and merging branches
+- [Sandboxes](/guides/running-tests-and-servers) - Running builds and dev servers in branch sandboxes
+- [Examples](/examples/) - Step-by-step walkthroughs
+
+---
+
+# Branches
+
+In standard Git, all open terminals and editor windows share a single `.git/HEAD`. Running `git checkout feat/pricing` in one terminal switches the branch underneath every other open terminal and AI agent.
+
+Tessera separates **per-terminal branches**, **per-agent branches**, and your **editor branch** so they never step on each other.
+
+```text
+[Architecture: Editor, Terminal & Agent Branches in One Folder]
+- Editor Working Tree : .git/HEAD stays on main in VS Code / Antigravity IDE
+- Terminal Tabs       : tes switch feat/pricing (:4100) | tes switch feat/faq (:4200)
+- Agent Branches      : tes claim --branch isolates agent edits inside .git/tessera/
+- Switch or Merge     : tes switch <branch> --editor  OR  tes merge ... --into main
+```
+
+## Switching Branches
+
+When shell integration is enabled (`tes env --install`), each terminal tab has its own session and can switch branches independently:
+
+```bash
+# Terminal 1
+tes switch feat/pricing
+
+# Terminal 2
+tes switch feat/faq
+```
+
+If the target branch does not exist yet, Tessera creates it automatically from `HEAD`.
+
+In a switched terminal tab:
+- Your shell prompt displays `(tes:feat/pricing)` so you always see which branch that tab is on.
+- Commands you run in that terminal (`npm test`, `npm run build`, `npm run dev`, `cargo test`) execute inside that branch's Copy-on-Write sandbox while your terminal prompt stays in your project folder.
+- Other open terminals and your code editor remain untouched.
+
+## Switching the Editor Branch
+
+When you want your IDE file explorer and language server to display a different branch's files in your main repository folder, switch the editor branch:
+
+- **In VS Code / Antigravity IDE**: Click the branch name in the bottom-left status bar and select the branch from the dropdown.
+- **From the CLI**: Pass `--editor` (or `-e`) to `tes switch`:
+
+```bash
+tes switch feat/pricing --editor
+```
+
+Switching the editor branch updates your repository working tree and `.git/HEAD` while keeping any open terminal tabs pinned to their own branches.
+
+## Assigning an Agent to a Branch
+
+To have an AI agent build a feature on a specific branch without switching your editor away from `main`, name the branch in your prompt:
+
+> *"On branch `feat/faq`, create `src/components/TestimonialsFaq.vue` and add it to `src/App.vue`."*
+
+The agent claims the branch automatically:
+
+```bash
+tes claim --branch feat/faq --intent "Add Testimonials and FAQ section" src/components/TestimonialsFaq.vue src/App.vue
+```
+
+When the agent finishes and commits onto `feat/faq`, your `main` working tree remains clean.
+
+## Listing Branches
+
+View all branches in the repository and see which branch your current terminal session is using:
+
+```bash
+tes branch
+```
+
+Pass `--json` to inspect commit hashes, assigned ports, active sessions, and modified files ahead of `main`:
+
+```bash
+tes branch --json
+```
+
+## Merging Branches
+
+Combine one or more feature branches into `main` (or any target branch) using `tes merge --into`:
+
+```bash
+# Merge a single branch into main
+tes merge feat/pricing --into main -m "feat: add pricing calculator"
+
+# Merge multiple branches into main at once
+tes merge feat/pricing feat/faq --into main -m "feat: add pricing and faq"
+```
+
+During `tes merge`, Tessera merges unchanged directories without reading file blobs, detects renamed files across directories, renumbers colliding sequential SQL migrations, merges `package.json`, `Cargo.toml`, and `Cargo.lock` dependencies structurally, and combines concurrent AST changes with Tree-sitter.
+
+## Pushing to Remotes
+
+Commit any pending session changes and push a branch to your Git remote (`origin`):
+
+```bash
+tes push
+tes push -u origin feat/pricing
+```
+
+## See Also
+
+- [Sandboxes](/guides/running-tests-and-servers) - Running builds and dev servers across branches
+- [Conflicts](/guides/conflict-resolution) - Handling conflicts and rolling back merges
+- [Editor Support](/guides/ide-extension) - Switching and merging branches in VS Code
+
+---
+
+# Sandboxes
+
+Running commands on another branch usually requires stashing uncommitted work or maintaining a separate `git worktree` with its own dependencies.
+
+Tessera creates Copy-on-Write branch sandboxes that reuse your existing dependencies and assign each session its own port and test database.
+
+## Running Commands
+
+With shell integration enabled (`tes env --install`), switch a terminal tab to any branch and run your test or build commands directly:
+
+```bash
+tes switch feat/pricing
+npm test
+npm run build
+```
+
+Open a second terminal tab, switch it to another branch, and run tests there at the same time:
+
+```bash
+tes switch feat/faq
+npm test
+```
+
+Each terminal tab executes against its own branch's files and dependencies without interfering with other tabs.
+
+## Running Dev Servers
+
+To preview two feature branches in your browser at the same time, switch each terminal tab to its branch and start your dev server:
+
+**Terminal 1:**
+
+```bash
+tes switch feat/pricing
+npm run dev
+# TES_PORT=4100
+```
+
+**Terminal 2:**
+
+```bash
+tes switch feat/faq
+npm run dev
+# TES_PORT=4200
+```
+
+Or run them explicitly with `tes exec -b <branch>`:
+
+```bash
+# Terminal 1
+tes exec -b feat/pricing -- npm run dev -- --port 4100
+
+# Terminal 2
+tes exec -b feat/faq -- npm run dev -- --port 4200
+```
+
+## One-Off Commands
+
+Use `tes exec` to run a command inside a branch's Copy-on-Write sandbox without switching your terminal tab:
+
+```bash
+# Run on the current session's branch
+tes exec -- npm run build
+
+# Run on a specific branch
+tes exec -b feat/pricing -- npm run build
+tes exec -b feat/faq -- ./node_modules/.bin/vue-tsc -b
+```
+
+When `tes exec` runs:
+1. Tessera materializes the branch's committed files plus any uncommitted changes for that branch into its sandbox.
+2. Dependency and build cache directories (`node_modules`, `target`, `.venv`, `vendor`) are cloned via Copy-on-Write.
+3. `<sandbox>/node_modules/.bin`, `<sandbox>/.venv/bin`, and `<sandbox>/vendor/bin` are prepended to `PATH`.
+4. Any new or modified source files generated by the command (such as codegen output or lockfile updates) are captured back into the branch state.
+
+## Dependency Caches
+
+Tessera clones and synchronizes dependency and build caches across major ecosystems:
+
+| Ecosystem | Cached Directories |
+|-----------|--------------------|
+| **JavaScript / TypeScript** | `node_modules`, `.pnpm-store`, `.next`, `.nuxt`, `.svelte-kit`, `.turbo`, `.parcel-cache`, `.vite` |
+| **Rust** | `target` (plus shared `CARGO_TARGET_DIR` support) |
+| **Python** | `.venv`, `venv`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `.tox` |
+| **Go / PHP / Ruby** | `vendor`, `.bundle` |
+| **Elixir / Erlang** | `_build`, `deps` |
+| **JVM / Swift / C++** | `.gradle`, `build`, `.build`, `cmake-build-debug`, `cmake-build-release` |
+| **Zig / .NET / Dart** | `.zig-cache`, `zig-out`, `bin`, `obj`, `.dart_tool` |
+
+> **Tip:** If you run `npm install` in your project root *after* a branch sandbox was already created, Tessera syncs the newly installed `node_modules` into the branch sandbox on the next `tes exec` run.
+
+## Environment Variables
+
+Each session slot (`1`, `2`, `3`, ...) receives non-overlapping environment variables:
+
+| Variable | Slot 1 | Slot 2 | Description |
+|----------|--------|--------|-------------|
+| `PORT` / `TES_PORT` | `4100` | `4200` | Calculated as `base_port + (slot * port_stride)` |
+| `TES_BRANCH` | `feat/pricing` | `feat/faq` | Target branch name for the session |
+| `TES_DB_NAME` | `tessera_slot_1` | `tessera_slot_2` | Isolated database name for integration tests |
+| `DATABASE_URL` | `sqlite:///.../tessera_slot_1.db` | `sqlite:///.../tessera_slot_2.db` | Isolated database connection URL |
+
+To customize `base_port`, `port_stride`, or custom environment variable templates, see the [Configuration Guide](/guides/configuration).
+
+---
+
+# Conflicts
+
+Most of the time, Tessera combines concurrent edits automatically using 3-way Tree-sitter AST merging and manifest drivers.
+
+A conflict is recorded **only** when two sessions or branches modify the exact same statement or expression in incompatible ways (for example, both rewriting the same heading or return expression to different strings).
+
+## Resolving in the Editor
+
+When a merge conflict occurs while using the VS Code / Antigravity IDE extension:
+
+1. Tessera writes standard Git conflict markers (`<<<<<<<`, `=======`, `>>>>>>>`) into the file.
+2. The extension opens the conflicted file in your editor and jumps to the `<<<<<<<` line.
+3. Edit the file to keep the code you want, remove the conflict markers, and save (`Cmd+S` / `Ctrl+S`).
+4. As soon as the file is saved without conflict markers, Tessera resolves the conflict and updates the branch commit.
+
+You can also click **`N Conflicts`** in the bottom status bar to open the **Conflict Resolver** panel and resolve with a single click (`AST Union`, `Keep Ours`, `Keep Theirs`, or `Keep Working File`).
+
+## Inspecting Conflicts
+
+To list any unresolved conflicts in your repository:
+
+```bash
+tes conflicts
+```
+
+Pass `--json` to inspect the base, ours, and theirs snippets along with the participating session IDs:
+
+```bash
+tes conflicts --json
+```
+
+## Resolving from the CLI
+
+Resolve a conflicted file using one of four strategies:
+
+```bash
+# Combine both sides' AST declarations and statements in order
+tes resolve src/App.vue --strategy ast-union
+
+# Keep the first session/branch's version
+tes resolve src/App.vue --strategy ours
+
+# Keep the second session/branch's version
+tes resolve src/App.vue --strategy theirs
+
+# Use the file as currently edited and saved on disk
+tes resolve src/App.vue --strategy working
+```
+
+## Checkpoints
+
+Before asking an AI agent to perform a large multi-file refactor, save a named checkpoint:
+
+```bash
+tes checkpoint before-refactor
+```
+
+## Restoring Files
+
+Use `tes restore` (or `tes reset`) to restore a branch or specific files to any checkpoint, commit SHA, `HEAD~N`, or branch:
+
+```bash
+# Restore the current branch to a named checkpoint or previous commit
+tes restore before-refactor
+tes restore HEAD~1
+
+# Restore a specific branch without switching to it
+tes restore -b feat/pricing HEAD~1
+
+# Discard uncommitted changes in a specific file
+tes restore src/App.vue
+
+# Restore a file from another branch or commit
+tes restore --source main src/App.vue
+```
+
+## Undo
+
+Every claim, file reconciliation, checkpoint, restore, and merge is recorded in `.git/tessera`.
+
+View recent operations:
+
+```bash
+tes oplog
+```
+
+Undo the most recent operation (including a merge):
+
+```bash
+tes undo
+```
+
+Or roll back to a specific operation ID from `tes oplog`:
+
+```bash
+tes undo --op <operation-id>
+```
+
+## See Also
+
+- [Editor Support](/guides/ide-extension) - Conflict resolver and branch graph
+- [tes resolve](/cli/resolve) - CLI command reference
+- [tes restore](/cli/restore) - CLI command reference
+
+---
+
+# Editor Support
+
+The Tessera extension for **VS Code** and **Antigravity IDE** provides real-time branch switching, a 2D commit graph, active session monitoring, and one-click conflict resolution.
+
+## Status Bar
+
+When you open a repository initialized with `tes init`, two items appear on the left side of the status bar:
+
+1. **Current Branch (`main`)**: Displays the branch currently checked out in your editor working tree. Click it at any time to switch your editor to another branch.
+2. **`Graph` / `N Conflicts`**: Opens the Branch Graph. If any unresolved conflicts exist, this item highlights in red (`N Conflicts`) and opens the Conflict Resolver when clicked.
+
+> **Note:** In workspaces that have not been initialized with `tes init`, the Tessera status bar items stay hidden automatically.
+
+## Live Attribution
+
+When two or more AI agents work on the same file on your active editor branch, the extension highlights each agent's lines in real time:
+
+1. **File Summary CodeLens**: Appears at line 1 whenever two or more agents are concurrently editing the file (`2 agents concurrently editing this file (main): antigravity-a1b2 · claude-c3d4`).
+2. **Hunk CodeLens (`Jump to Session`)**: Appears directly above the start line of each agent's modified section (`<agent_id> · L<start>-L<end>: <intent> · Jump to Session`). Clicking the CodeLens focuses the originating integrated terminal tab, terminal multiplexer pane (`tmux`, `WezTerm`, `kitty`), external macOS terminal tab (`Terminal.app`, `iTerm2`), or IDE agent conversation.
+3. **Gutter Borders and Line Highlights**: Each agent session receives a distinct 3px left border and line highlight along with a matching marker on the scrollbar overview ruler.
+4. **Inline Labels and Hover Cards**: The first line of each agent's section displays an italic inline label (`<agent_id>: <intent>`), and hovering any highlighted line shows a card with the agent ID, branch, line range, task intent, and a clickable **`Jump to Session`** action link.
+
+```ts
+// Live Multi-Agent Attribution in src/currency.ts (main):
+// [CodeLens] 2 agents concurrently editing this file (main): antigravity-a1b2 · claude-c3d4
+export function formatCurrency(
+  cents: number,
+  // [antigravity-a1b2 · L3-L6: Add locale and decimals]
+  currency = "USD",
+  locale = "en-US",
+  decimals = 2
+): string {
+  const amount = (cents / 100).toFixed(decimals);
+  return `[${locale}] ${currency} ${amount}`;
+}
+// [claude-c3d4 · L10-L14: Add formatCompact helper]
+export function formatCompact(cents: number) {
+  return new Intl.NumberFormat("en-US", {
+    style: "currency", currency: "USD", notation: "compact"
+  }).format(cents / 100);
+}
+```
+
+## Branch Graph
+
+Click **`Graph`** in the status bar (or run **`tes: Open Branch Graph`** from the Command Palette) to open the commit graph:
+
+- **Branch Column Headers**: Shows each branch's name, current commit hash, sandbox port, modified file count, and active agent sessions, with action buttons to **Switch**, **Merge**, or **Restore**.
+- **Commit History**: Displays the commit history across parallel branch lanes with merge nodes, author names, and timestamps. Conflicted merge nodes are highlighted with a red border and a `Conflict` badge.
+
+## Sidebar Views
+
+Clicking the Tessera icon in the Activity Bar opens three sidebar views (plus a **Branches** view inside the Source Control sidebar):
+
+### Branches
+Lists every branch in the repository with its short commit SHA and modified file count ahead of `main`. Expanding a branch lets you:
+- Switch your editor to that branch
+- Open the branch's assigned dev server (`localhost:<port>`)
+- Click any modified file (`M`) to open a side-by-side diff against `main`
+
+### Sessions
+Displays all active AI agent and terminal sessions (`antigravity-*`, `claude-*`, `codex-*`, `cursor-*`, `term-*`), their target branch, and their current task intent. Clicking the **Jump to Session** inline button (or running `tes session focus <session-id>` from a terminal) navigates directly to that session's terminal tab, multiplexer pane, or IDE window. Expanding a session shows claimed symbols and modified files.
+
+### Checkpoints
+Lists active conflicts alongside saved checkpoints (`tes checkpoint`), with toolbar actions to create a new checkpoint or open the Conflict Resolver.
+
+## Conflict Resolution
+
+When a merge conflict occurs:
+1. The extension opens the conflicted file in your editor at the `<<<<<<<` conflict marker.
+2. Resolve the conflict by editing the file and saving (`Cmd+S` / `Ctrl+S` resolves once markers are removed) or by using the **Conflict Resolver** panel (`AST Union`, `Keep Ours`, `Keep Theirs`, `Keep Working File`).
+
+## See Also
+
+- [Branches](/guides/branches-and-terminals) - How editor branches and terminal branches interact
+- [Conflicts](/guides/conflict-resolution) - Resolving conflicts and rolling back changes
+
+---
+
+# Configuration
+
+Tessera includes default settings for JavaScript/TypeScript, Rust, Python, Go, PHP, Ruby, Elixir, JVM, Swift, C/C++, Zig, .NET, and Dart projects.
+
+You can customize ports, verification gates, Copy-on-Write cache directories, and environment variable templates using either a `tessera.toml` file in your project root or the `tes config` command.
+
+## Quick Start
+
+View the active configuration for your repository:
+
+```bash
+tes config show
+```
+
+## Configuration File (`tessera.toml`)
+
+To share configuration across your team in version control, create a `tessera.toml` file in your repository root.
+
+### Example Configuration
+
+```toml
+trunk_branch = "main"
+base_port = 4000
+port_stride = 100
+verify_cmd = ["npm", "run", "build"]
+
+cow_cache_dirs = [
+  "node_modules",
+  ".pnpm-store",
+  "target",
+  ".venv",
+  "venv",
+  "vendor"
+]
+
+extra_bin_dirs = [
+  "node_modules/.bin",
+  ".venv/bin",
+  "vendor/bin",
+  "bin"
+]
+
+[custom_env]
+DATABASE_URL = "postgres://localhost:5432/app_slot_{slot}"
+REDIS_URL = "redis://localhost:6379/{slot}"
+VITE_PORT = "{port}"
+```
+
+## Configuration Options
+
+### Core Settings
+
+#### `trunk_branch`
+
+- **Type:** `string`
+- **Default:** `"main"`
+- **Description:** Default primary branch for the repository.
+
+```toml
+trunk_branch = "main"
+```
+
+Update via CLI:
+
+```bash
+tes config set trunk_branch main
+```
+
+#### `base_port`
+
+- **Type:** `number`
+- **Default:** `4000`
+- **Description:** Starting port used when calculating isolated session ports (`PORT = base_port + slot * port_stride`).
+
+```toml
+base_port = 4000
+```
+
+Update via CLI:
+
+```bash
+tes config set base_port 4000
+```
+
+#### `port_stride`
+
+- **Type:** `number`
+- **Default:** `100`
+- **Description:** Port increment between session slots (e.g., Slot 1 receives `4100`, Slot 2 receives `4200`).
+
+```toml
+port_stride = 100
+```
+
+Update via CLI:
+
+```bash
+tes config set port_stride 100
+```
+
+#### `verify_cmd`
+
+- **Type:** `string[]`
+- **Default:** `[]`
+- **Description:** Optional verification command executed automatically before `tes merge` finalizes.
+
+```toml
+verify_cmd = ["npm", "test"]
+```
+
+Update via CLI:
+
+```bash
+tes config set verify_cmd "npm test"
+```
+
+#### `co_author`
+
+- **Type:** `boolean`
+- **Default:** `false`
+- **Description:** When enabled (`true`), appends a `Co-authored-by:` trailer (`Co-authored-by: Tessera <noreply@tessera.getlunaris.dev>` by default) to commits created by Tessera (`tes commit`, `tes merge`, `tes resolve`, `tes pull`, and `tes cherry-pick`). Commits always record your active Git/system user as the primary `Author`.
+
+```toml
+co_author = true
+```
+
+Update via CLI:
+
+```bash
+tes config set co_author true
+```
+
+#### `co_author_trailer`
+
+- **Type:** `string`
+- **Default:** `"Tessera <noreply@tessera.getlunaris.dev>"`
+- **Description:** Custom identity used in the `Co-authored-by: <trailer>` line when `co_author = true`.
+
+```toml
+co_author = true
+co_author_trailer = "Tessera <noreply@tessera.getlunaris.dev>"
+```
+
+Update via CLI:
+
+```bash
+tes config set co_author_trailer "Tessera <noreply@tessera.getlunaris.dev>"
+```
+
+#### `pager`
+
+- **Type:** `string | null`
+- **Default:** `null` (falls back to `TES_PAGER` -> `GIT_PAGER` -> `git config core.pager` -> `PAGER` -> `less -FRX`)
+- **Description:** Terminal pager command used for `tes diff`, `tes log`, `tes oplog`, `tes branch`, `tes stash list`, and any command invoked with `--paginate` when `stdout` is an interactive terminal. Set to `"cat"` or pass `-P` / `--no-pager` to disable paging.
+
+```toml
+pager = "less -FRX"
+```
+
+Update via CLI:
+
+```bash
+tes config set pager "delta --paging=always"
+```
+
+### Sandbox Options
+
+#### `cow_cache_dirs`
+
+- **Type:** `string[]`
+- **Default:** `["node_modules", ".pnpm-store", ".next", ".nuxt", ".svelte-kit", ".turbo", ".parcel-cache", ".vite", "target", ".venv", "venv", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox", "vendor", ".bundle", "_build", "deps", ".gradle", "build", ".build", "cmake-build-debug", "cmake-build-release", ".zig-cache", "zig-out", "bin", "obj", ".dart_tool"]`
+- **Description:** Dependency and build cache directories cloned via Copy-on-Write into every branch sandbox.
+
+Add or remove directories via CLI:
+
+```bash
+tes config add-cache-dir .nx .angular
+tes config remove-cache-dir .angular
+```
+
+#### `extra_bin_dirs`
+
+- **Type:** `string[]`
+- **Default:** `["node_modules/.bin", ".venv/bin", "venv/bin", "vendor/bin", "bin"]`
+- **Description:** Relative directories inside the branch sandbox prepended to `PATH` during `tes exec`.
+
+Add or remove binary directories via CLI:
+
+```bash
+tes config add-bin-dir ./scripts ./tools/bin
+tes config remove-bin-dir ./scripts
+```
+
+### Environment Variables
+
+#### `[custom_env]`
+
+- **Type:** `table`
+- **Default:** `{}`
+- **Description:** Custom environment variables injected into `tes exec` and switched terminals. Supports `{slot}`, `{port}`, `{branch}`, and `{agent_id}` placeholders.
+
+```toml
+[custom_env]
+DATABASE_URL = "postgres://localhost:5432/app_test_{slot}"
+APP_URL = "http://localhost:{port}"
+```
+
+Set or remove environment templates via CLI:
+
+```bash
+tes config set-env DATABASE_URL "postgres://localhost:5432/app_test_{slot}"
+tes config set-env APP_URL "http://localhost:{port}"
+tes config unset-env APP_URL
+```
+
+### Repository Trust (`tessera.toml`)
+
+When cloning an external repository that includes a checked-in `tessera.toml`, non-executable settings (`trunk_branch`, `base_port`, `port_stride`, `co_author`, `co_author_trailer`, `cow_cache_dirs`, and safe `custom_env` templates) are loaded automatically.
+
+To prevent untrusted repositories from executing arbitrary commands or overriding system binaries automatically, `verify_command`, `pager`, and `extra_bin_dirs` in `tessera.toml` require explicit repository trust:
+
+```bash
+# trust the repository's tessera.toml
+tes config trust
+
+# revoke trust for tessera.toml
+tes config untrust
+```
+
+## See Also
+
+- [tes config](/cli/config) - CLI command reference
+- [Sandboxes](/guides/running-tests-and-servers) - How branch sandboxes use cache directories and ports
+- [Getting Started](/getting-started/) - Project initialization guide
+
+---
+
+# Examples
+
+Step-by-step walkthroughs for working with multiple agents and branches in Tessera.
+
+## Available Examples
+
+- [Same-Branch Editing](/examples/same-branch) - Two agents editing the same function or file on `main`
+- [Feature Branches](/examples/parallel-branches) - Building two features on separate branches and merging them into `main`
+- [Conflict Resolution](/examples/conflict-resolution) - Handling incompatible edits on the same line using the editor or CLI
+
+## Quick Examples
+
+### Initialize and Configure Shell
+
+```bash
+tes init
+tes env --install
+```
+
+### Switch Terminals to Different Branches
+
+```bash
+# Terminal 1
+tes switch feat/pricing
+npm run dev
+
+# Terminal 2
+tes switch feat/faq
+npm run dev
+```
+
+### Merge Multiple Feature Branches into `main`
+
+```bash
+tes merge feat/pricing feat/faq --into main -m "feat: add pricing and faq"
+```
+
+---
+
+# Same-Branch Editing
+
+This example walks through two agents editing the same function in `src/currency.ts` on `main`.
+
+```text
+[Workflow: Same-Branch AST Merging on main]
+1. Prompt on main   -> Agent 1 ("Add locale") & Agent 2 ("Add decimals") target src/currency.ts
+2. Concurrent Edits -> Both agents save directly on main (no file locks)
+3. Tree-sitter AST  -> Parses FunctionDecl -> merges ParamNode[1] (locale) + ParamNode[2] (decimals)
+4. Unified on Disk  -> Both edits preserved in src/currency.ts with zero overwrites
+```
+
+## Starting File
+
+Suppose `src/currency.ts` on `main` contains:
+
+```ts
+export function formatCurrency(cents: number, currency: string = "USD"): string {
+  const amount = (cents / 100).toFixed(2);
+  return `${currency} ${amount}`;
+}
+```
+
+## Prompting Two Agents
+
+Open two AI agent tabs and give both a prompt that modifies `formatCurrency`:
+
+- **Tab 1**: *"Add a `locale: string = 'en-US'` parameter to `formatCurrency` in `src/currency.ts`."*
+- **Tab 2**: *"Add a `decimals: number = 2` parameter to `formatCurrency` in `src/currency.ts`."*
+
+## How It Works
+
+1. Both agents claim `src/currency.ts` against the same starting commit on `main`.
+2. Agent 1 writes its edit and runs `tes hook post-tool --path src/currency.ts`.
+3. Agent 2 writes its edit and runs `tes hook post-tool --path src/currency.ts`.
+4. Tessera parses the base version and both agents' versions using Tree-sitter and merges the parameter list and function body automatically.
+
+## Merged Result
+
+```ts
+export function formatCurrency(
+  cents: number,
+  currency: string = "USD",
+  locale: string = "en-US",
+  decimals: number = 2
+): string {
+  const amount = (cents / 100).toFixed(decimals);
+  return `[${locale}] ${currency} ${amount}`;
+}
+```
+
+## Committing
+
+Check the status and commit:
+
+```bash
+tes status
+tes diff
+tes commit -m "feat(currency): support locale and decimals parameters"
+```
+
+## Next Steps
+
+- [Feature Branches](/examples/parallel-branches) - Isolate two features on separate branches
+- [Conflict Resolution](/examples/conflict-resolution) - Handle overlapping edits to the same expression
+
+---
+
+# Feature Branches
+
+This example shows two agents building separate features on `feat/pricing` and `feat/faq` while both modifying `src/App.vue` in the same checkout, then merging both branches into `main`.
+
+```text
+[Workflow: Parallel Agents in One Repository]
+1. Prompt in One Repo (~/acme-web)
+   ├─ Agent 1: "Add Pricing"
+   └─ Agent 2: "Add FAQ"
+       │
+       ▼
+2. Own Branches (Isolated in .git/tessera while .git/HEAD stays on main)
+   ├─ feat/pricing (Agent 1 · +Pricing)
+   └─ feat/faq     (Agent 2 · +FAQ)
+       │
+       ▼
+3. Branch Dev Servers (Copy-on-Write node_modules / target)
+   ├─ http://localhost:4100 (feat/pricing)
+   └─ http://localhost:4200 (feat/faq)
+       │
+       ▼
+4. Merge into main (3-Way Tree-sitter AST Merge)
+   └─ tes merge feat/pricing feat/faq --into main -m "feat: add pricing and faq"
+```
+
+## Starting File
+
+Suppose `src/App.vue` on `main` starts as:
+
+```vue
+<script setup lang="ts">
+import HelloWorld from './components/HelloWorld.vue'
+</script>
+
+<template>
+  <HelloWorld />
+</template>
+```
+
+## 1. Launch Two Agents on Separate Branches
+
+Open two AI agent chat tabs in your editor:
+
+- **Tab 1 (`feat/pricing`)**:
+  > *"On branch `feat/pricing`, create `src/components/PricingCalculator.vue`, add it to `src/App.vue`, and verify with `npm run build`."*
+
+- **Tab 2 (`feat/faq`)**:
+  > *"On branch `feat/faq`, create `src/components/TestimonialsFaq.vue`, add it to `src/App.vue`, and verify with `npm run build`."*
+
+## 2. Branch Isolation
+
+Even though both agents edit `src/App.vue` in the same folder at the same time:
+
+- `feat/pricing` only contains `HelloWorld.vue` and `PricingCalculator.vue`.
+- `feat/faq` only contains `HelloWorld.vue` and `TestimonialsFaq.vue`.
+- When each agent runs `tes exec -- npm run build`, the build runs inside that branch's Copy-on-Write sandbox (`branches/feat-pricing` and `branches/feat-faq`), so neither branch fails with missing-component errors.
+
+## 3. Preview Either Branch
+
+You can inspect the diff of each branch or switch your editor to preview it:
+
+```bash
+# Compare each branch against main
+tes diff -b feat/pricing
+tes diff -b feat/faq
+
+# Or switch your editor working tree to feat/pricing
+tes switch feat/pricing --editor
+```
+
+## 4. Merge Both Branches into `main`
+
+Combine both branches into `main` with a single command:
+
+```bash
+tes merge feat/pricing feat/faq --into main -m "feat: add pricing calculator and testimonials faq"
+```
+
+Tessera merges both `<script setup>` import blocks and both `<template>` usages cleanly into `main`:
+
+```vue
+<script setup lang="ts">
+import HelloWorld from './components/HelloWorld.vue'
+import PricingCalculator from './components/PricingCalculator.vue'
+import TestimonialsFaq from './components/TestimonialsFaq.vue'
+</script>
+
+<template>
+  <HelloWorld />
+  <PricingCalculator />
+  <TestimonialsFaq />
+</template>
+```
+
+## Next Steps
+
+- [Conflict Resolution](/examples/conflict-resolution) - See what happens when two branches change the exact same line
+- [Branches](/guides/branches-and-terminals) - Learn more about branch management
+
+---
+
+# Conflict Resolution
+
+This example shows what happens when two branches modify the exact same line in incompatible ways, and how to resolve the conflict in your editor or from the CLI.
+
+## 1. Creating a Conflict
+
+Suppose `index.html` on `main` has:
+
+```html
+<title>My App</title>
+```
+
+Now suppose:
+- Branch `feat/pricing` changes `<title>` to `<title>Pricing | My App</title>`.
+- Branch `feat/faq` changes `<title>` to `<title>FAQ | My App</title>`.
+
+When you merge both branches into `main`:
+
+```bash
+tes merge feat/pricing feat/faq --into main -m "feat: merge pricing and faq"
+```
+
+All non-overlapping files and components merge automatically, and Tessera reports `1` conflict on `index.html`.
+
+## 2. Resolving in Your Editor
+
+If you have the VS Code / Antigravity IDE extension installed:
+
+1. `index.html` opens in your editor at the `<<<<<<<` line:
+   ```html
+   <<<<<<< ours
+   <title>Pricing | My App</title>
+   =======
+   <title>FAQ | My App</title>
+   >>>>>>> theirs
+   ```
+2. Edit the line to what you want:
+   ```html
+   <title>My App | Pricing and FAQ</title>
+   ```
+3. Save the file (`Cmd+S` / `Ctrl+S`). The extension detects that the conflict markers have been removed and resolves the conflict automatically.
+
+## 3. Resolving from the CLI
+
+You can also inspect and resolve conflicts directly from your terminal:
+
+```bash
+# List active conflicts
+tes conflicts
+
+# Resolve using the edited file on disk
+tes resolve index.html --strategy working
+
+# Or pick one side directly
+tes resolve index.html --strategy ours
+tes resolve index.html --strategy theirs
+```
+
+## Next Steps
+
+- [Conflicts](/guides/conflict-resolution) - Learn about checkpoints, `tes restore`, and `tes undo`
+- [Editor Support](/guides/ide-extension) - Explore the Conflict Resolver panel
+
+---
+
+# CLI Commands
+
+The `tes` CLI provides commands for initializing repositories, coordinating multiple AI coding agents, managing per-terminal branches, running sandboxed builds, and merging branches.
+
+## Command Overview
+
+| Command | Purpose |
+|---------|---------|
+| [tes init](/cli/init) | Initialize Tessera in a Git repository and install AI editor rules |
+| [tes env](/cli/env) | Configure shell prompt integration (`(tes:<branch>)`) and tab completion |
+| [tes switch](/cli/switch) | Switch the active terminal session or editor working tree to a branch |
+| [tes branch](/cli/branch) | List (`-l`, `-v`), create, rename (`-m`), or delete (`-d`/`-D`) branches and sandboxes |
+| [tes claim](/cli/claim) | Claim a task intent, target branch, and file paths for an agent session |
+| [tes status](/cli/status) | Show session changes, peer changes on the same branch, and branch commits (`-s/--short/--porcelain`, `-b`) |
+| [tes diff](/cli/diff) | Show unified diffs or diffstats (`--stat`, `--name-only`, `--name-status`, `-U`, `-w`) for the session, working tree (`--all`), branch, or `<revA>..<revB>` |
+| [tes stash](/cli/stash) | Session-isolated AST stash (`push`, `pop`, `apply`, `list`, `drop`, `clear`) |
+| [tes radar](/cli/radar) | Show all active AI agent and terminal sessions in real time |
+| [tes exec](/cli/exec) | Run a build, test, or server command inside a branch's Copy-on-Write sandbox |
+| [tes merge](/cli/merge) | Semantically merge sessions or multiple feature branches into a target branch |
+| [tes cherry-pick](/cli/cherry-pick) | Apply a commit (`<rev>`) onto the active branch via 3-way AST merge |
+| [tes commit](/cli/commit) | Commit the active session's changes onto its target branch (`-m`, `--amend`, `--no-edit`, `--author`, `--co-author`) |
+| [tes pull](/cli/pull) | Fetch and fast-forward or 3-way AST-merge a remote branch while rebasing sessions |
+| [tes push](/cli/push) | Synchronize session changes and push a branch to a Git remote |
+| [tes log](/cli/log) | Show commit history with branch refs, patches (`-p`), diffstats (`--stat`), graphs (`--graph`), filters (`--grep`, `-S`, `--author`), and pathspecs (`-- <paths...>`) |
+| [tes conflicts](/cli/conflicts) | List unresolved merge conflicts |
+| [tes resolve](/cli/resolve) | Resolve a conflicted file using `ast-union`, `ours`, `theirs`, or `working` |
+| [tes checkpoint](/cli/checkpoint) | Save a named checkpoint in the operation log |
+| [tes restore](/cli/restore) | Restore a branch or specific files to a checkpoint, commit, or branch |
+| [tes undo](/cli/undo) | Undo the most recent operation or roll back to a specific operation ID |
+| [tes config](/cli/config) | View or update repository configuration settings |
+| `tes session focus <id>` | Focus the originating terminal tab, multiplexer pane, or IDE window for an active session |
+
+---
+
+## Global Options
+
+These options can be used with any `tes` command:
+
+| Option | Description |
+|--------|-------------|
+| `--json` | Emit structured JSON output (never paged) |
+| `-P, --no-pager` | Do not pipe output into a pager |
+| `--paginate` | Pipe output into a pager when `stdout` is an interactive terminal (even for commands like `tes status` and `tes radar` that do not page by default) |
+| `-C, --repo <PATH>` | Run against the repository at `<PATH>` |
+| `-V, --version` | Display the `tes` version |
+| `-h, --help` | Show help for a command |
+
+By default, `tes diff`, `tes log`, `tes oplog`, `tes branch` (when listing), and `tes stash list` automatically pipe output through a pager (`TES_PAGER` -> `tessera.toml` `pager` -> `GIT_PAGER` -> `git config core.pager` -> `PAGER` -> `less -FRX`) when `stdout` is an interactive terminal. `tes status`, `tes radar`, and `tes conflicts` print directly to the terminal unless `--paginate` is passed.
+
+---
+
+## MCP Server
+
+For AI coding editors that support the Model Context Protocol (MCP), `tes mcp` starts a JSON-RPC 2.0 server over `stdio` exposing the following tools:
+
+| Tool | Description |
+|------|-------------|
+| `claim` | Claim a task intent, target branch (`branch`), and file/symbol list (`symbols`) |
+| `status` | Reconcile edits and return session status and branch state |
+| `radar` | Return all active agent sessions, target branches, and claimed symbols |
+| `branch` | List, delete (`delete` / `force_delete`), or rename (`rename`) branches |
+| `stash` | Session-isolated AST stash (`push`, `pop`, `apply`, `list`, `drop`, `clear`) |
+| `pull` | Fetch and fast-forward or 3-way AST-merge a remote branch and rebase sessions |
+| `cherry-pick` | 3-way AST cherry-pick a commit (`rev`) onto a target branch |
+| `conflicts` | List active structural conflicts with base, ours, and theirs snippets |
+| `resolve` | Resolve a conflict using `ast-union`, `ours`, `theirs`, or `working` |
+| `checkpoint` | Create a named checkpoint in the operation log |
+| `restore` | Restore a branch or file paths to a commit, branch, or checkpoint |
+| `undo` | Roll back the latest operation or restore to a specific `op_id` |
+| `sync` | Synchronize the current session with the latest branch `HEAD` |
+| `merge` | Commit the session or AST-merge multiple branches into a target branch |
+
+---
+
+## Configuration
+
+Tessera projects can be configured via `tessera.toml` or `tes config`.
+
+**See:** [Configuration Guide](/guides/configuration) for complete documentation.
+
+---
+
+# tes init
+
+Initialize Tessera in a project directory and install AI editor rules.
+
+## Usage
+
+```bash
+tes init [options]
+```
+
+## Options
+
+- `-b, --branch <BRANCH>` - Default trunk branch name (default: `main`).
+- `--harness <LIST>` - Comma-separated list of AI editors/harnesses to configure (`antigravity`, `claude`, `cursor`, `windsurf`, `kiro`, `opencode`, `codex`, `vscode`, or `all`).
+
+## Description
+
+The `init` command sets up Tessera inside your project by:
+1. Initializing `.git` and creating an initial commit if the directory is not already a Git repository.
+2. Creating the `.git/tessera` store and default configuration.
+3. Installing workspace rules (`AGENTS.md`, `.agents/rules/tessera.md`, `.codex/config.toml`, `.codex/hooks.json`, and detected editor rules) and MCP configuration so AI coding agents coordinate through Tessera automatically.
+4. Installing lightweight Git `post-commit` and `post-merge` hooks to keep `.git/tessera` synchronized with native `git` commands.
+
+## Examples
+
+```bash
+# initialize in current directory (auto-detects AI editors)
+tes init
+
+# initialize with a specific default branch
+tes init --branch main
+
+# install rules for specific AI editors
+tes init --harness antigravity,claude,cursor
+
+# install rules for all supported AI editors
+tes init --harness all
+```
+
+---
+
+# tes env
+
+Configure shell prompt integration and dynamic `<TAB>` completion.
+
+## Usage
+
+```bash
+tes env [options]
+```
+
+## Options
+
+- `--install` - Automatically append the shell integration to `~/.zshrc`, `~/.bashrc`, `~/.bash_profile`, `~/.profile`, `~/.kshrc`, `~/.mkshrc`, `~/.tcshrc`, `~/.cshrc`, `~/.config/fish/config.fish`, and PowerShell's `$PROFILE` on Windows (when present).
+- `--zsh` - Output the Zsh integration script.
+- `--bash` - Output the Bash (`3.2+` and `5.x`) integration script.
+- `--fish` - Output the Fish integration script.
+- `--sh` - Output the POSIX `sh` / `dash` / `ksh` / `mksh` / `oksh` / `yash` integration script.
+- `--tcsh` / `--csh` - Output the `tcsh` / BSD `csh` integration script.
+- `--nu` / `--nushell` - Output the Nushell (`nu`) integration script.
+- `--elvish` - Output the Elvish integration script.
+- `--pwsh` - Output the PowerShell (`pwsh`) integration script.
+
+## Description
+
+The `env` command configures your shell so each terminal tab displays its active Tessera branch (`(tes:<branch>)`) in the prompt, enables `<TAB>` completion for subcommands, branches, and checkpoints, and routes commands in switched terminals to the active branch's Copy-on-Write sandbox.
+
+Even without `tes env` installed in your shell profile, Tessera automatically isolates terminal tabs across macOS, Linux, FreeBSD, OpenBSD, NetBSD, and Windows using terminal session environment variables (`TERM_SESSION_ID`, `ITERM_SESSION_ID`, `TMUX_PANE`, `ZELLIJ_PANE_ID`, `WEZTERM_PANE`, `KITTY_WINDOW_ID`, `GHOSTTY_SURFACE_ID`, `ALACRITTY_WINDOW_ID`, `GNOME_TERMINAL_SCREEN`, `KONSOLE_DBUS_SESSION`, `TILIX_ID`, `WT_SESSION`), POSIX session leader (`getsid(0)`), and Windows console/process tree tracking.
+
+## Examples
+
+```bash
+# automatically configure your shell profiles
+tes env --install
+
+# evaluate manually in ~/.zshrc
+eval "$(tes env --zsh)"
+
+# evaluate manually in ~/.bashrc
+eval "$(tes env --bash)"
+
+# evaluate manually in ~/.config/fish/config.fish
+tes env --fish | source
+
+# evaluate manually in ~/.profile, ~/.kshrc, or ~/.mkshrc (sh, dash, ksh, mksh, oksh, yash)
+eval "$(tes env --sh)"
+
+# evaluate manually in ~/.tcshrc or ~/.cshrc
+eval "`tes env --tcsh`"
+
+# save and source in ~/.config/nushell/config.nu
+tes env --nu | save -f ~/.config/nushell/tes.nu
+source ~/.config/nushell/tes.nu
+
+# append to ~/.config/elvish/rc.elv
+tes env --elvish >> ~/.config/elvish/rc.elv
+
+# evaluate manually in PowerShell ($PROFILE)
+Invoke-Expression (& tes env --pwsh)
+```
+
+---
+
+# tes switch
+
+Switch the current terminal session or the editor working tree to a branch.
+
+## Usage
+
+```bash
+tes switch <branch> [options]
+```
+
+Alias: `tes checkout <branch>`
+
+## Options
+
+- `-e, --editor` - Switch the primary repository working tree (`repo_root` and `.git/HEAD`) so your IDE displays `<branch>`, and also bind the calling terminal session to `<branch>`.
+- `-a, --agent <ID>` - Bind a specific agent session ID to `<branch>`.
+
+## Description
+
+By default, `tes switch <branch>` binds your current terminal session to `<branch>` (creating the branch at `HEAD` if it does not exist yet) and materializes its Copy-on-Write sandbox without changing `.git/HEAD` for other open terminals or AI agents.
+
+When `--editor` is passed, `tes switch` updates the primary repository working tree (`repo_root`), `.git/HEAD`, and `.git/index` to `<branch>` and binds the calling terminal session to `<branch>` while preserving isolated sandboxes for all other background terminal sessions.
+
+## Examples
+
+```bash
+# switch the current terminal tab to feat/pricing
+tes switch feat/pricing
+
+# switch both the IDE working tree (repo_root) and current terminal to feat/pricing
+tes switch feat/pricing --editor
+
+# bind a specific agent session to feat/pricing
+tes switch feat/pricing --agent antigravity-1
+```
+
+---
+
+# tes branch
+
+List, create, rename, or delete branches and their Copy-on-Write sandboxes.
+
+## Usage
+
+```bash
+tes branch [branch] [options]
+```
+
+Alias: `tes branches`
+
+## Options
+
+- `-l, --list` - List branches.
+- `-v, --verbose` - Show the tip commit SHA and subject line for each branch in list mode.
+- `-d, --delete` - Safely delete `<branch>` and its Copy-on-Write sandbox (refuses if unmerged or dirty).
+- `-D, --force-delete` - Force-delete `<branch>` and its Copy-on-Write sandbox even if unmerged or dirty.
+- `-m, --move <NEW_BRANCH>` - Rename `<branch>` (or the current session's branch if omitted) to `<NEW_BRANCH>`, migrating active sessions and its Copy-on-Write sandbox.
+- `-e, --editor` - When switching to `<branch>`, also switch the primary repository working tree (`repo_root` and `.git/HEAD`) and bind the calling terminal session.
+- `--json` - Output detailed branch metadata including commit SHAs, ports, active sessions, modified files, and the commit graph.
+
+## Description
+
+When run with no arguments (or with `-l` / `-v`), `tes branch` lists all local Git and Tessera branches and highlights the current session's active branch with `*`.
+
+## Examples
+
+```bash
+# list all branches
+tes branch
+
+# list branches with short commit SHAs and commit subjects
+tes branch -v
+
+# safely delete a merged branch and its sandbox
+tes branch -d feat/old-experiment
+
+# force-delete an unmerged branch
+tes branch -D feat/abandoned
+
+# rename a branch and migrate active sessions
+tes branch -m feat/old-name feat/new-name
+
+# inspect detailed branch state as JSON
+tes branch --json
+```
+
+---
+
+# tes claim
+
+Register a task intent, target branch, and file paths for an AI agent session.
+
+## Usage
+
+```bash
+tes claim --intent <TEXT> [options] <files...>
+```
+
+## Options
+
+- `-i, --intent <TEXT>` - Concise description of the task being performed.
+- `-b, --branch <BRANCH>` - Target branch for the session (created from `HEAD` if it does not exist).
+- `-a, --agent <ID>` - Explicit session ID (auto-detected from environment by default).
+
+## Description
+
+AI agents run `tes claim` before modifying files. The command records the starting baseline of each claimed file, binds the session to `--branch` if specified, prepares the branch's Copy-on-Write sandbox, and starts the background file watcher.
+
+## Examples
+
+```bash
+# claim files on the current branch
+tes claim --intent "Add currency formatter" src/currency.ts
+
+# claim files on an isolated feature branch
+tes claim --branch feat/pricing --intent "Build pricing calculator" src/components/PricingCalculator.vue src/App.vue
+```
+
+---
+
+# tes status
+
+Reconcile working tree edits and display current session and branch status.
+
+## Usage
+
+```bash
+tes status [options]
+```
+
+## Options
+
+- `-s, --short, --porcelain` - Give the output in compact `XY <path>` short-format.
+- `-b, --branch` - Show the branch and session header (`## <branch> [session: <id>]`) in short-format.
+- `-a, --agent <ID>` - Inspect status for a specific session ID.
+- `--json` - Emit structured JSON output.
+
+## Description
+
+The `status` command snapshots any modified files in the current workspace, reconciles concurrent edits, and reports:
+1. **Staged / Session Changes**: Files recorded in the current session (`M`, `A`, `D`).
+2. **Peer Session Changes (concurrent on `<branch>`)**: Files modified by other concurrent AI agent or terminal sessions on the same branch, kept strictly isolated from your session's staged list.
+3. **Unstaged Changes**: Working tree edits on disk not yet claimed by any session.
+4. **Committed on Branch**: Files committed on the active feature branch ahead of `main`.
+
+## Examples
+
+```bash
+# show current session and branch status
+tes status
+
+# show compact short-format status with branch header
+tes status -sb
+
+# output status as JSON
+tes status --json
+```
+
+---
+
+# tes diff
+
+Display line-by-line unified diffs, diffstats, or changed file lists for the session, working tree, branch, or any commit range.
+
+## Usage
+
+```bash
+tes diff [options] [<revA>..<revB> | <revA> <revB>] [--] [<paths...>]
+```
+
+## Options
+
+- `--staged, --cached` - Show only staged session changes.
+- `--all` - Show all combined working tree edits on disk across all concurrent sessions on the branch.
+- `--stat` - Show a diffstat summary of changed files and line counts.
+- `--shortstat` - Show only the aggregate line count summary (files changed, insertions, deletions).
+- `--numstat` - Show machine-friendly per-file added and deleted line counts.
+- `--name-only` - Show only the names of changed files.
+- `--name-status` - Show names and status letters (`A`, `M`, `D`) of changed files.
+- `-U, --unified <LINES>` - Generate diffs with `<LINES>` lines of context instead of the default `3`.
+- `-w, --ignore-all-space` - Ignore all whitespace when comparing lines.
+- `--ignore-space-change` - Ignore changes in the amount of whitespace.
+- `-b, --branch <BRANCH>` - Compare `<BRANCH>` against `main` without switching branches.
+- `-a, --agent <ID>` - Show changes for a specific session ID.
+- `-- <paths...>` - Restrict the diff to specific files or directories.
+
+## Description
+
+By default, when your session has claimed files, `tes diff` shows only your session's isolated diff (`base_commit -> own_blobs`) so concurrent peer edits do not pollute your diff output. You can pass `--all` to inspect the combined working tree diff, `-b <branch>` to diff a branch against `main`, or `<revA>..<revB>` (or `<revA> <revB>`) to diff any two revisions, branches, or commits.
+
+## Examples
+
+```bash
+# diff changes in the current session (or working tree if unclaimed)
+tes diff
+
+# show diffstat or changed file names for the current session
+tes diff --stat
+tes diff --name-status
+
+# diff all combined working tree changes across concurrent sessions
+tes diff --all
+
+# diff specific paths or directories
+tes diff -- crates/cli/src/main.rs docs/
+
+# compare a feature branch against main
+tes diff -b feat/pricing
+
+# diff two revisions or branches (optionally scoped to paths)
+tes diff HEAD~1..HEAD --stat
+tes diff main..feat/pricing -- src/App.vue
+```
+
+---
+
+# tes stash
+
+Session-isolated AST stash for saving and reapplying uncommitted changes without interfering with concurrent agents or other branches.
+
+## Usage
+
+```bash
+tes stash [subcommand] [options]
+```
+
+## Subcommands
+
+- `tes stash [push] [-m <msg>] [-a <ID>] [paths...]` - Save the current session's (or working tree's) uncommitted changes onto the stash stack and restore the stashed files to the branch base. Optionally pass `<paths...>` to stash only specific files.
+- `tes stash pop [index] [-a <ID>]` - 3-way AST-merge `stash@{index}` (default `0`) onto the current branch/session and remove it from the stash stack.
+- `tes stash apply [index] [-a <ID>]` - 3-way AST-merge `stash@{index}` (default `0`) onto the current branch/session while keeping it in the stash stack.
+- `tes stash list` - List all stash entries (`stash@{0}`, `stash@{1}`, ...).
+- `tes stash drop [index]` - Delete a single stash entry (default `0`).
+- `tes stash clear` - Remove all entries from the stash stack.
+
+## Examples
+
+```bash
+# stash all changes in the current session or working tree
+tes stash -m "WIP: refactor billing"
+
+# stash only specific files while keeping other edits in place
+tes stash push -m "partial stash" src/billing.ts
+
+# list stashes
+tes stash list
+
+# pop the most recent stash via 3-way AST merge
+tes stash pop
+
+# apply stash@{1} without dropping it
+tes stash apply 1
+```
+
+---
+
+# tes radar
+
+Display all active AI agent and terminal sessions in real time.
+
+## Usage
+
+```bash
+tes radar [options]
+```
+
+## Options
+
+- `--json` - Emit structured JSON output.
+
+## Description
+
+`tes radar` shows every active session in the repository along with its assigned slot number, target branch, task intent, claimed AST symbols, and modified files. Any structural overlaps between sessions on the same branch are highlighted.
+
+## Examples
+
+```bash
+# inspect live sessions
+tes radar
+
+# output live sessions as JSON
+tes radar --json
+```
+
+---
+
+# tes exec
+
+Run a command inside an isolated Copy-on-Write branch sandbox.
+
+## Usage
+
+```bash
+tes exec [-b <branch>] -- <command...>
+```
+
+## Options
+
+- `-b, --branch <BRANCH>` - Target branch sandbox to run the command in (defaults to the current session's branch).
+- `-a, --agent <ID>` - Explicit session ID.
+
+## Description
+
+`tes exec` materializes the target branch's files into a Copy-on-Write sandbox, clones dependency and build caches (`node_modules`, `target`, `.venv`, `vendor`), prepends `<sandbox>/node_modules/.bin` to `PATH`, and exports isolated `PORT`, `TES_PORT`, `TES_BRANCH`, and `DATABASE_URL` environment variables.
+
+## Examples
+
+```bash
+# run a build on the current session's branch
+tes exec -- npm run build
+
+# run a build on a specific branch without switching your working tree
+tes exec -b feat/pricing -- npm run build
+
+# run tests on two branches in parallel
+tes exec -b feat/pricing -- npm test
+tes exec -b feat/faq -- npm test
+```
+
+---
+
+# tes merge
+
+Commit the current session or semantically merge multiple branches into a target branch.
+
+## Usage
+
+```bash
+tes merge [branches_or_sessions...] [options]
+```
+
+## Options
+
+- `--into <BRANCH>` - Target branch to merge into (defaults to the active session's branch or `main`).
+- `-m, --message <MSG>` - Commit message for the merge commit.
+- `--verify <CMD>` - Verification command to run before finalizing the merge.
+- `--keep-open` - Keep agent sessions open after merging.
+- `--co-author [=<NAME <EMAIL>>]` - Append a `Co-authored-by:` trailer to the merge commit (defaults to configured `co_author_trailer` when passed without a value; repeatable).
+- `--no-co-author` - Omit `Co-authored-by:` trailers even if `co_author = true` in repository config.
+- `--author <NAME <EMAIL>>` - Override the commit `Author` identity for the merge commit.
+
+## Description
+
+When called with `-m "<message>"` inside an active session, `tes merge` commits the session's changes onto its target branch.
+
+When called with one or more branch names and `--into <target>`, `tes merge` combines the branches into `<target>` using Tessera's semantic merge pipeline (subtree skipping, rename detection, SQL migration resequencing, manifest drivers, and 3-way Tree-sitter AST merging).
+
+Merge commits record your active Git/system user as the commit `Author` (or `--author "Name <email>"` when specified), and optionally append `Co-authored-by: Tessera <noreply@tessera.getlunaris.dev>` when `co_author = true` is configured (`false` by default) or `--co-author` is passed.
+
+## Examples
+
+```bash
+# commit the current session onto its target branch
+tes merge -m "feat(pricing): add pricing calculator"
+
+# merge two feature branches into main
+tes merge feat/pricing feat/faq --into main -m "feat: add pricing and faq"
+
+# merge with an explicit Co-authored-by trailer
+tes merge feat/pricing --into main -m "feat: add pricing" --co-author
+
+# run a verification command before completing the merge
+tes merge feat/pricing --into main --verify "npm run build" -m "feat: add pricing"
+```
+
+---
+
+# tes cherry-pick
+
+Apply the changes introduced by an existing commit onto the active (or specified) branch via 3-way AST merge.
+
+## Usage
+
+```bash
+tes cherry-pick <commit> [options]
+```
+
+## Options
+
+- `-b, --branch <BRANCH>` - Target branch to apply the commit onto (defaults to the current session's active branch).
+- `-a, --agent <ID>` - Explicit session ID.
+
+## Description
+
+`tes cherry-pick` takes the diff introduced by `<commit>` (a commit SHA, branch name, `HEAD~N`, or checkpoint) against its parent and applies it onto the target branch using Tessera's 3-way Tree-sitter AST merge engine, rebasing active sessions on that branch automatically.
+
+## Examples
+
+```bash
+# cherry-pick a commit onto the active branch
+tes cherry-pick 4beccce
+
+# cherry-pick the tip commit of another branch onto main
+tes cherry-pick feat/pricing --branch main
+```
+
+---
+
+# tes commit
+
+Commit the current session's changes onto its target branch.
+
+## Usage
+
+```bash
+tes commit [-m <MESSAGE>] [options]
+```
+
+## Options
+
+- `-m, --message <MSG>` - Commit message.
+- `-b, --branch <BRANCH>` - Explicit target branch override.
+- `--amend` - Amend the tip commit of the target branch instead of creating a new child commit.
+- `--no-edit` - Reuse the previous commit message when amending without `-m`.
+- `--verify <CMD>` - Run a verification command before committing.
+- `--co-author [=<NAME <EMAIL>>]` - Append a `Co-authored-by:` trailer to this commit (defaults to configured `co_author_trailer` when passed without a value; repeatable).
+- `--no-co-author` - Omit `Co-authored-by:` trailers for this commit even if `co_author = true` in repository config.
+- `--author <NAME <EMAIL>>` - Override the commit `Author` identity for this commit.
+- `-a, --agent <ID>` - Explicit session ID.
+
+## Description
+
+`tes commit` snapshots any pending changes in the current session, writes a new commit onto the session's target branch (`refs/heads/<branch>`), and updates the branch sandbox. Passing `--amend` replaces the tip commit on the target branch while preserving its parent commits (and reusing the previous commit message and author when `-m` / `--author` are omitted).
+
+Commits record your active Git/system user (`git config user.name` and `user.email`, with automatic OS user fallback) as the commit `Author`, unless overridden via `--author "Name <email>"`. If `co_author = true` is enabled in `tessera.toml`, via `tes config set co_author true` (`false` by default), or per-commit via `--co-author`, Tessera appends `Co-authored-by: Tessera <noreply@tessera.getlunaris.dev>` (or your custom trailer) to the commit message.
+
+## Examples
+
+```bash
+# commit changes in the current session
+tes commit -m "feat(pricing): add interactive pricing calculator"
+
+# amend the previous commit with new edits or an updated message
+tes commit --amend --no-edit
+tes commit --amend -m "feat(pricing): add interactive pricing calculator and unit tests"
+
+# commit to a specific branch
+tes commit -b feat/pricing -m "feat(pricing): add interactive pricing calculator"
+
+# include the default Co-authored-by trailer on a single commit
+tes commit -m "feat(pricing): add tier selector" --co-author
+
+# include a custom Co-authored-by trailer or override the commit author
+tes commit -m "feat(pricing): pair on billing logic" --co-author "Alice <alice@example.com>"
+tes commit -m "fix(auth): token refresh" --author "Jane Doe <jane@example.com>"
+```
+
+---
+
+# tes pull
+
+Fetch from a Git remote, fast-forward or 3-way AST-merge the remote branch into your local branch, and rebase active sessions on that branch.
+
+## Usage
+
+```bash
+tes pull [remote] [branch]
+```
+
+## Arguments
+
+- `[remote]` - Git remote name (defaults to `origin`).
+- `[branch]` - Branch name to pull (defaults to the current session's active branch).
+
+## Description
+
+`tes pull` fetches the latest commits from `<remote>/<branch>`, fast-forwards your local branch ref when possible (or performs a 3-way AST merge if local commits have diverged), and rebases any active sessions and Copy-on-Write branch sandboxes onto the updated branch `HEAD`.
+
+## Examples
+
+```bash
+# pull the current active branch from origin
+tes pull
+
+# pull a specific branch from origin
+tes pull origin feat/pricing
+```
+
+---
+
+# tes push
+
+Synchronize pending session changes and push a branch to a Git remote.
+
+## Usage
+
+```bash
+tes push [remote] [branch] [options]
+```
+
+## Options
+
+- `-m, --message <MSG>` - Commit message if uncommitted session changes need to be committed before pushing.
+- `-f, --force` - Push with `--force-with-lease`.
+- `-a, --agent <ID>` - Explicit session ID.
+
+## Description
+
+`tes push` commits any uncommitted changes in the current session onto the active branch and runs `git push -u <remote> refs/heads/<branch>:refs/heads/<branch>`.
+
+## Examples
+
+```bash
+# push the active branch to origin
+tes push
+
+# push a specific branch to origin
+tes push origin feat/pricing
+```
+
+---
+
+# tes log
+
+Show the commit history for the active session's branch, any specified branch or revision range, or specific file paths.
+
+## Usage
+
+```bash
+tes log [options] [<revision-or-range>] [-- <paths...>]
+```
+
+## Options
+
+- `-n, --limit, --max-count <N>` - Maximum number of commits to display (default: `20`).
+- `-b, --branch <BRANCH>` - Branch or revision to inspect (defaults to the active session's branch).
+- `--oneline` - Display each commit on a single compact line (`<short_sha> (<refs>) <subject>`).
+- `-p, -u, --patch` - Generate a unified diff patch for each commit.
+- `--stat` - Show a diffstat summary of modified files and line counts for each commit.
+- `--name-only` - Show only the names of changed files for each commit.
+- `--name-status` - Show the names and status letters (`A`, `M`, `D`) of changed files for each commit.
+- `--graph` - Draw a text-based graphical representation of the commit history.
+- `--all` - Show commits across all branches and refs.
+- `--author <PATTERN>` - Filter commits by author name or email pattern.
+- `--grep <PATTERN>` - Filter commits whose commit message matches `<PATTERN>`.
+- `-S, --pickaxe <STRING>` - Filter commits that introduce or remove `<STRING>` in the patch.
+- `--since, --after <DATE>` - Show commits more recent than a specific date.
+- `--until, --before <DATE>` - Show commits older than a specific date.
+- `--reverse` - Output the chosen commits in reverse chronological order.
+- `-a, --agent <ID>` - Inspect commit history for a specific session's branch.
+- `-- <paths...>` - Restrict commit history (and patches) to commits touching the given files or directories.
+- `--json` - Emit structured JSON commit entries.
+
+## Examples
+
+```bash
+# show recent commits on the current branch
+tes log
+
+# show compact one-line commit log
+tes log --oneline -n 10
+
+# show the last 4 commits with patches scoped to docs/
+tes log -p -n 4 -- docs/
+
+# show diffstat and commit graph across all branches
+tes log --graph --stat --all -n 15
+
+# filter commits by message or pickaxe string
+tes log --grep "AST" -n 5
+tes log -S "merge_trees_3way" --oneline
+
+# inspect commit history of another branch without switching
+tes log -b feat/pricing --oneline
+```
+
+---
+
+# tes conflicts
+
+List unresolved merge conflicts in the repository.
+
+## Usage
+
+```bash
+tes conflicts [options]
+```
+
+## Options
+
+- `--json` - Emit structured JSON output with `base`, `ours`, and `theirs` code snippets and participating session IDs.
+
+## Description
+
+`tes conflicts` lists all files that currently have an unresolved structural merge conflict.
+
+## Examples
+
+```bash
+# list unresolved conflicts
+tes conflicts
+
+# inspect full conflict snippets as JSON
+tes conflicts --json
+```
+
+---
+
+# tes resolve
+
+Resolve a merge conflict in a file using a specified strategy.
+
+## Usage
+
+```bash
+tes resolve <path> --strategy <strategy>
+```
+
+## Options
+
+- `-s, --strategy <STRATEGY>` - Resolution strategy (`ast-union`, `ours`, `theirs`, or `working`).
+
+## Description
+
+The `resolve` command clears the conflict record for `<path>`, writes the chosen resolution to disk and the target branch, and replaces any intermediate conflict commit cleanly:
+
+- `ast-union` - Combine both sides' AST declarations and statements in order.
+- `ours` - Keep the first session or branch's version.
+- `theirs` - Keep the second session or branch's version.
+- `working` - Use the file as currently edited and saved on disk.
+
+## Examples
+
+```bash
+# combine both sides using AST union
+tes resolve src/App.vue --strategy ast-union
+
+# keep the first branch's version
+tes resolve src/App.vue --strategy ours
+
+# keep the second branch's version
+tes resolve src/App.vue --strategy theirs
+
+# resolve using the manually edited file on disk
+tes resolve src/App.vue --strategy working
+```
+
+---
+
+# tes checkpoint
+
+Save a named checkpoint in the operation log.
+
+## Usage
+
+```bash
+tes checkpoint <name>
+```
+
+## Arguments
+
+- `<name>` - Name for the checkpoint (e.g., `before-refactor`).
+
+## Description
+
+`tes checkpoint` snapshots the current working tree and session state and records a named checkpoint in `.git/tessera`. You can restore the repository back to this checkpoint at any time using `tes restore <name>`.
+
+## Examples
+
+```bash
+# save a named checkpoint
+tes checkpoint before-refactor
+
+# restore back to the checkpoint later
+tes restore before-refactor
+```
+
+---
+
+# tes restore
+
+Restore a branch or specific files to a checkpoint, commit, or branch.
+
+## Usage
+
+```bash
+tes restore [options] [target_or_paths...]
+```
+
+Alias: `tes reset`
+
+## Options
+
+- `-b, --branch <BRANCH>` - Restore a specific branch without switching your working tree to it first.
+- `-s, --source <REF>` - Restore specific files from `<REF>` (checkpoint name, commit SHA, `HEAD~N`, or branch name).
+
+## Description
+
+When given a checkpoint name, commit SHA, or `HEAD~N` (with no file paths), `tes restore` resets the target branch to that point in time and synchronizes `.git/HEAD`, `.git/index`, active agent baselines, and the branch's Copy-on-Write sandbox.
+
+When given file paths, `tes restore` restores only those files from `--source` (or from `HEAD` if `--source` is omitted).
+
+## Examples
+
+```bash
+# restore the current branch to a named checkpoint or previous commit
+tes restore before-refactor
+tes restore HEAD~1
+
+# restore a specific branch to its previous commit
+tes restore -b feat/pricing HEAD~1
+
+# discard uncommitted changes in a file
+tes restore src/App.vue
+
+# restore a file from main
+tes restore --source main src/App.vue
+```
+
+---
+
+# tes undo
+
+Undo the most recent operation or roll back to a specific operation ID.
+
+## Usage
+
+```bash
+tes undo [options]
+```
+
+## Options
+
+- `--op <OP_ID>` - Roll back to a specific operation ID from `tes oplog`.
+- `--checkpoint <LABEL>` - Roll back to a named checkpoint created with `tes checkpoint <LABEL>`.
+
+## Description
+
+Every state change in `.git/tessera` is recorded in the operation log (`tes oplog`). Running `tes undo` reverses the most recent operation and restores the working tree and branch refs to their prior state.
+
+## Examples
+
+```bash
+# view recent operations
+tes oplog
+
+# undo the most recent operation
+tes undo
+
+# roll back to a specific operation ID
+tes undo --op 8f3a1c2
+
+# roll back to a named checkpoint
+tes undo --checkpoint before-refactor
+```
+
+---
+
+# tes config
+
+View or update repository configuration settings.
+
+## Usage
+
+```bash
+tes config <subcommand> [arguments]
+```
+
+## Subcommands
+
+- `show` - Display the effective configuration for the repository.
+- `set <KEY> <VALUE>` - Update `trunk_branch`, `base_port`, `port_stride`, `verify_command`, `co_author`, `co_author_trailer`, or `pager`.
+- `trust` - Trust the repository's `tessera.toml` so `verify_command`, `pager`, and `extra_bin_dirs` defined in `tessera.toml` are allowed to execute.
+- `untrust` - Revoke trust for the repository's `tessera.toml`.
+- `add-cache-dir <DIRS...>` - Add directories to `cow_cache_dirs`.
+- `remove-cache-dir <DIRS...>` - Remove directories from `cow_cache_dirs`.
+- `add-bin-dir <DIRS...>` - Add directories to `extra_bin_dirs`.
+- `remove-bin-dir <DIRS...>` - Remove directories from `extra_bin_dirs`.
+- `set-env <KEY> <TEMPLATE>` - Set a custom environment variable template (`{slot}`, `{port}`, `{branch}`, `{agent_id}`).
+- `unset-env <KEY>` - Remove a custom environment variable template.
+
+## Examples
+
+```bash
+# view current configuration
+tes config show
+
+# update base port and verification command
+tes config set base_port 4000
+tes config set verify_command "npm test"
+
+# enable Co-authored-by trailer on Tessera commits (false by default)
+tes config set co_author true
+
+# configure a custom terminal pager (e.g. delta or less -FRX)
+tes config set pager "delta --paging=always"
+
+# trust a cloned repository's tessera.toml
+tes config trust
+
+# add a Copy-on-Write cache directory
+tes config add-cache-dir .nx
+
+# set a custom environment variable template
+tes config set-env DATABASE_URL "postgres://localhost:5432/app_slot_{slot}"
+```
+
+## See Also
+
+- [Configuration Guide](/guides/configuration) - Full `tessera.toml` reference

@@ -1,0 +1,60 @@
+# Tessera
+
+> Multi-agent coordination layer on top of Git for running concurrent AI coding agents and terminal sessions in the same repository.
+
+Tessera (`tes`) does not replace Git. It works on top of your existing Git checkout (`.git/tessera`), isolating every AI agent and terminal session so they can work on independent branches or the same branch simultaneously, running builds and dev servers inside Copy-on-Write branch sandboxes with isolated ports and test databases, and merging concurrent edits structurally at the Tree-sitter AST level. Every commit and merge writes standard Git blobs, trees, and commits directly into `.git/objects/` and `refs/heads/*`.
+
+## Machine-Readable Bundles
+
+- [Autonomous Agent Instructions (`/agents.txt`)](https://tessera.getlunaris.dev/agents.txt): Mandatory 4-step `tes` workflow, safety rules, CLI cheatsheet, and MCP tools for AI coding agents.
+- [Full Documentation Bundle (`/llms-full.txt`)](https://tessera.getlunaris.dev/llms-full.txt): Complete Tessera documentation concatenated into a single plain-text Markdown file for LLM context ingestion.
+
+## Getting Started
+
+- [Introduction](https://tessera.getlunaris.dev/getting-started/): Install `tes`, initialize a repository with `tes init`, and run your first multi-branch workflow.
+- [Why Tessera?](https://tessera.getlunaris.dev/getting-started/why-tessera): How Tessera works on top of Git to eliminate `.git/HEAD` collisions and `git worktree` overhead when running parallel AI agents.
+- [Installation](https://tessera.getlunaris.dev/getting-started/installation): Install on macOS, Linux, Windows, FreeBSD, OpenBSD, or NetBSD, enable `(tes:<branch>)` shell prompts (`tes env --install`), and configure AI editor harnesses.
+- [Your First Workflow](https://tessera.getlunaris.dev/getting-started/first-workflow): Walk through parallel feature branches (`feat/pricing` and `feat/faq`), live session inspection (`tes radar`), and 3-way AST merging (`tes merge`).
+
+## Guides
+
+- [Guides Overview](https://tessera.getlunaris.dev/guides/): Index of step-by-step guides and tutorials.
+- [Configuration (`tessera.toml`)](https://tessera.getlunaris.dev/guides/configuration): Customize `trunk_branch`, `base_port`, `port_stride`, `verify_cmd`, `co_author`, `cow_cache_dirs`, `extra_bin_dirs`, `[custom_env]`, and repository trust (`tes config`).
+- [Editor Support (VS Code & Antigravity IDE)](https://tessera.getlunaris.dev/guides/ide-extension): Status bar branch switcher, live multi-agent line attribution, 2D Branch Graph, and one-click Conflict Resolver.
+- [Agents (Multi-Agent Workflow)](https://tessera.getlunaris.dev/guides/multi-agent-workflow): How AI agents coordinate automatically using `tes claim`, `tes hook post-tool`, `tes exec`, and `tes commit` on the same branch or separate branches.
+- [Branches & Terminals](https://tessera.getlunaris.dev/guides/branches-and-terminals): How per-terminal branches (`tes switch`), per-agent branches (`tes claim --branch`), and the editor working tree (`tes switch --editor`) stay isolated in one folder.
+- [Sandboxes (Running Tests & Dev Servers)](https://tessera.getlunaris.dev/guides/running-tests-and-servers): Copy-on-Write dependency cloning (`node_modules`, `target`, `.venv`, `vendor`) and isolated `PORT` / `DATABASE_URL` slots.
+- [Conflicts, Checkpoints & Undo](https://tessera.getlunaris.dev/guides/conflict-resolution): Resolving true same-line conflicts (`ast-union`, `ours`, `theirs`, `working`), saving checkpoints (`tes checkpoint`), restoring files (`tes restore`), and rolling back operations (`tes undo`).
+
+## Examples
+
+- [Examples Overview](https://tessera.getlunaris.dev/examples/): Step-by-step multi-agent walkthroughs.
+- [Same-Branch Editing](https://tessera.getlunaris.dev/examples/same-branch): Two agents editing the same function in `src/currency.ts` on `main` and merging automatically via Tree-sitter AST.
+- [Feature Branches](https://tessera.getlunaris.dev/examples/parallel-branches): Building two features on `feat/pricing` and `feat/faq` while modifying `src/App.vue` concurrently, then merging both into `main`.
+- [Conflict Resolution](https://tessera.getlunaris.dev/examples/conflict-resolution): Resolving incompatible edits to the exact same expression in the editor or from the CLI.
+
+## CLI Reference
+
+- [CLI Commands Overview](https://tessera.getlunaris.dev/cli/): Complete command table, global flags (`--json`, `-P/--no-pager`, `--paginate`, `-C/--repo`), and MCP server tools (`tes mcp`).
+- [tes init](https://tessera.getlunaris.dev/cli/init): Initialize `.git/tessera` and install AI coding harness rules (`antigravity`, `claude`, `cursor`, `codex`, `windsurf`, `kiro`, `opencode`, `vscode`, `all`).
+- [tes env](https://tessera.getlunaris.dev/cli/env): Install shell prompt integration (`(tes:<branch>)`) and tab completions across Zsh, Bash, Fish, POSIX sh, tcsh, Nushell, Elvish, and PowerShell.
+- [tes switch](https://tessera.getlunaris.dev/cli/switch): Switch the active terminal tab (`tes switch <branch>`) or IDE working tree (`tes switch <branch> --editor`).
+- [tes branch](https://tessera.getlunaris.dev/cli/branch): List (`-l`, `-v`), create, rename (`-m`), or delete (`-d`/`-D`) branches and clean up sandboxes.
+- [tes claim](https://tessera.getlunaris.dev/cli/claim): Claim a task intent, target branch, and target files for an agent session.
+- [tes status](https://tessera.getlunaris.dev/cli/status): Display staged session changes, unstaged edits, peer session changes, and branch commits ahead of `main` (`-s/--short/--porcelain`, `-b/--branch`, `--json`).
+- [tes diff](https://tessera.getlunaris.dev/cli/diff): Inspect unified diffs or diffstats (`--stat`, `--name-only`, `--name-status`, `-U`, `-w`) for the active session, working tree (`--all`), branch (`-b`), or commit range (`<revA>..<revB>`).
+- [tes stash](https://tessera.getlunaris.dev/cli/stash): Session-isolated AST stash (`push`, `pop`, `apply`, `list`, `drop`, `clear`).
+- [tes radar](https://tessera.getlunaris.dev/cli/radar): View all active AI agent and terminal sessions, assigned ports, branches, and claimed symbols (`tes session focus <id>` jumps to the session's window/pane).
+- [tes exec](https://tessera.getlunaris.dev/cli/exec): Execute builds, tests, or dev servers inside a branch's Copy-on-Write sandbox.
+- [tes merge](https://tessera.getlunaris.dev/cli/merge): Semantically merge one or more branches into a target branch (`tes merge feat/a feat/b --into main -m "..."`).
+- [tes cherry-pick](https://tessera.getlunaris.dev/cli/cherry-pick): Apply any commit onto the active branch using 3-way AST merging.
+- [tes commit](https://tessera.getlunaris.dev/cli/commit): Commit the active session's isolated changes onto its target branch (`-m`, `--amend`, `--no-edit`, `--author`, `--co-author`, `--no-co-author`).
+- [tes pull](https://tessera.getlunaris.dev/cli/pull): Fetch and fast-forward or 3-way AST-merge remote changes while rebasing active sessions.
+- [tes push](https://tessera.getlunaris.dev/cli/push): Synchronize pending session changes and push a branch to a Git remote.
+- [tes log](https://tessera.getlunaris.dev/cli/log): Display commit history with branch refs, patches (`-p`), diffstats (`--stat`), graphs (`--graph`), filters (`--grep`, `-S`, `--author`), and pathspecs (`-- <paths...>`).
+- [tes conflicts](https://tessera.getlunaris.dev/cli/conflicts): List unresolved structural conflicts in the repository.
+- [tes resolve](https://tessera.getlunaris.dev/cli/resolve): Resolve a conflicted file (`--strategy ast-union | ours | theirs | working`).
+- [tes checkpoint](https://tessera.getlunaris.dev/cli/checkpoint): Record a named checkpoint in the operation log.
+- [tes restore](https://tessera.getlunaris.dev/cli/restore): Restore a branch or specific files to a checkpoint, commit SHA, `HEAD~N`, or source branch.
+- [tes undo](https://tessera.getlunaris.dev/cli/undo): Undo the most recent operation or roll back to a specific operation ID from `tes oplog`.
+- [tes config](https://tessera.getlunaris.dev/cli/config): View or modify `tessera.toml` settings (`show`, `set`, `add-cache-dir`, `add-bin-dir`, `set-env`, `trust`, `untrust`).

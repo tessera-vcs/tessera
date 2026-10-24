@@ -1,0 +1,257 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1.0)"
+        required: false
+        default: "v0.1.0"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-binaries:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS (Apple Silicon & Intel)
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            archive: tar.gz
+
+          # Linux x86_64 (glibc & static musl)
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            archive: tar.gz
+
+          # Linux ARM64 (glibc & static musl)
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            archive: tar.gz
+            use_cross: true
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            archive: tar.gz
+            use_cross: true
+
+          # Windows (x86_64 & ARM64 MSVC)
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            archive: zip
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo registry and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src
+          key: ${{ matrix.target }}
+
+      - name: Install musl-tools on Linux x86_64
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Install cross for Linux ARM64 targets
+        if: matrix.use_cross == true
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build release binary (cargo)
+        if: matrix.use_cross != true
+        working-directory: src
+        run: cargo build --release -p cli --target ${{ matrix.target }}
+
+      - name: Build release binary (cross)
+        if: matrix.use_cross == true
+        working-directory: src
+        run: cross build --release -p cli --target ${{ matrix.target }}
+
+      - name: Package Unix tar.gz archive and SHA-256 checksum
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist stage
+          cp "src/target/${{ matrix.target }}/release/tes" stage/tes
+          chmod +x stage/tes
+          tar -C stage -czf "dist/tes-${{ matrix.target }}.tar.gz" tes
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd dist && sha256sum "tes-${{ matrix.target }}.tar.gz" > "tes-${{ matrix.target }}.tar.gz.sha256")
+          else
+            (cd dist && shasum -a 256 "tes-${{ matrix.target }}.tar.gz" > "tes-${{ matrix.target }}.tar.gz.sha256")
+          fi
+
+      - name: Package Windows zip archive and SHA-256 checksum
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path dist, stage | Out-Null
+          Copy-Item "src\target\${{ matrix.target }}\release\tes.exe" "stage\tes.exe"
+          $zipName = "tes-${{ matrix.target }}.zip"
+          Compress-Archive -Path "stage\tes.exe" -DestinationPath "dist\$zipName" -Force
+          $hash = (Get-FileHash -Path "dist\$zipName" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $zipName" | Set-Content -Path "dist\$zipName.sha256" -Encoding ASCII
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/*
+
+  build-bsd-binaries:
+    name: Build BSD (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: freebsd
+            target: x86_64-unknown-freebsd
+          - os: openbsd
+            target: x86_64-unknown-openbsd
+          - os: netbsd
+            target: x86_64-unknown-netbsd
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build on FreeBSD
+        if: matrix.os == 'freebsd'
+        uses: vmactions/freebsd-vm@v1
+        with:
+          usesh: true
+          prepare: pkg install -y rust
+          run: |
+            cargo build --manifest-path src/Cargo.toml --release -p cli
+            mkdir -p dist stage
+            cp src/target/release/tes stage/tes
+            chmod +x stage/tes
+            tar -C stage -czf "dist/tes-${{ matrix.target }}.tar.gz" tes
+            (cd dist && sha256 -r "tes-${{ matrix.target }}.tar.gz" | awk '{print $1 "  " $2}' > "tes-${{ matrix.target }}.tar.gz.sha256")
+
+      - name: Build on OpenBSD
+        if: matrix.os == 'openbsd'
+        uses: vmactions/openbsd-vm@v1
+        with:
+          usesh: true
+          prepare: pkg_add rust
+          run: |
+            cargo build --manifest-path src/Cargo.toml --release -p cli
+            mkdir -p dist stage
+            cp src/target/release/tes stage/tes
+            chmod +x stage/tes
+            tar -C stage -czf "dist/tes-${{ matrix.target }}.tar.gz" tes
+            (cd dist && sha256 -r "tes-${{ matrix.target }}.tar.gz" | awk '{print $1 "  " $2}' > "tes-${{ matrix.target }}.tar.gz.sha256")
+
+      - name: Build on NetBSD
+        if: matrix.os == 'netbsd'
+        uses: vmactions/netbsd-vm@v1
+        with:
+          usesh: true
+          prepare: pkgin -y install rust mozilla-rootcerts-openssl
+          run: |
+            cargo build --manifest-path src/Cargo.toml --release -p cli
+            mkdir -p dist stage
+            cp src/target/release/tes stage/tes
+            chmod +x stage/tes
+            tar -C stage -czf "dist/tes-${{ matrix.target }}.tar.gz" tes
+            (cd dist && cksum -a sha256 -n "tes-${{ matrix.target }}.tar.gz" | awk '{print $1 "  " $2}' > "tes-${{ matrix.target }}.tar.gz.sha256")
+
+      - name: Upload BSD artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/*
+
+  build-vscode-extension:
+    name: Package VS Code Extension (.vsix)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Compile and package VSIX
+        working-directory: extensions/vscode
+        run: |
+          mkdir -p ../../dist
+          npm ci
+          npm run compile
+          npx --yes @vscode/vsce package --no-dependencies -o ../../dist/tessera-vscode.vsix
+          (cd ../../dist && sha256sum tessera-vscode.vsix > tessera-vscode.vsix.sha256)
+
+      - name: Upload VSIX artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-vscode-extension
+          path: dist/*
+
+  publish-release:
+    name: Publish GitHub Release
+    needs:
+      - build-binaries
+      - build-bsd-binaries
+      - build-vscode-extension
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Prepare SHA256SUMS.txt, install.sh, and install.ps1
+        run: |
+          cp docs/public/install.sh release-assets/install.sh
+          cp docs/public/install.ps1 release-assets/install.ps1
+          (
+            cd release-assets
+            cat *.sha256 > SHA256SUMS.txt
+          )
+          ls -lh release-assets
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || inputs.tag }}
+          generate_release_notes: true
+          files: release-assets/*
