@@ -70,6 +70,7 @@ fn is_safe_symlink_within_root(link_path: &Path, link_dest: &Path, root_dir: &Pa
 
 /// Walks `dir` after a kernel-level directory clone and removes any symbolic links that
 /// point outside `confinement_root`.
+#[cfg(target_os = "macos")]
 fn prune_unsafe_symlinks_in_dir(dir: &Path, confinement_root: &Path) {
     let walker = WalkDir::new(dir).min_depth(1).into_iter().filter_entry(|e| {
         if e.file_type().is_dir() {
