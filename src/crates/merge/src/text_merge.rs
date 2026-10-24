@@ -318,7 +318,304 @@ fn try_reconcile_overlapping_hunk(
         }
     }
 
+    if base_chunk.is_empty() && left_chunk.len() >= 2 && right_chunk.len() >= 2 {
+        if let Some(shared_hdr_len) = find_shared_container_header_prefix(left_chunk, right_chunk) {
+            let l_inner = &left_chunk[shared_hdr_len..];
+            let r_inner = &right_chunk[shared_hdr_len..];
+
+            if let Some(mid) = try_reconcile_overlapping_hunk(&[], l_inner, r_inner) {
+                let mut out = Vec::with_capacity(shared_hdr_len + mid.len());
+                out.extend(left_chunk[..shared_hdr_len].iter().cloned());
+                out.extend(mid);
+                return Some(out);
+            }
+        }
+    }
+
     try_reconcile_overlapping_hunk_inner(base_chunk, left_chunk, right_chunk)
+}
+
+/// Checks if `left_chunk` and `right_chunk` start with an identical YAML mapping container
+/// header (e.g. `dependencies:`) or singleton `[section]` header whose body lines can be
+/// recursively reconciled under a single shared header.
+fn find_shared_container_header_prefix(
+    left_chunk: &[String],
+    right_chunk: &[String],
+) -> Option<usize> {
+    let mut idx = 0usize;
+    let mut last_header_end = None;
+    let mut last_header_indent = 0usize;
+    let mut is_section = false;
+
+    while idx < left_chunk.len() && idx < right_chunk.len() && left_chunk[idx] == right_chunk[idx] {
+        let line = &left_chunk[idx];
+        let trimmed = line.trim();
+
+        if trimmed.is_empty() {
+            idx += 1;
+            continue;
+        }
+
+        let indent = line.len() - line.trim_start().len();
+
+        if is_yaml_mapping_container_header(trimmed)
+            && (last_header_end.is_none() || indent > last_header_indent)
+        {
+            last_header_indent = indent;
+            last_header_end = Some(idx + 1);
+            is_section = false;
+            idx += 1;
+            continue;
+        }
+
+        if last_header_end.is_none() && is_single_section_header(trimmed) {
+            last_header_indent = indent;
+            last_header_end = Some(idx + 1);
+            is_section = true;
+            break;
+        }
+
+        break;
+    }
+
+    let hdr_len = last_header_end?;
+    let l_rest = &left_chunk[hdr_len..];
+    let r_rest = &right_chunk[hdr_len..];
+
+    if l_rest.iter().all(|l| l.trim().is_empty()) || r_rest.iter().all(|l| l.trim().is_empty()) {
+        return None;
+    }
+
+    if is_section {
+        let valid_body = l_rest.iter().chain(r_rest.iter()).all(|l| {
+            let t = l.trim();
+            t.is_empty() || !is_section_header_line(t)
+        });
+
+        if valid_body {
+            return Some(hdr_len);
+        }
+
+        return None;
+    }
+
+    let all_indented_deeper = l_rest.iter().chain(r_rest.iter()).all(|l| {
+        let t = l.trim();
+        t.is_empty() || (l.len() - l.trim_start().len()) > last_header_indent
+    });
+
+    if all_indented_deeper {
+        return Some(hdr_len);
+    }
+
+    None
+}
+
+/// Returns `true` if `trimmed` is a YAML mapping container header (`key:`) rather than a
+/// code declaration or control-flow statement (`def`, `class`, `if`, `for`, etc.).
+fn is_yaml_mapping_container_header(trimmed: &str) -> bool {
+    let clean = strip_inline_hash_comment(trimmed);
+
+    if !clean.ends_with(':') || clean.starts_with('-') || clean.starts_with('@') {
+        return false;
+    }
+
+    for kw in [
+        "def ",
+        "async ",
+        "class ",
+        "if ",
+        "elif ",
+        "else:",
+        "for ",
+        "while ",
+        "with ",
+        "try:",
+        "except",
+        "finally:",
+        "match ",
+        "case ",
+        "fn ",
+        "func ",
+        "proc ",
+    ] {
+        if clean.starts_with(kw) {
+            return false;
+        }
+    }
+
+    true
+}
+
+/// Returns `true` if `trimmed` is a singleton `[section]` header (excluding `[[array]]` stanzas).
+fn is_single_section_header(trimmed: &str) -> bool {
+    is_section_header_line(trimmed) && !trimmed.starts_with("[[")
+}
+
+/// Returns `true` if `trimmed` is a `[section]` or `[[section]]` table/stanza header.
+fn is_section_header_line(trimmed: &str) -> bool {
+    if !trimmed.starts_with('[') || !trimmed.ends_with(']') || trimmed.len() < 3 {
+        return false;
+    }
+
+    let inner = trimmed.trim_start_matches('[').trim_end_matches(']').trim();
+
+    if inner.is_empty() || !inner.chars().any(|c| c.is_ascii_alphanumeric()) {
+        return false;
+    }
+
+    split_top_level(inner, ',').len() == 1
+}
+
+/// Strips a trailing `# ...` comment outside string quotes and trims trailing whitespace.
+fn strip_inline_hash_comment(line: &str) -> &str {
+    let mut in_quote: Option<char> = None;
+    let mut escaped = false;
+    let bytes = line.as_bytes();
+
+    for (idx, ch) in line.char_indices() {
+        if let Some(q) = in_quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == q {
+                in_quote = None;
+            }
+            continue;
+        }
+
+        if matches!(ch, '"' | '\'' | '`') {
+            in_quote = Some(ch);
+            continue;
+        }
+
+        if ch == '#' && (idx == 0 || bytes[idx - 1].is_ascii_whitespace()) {
+            return line[..idx].trim_end();
+        }
+    }
+
+    line.trim_end()
+}
+
+/// Returns `true` if `trimmed` is a closing keyword for an `end`/`fi`/`esac`-delimited block.
+fn is_keyword_block_closer(trimmed: &str) -> bool {
+    matches!(
+        trimmed,
+        "end" | "end;" | "end," | "end)" | "fi" | "esac" | "endmodule"
+    )
+}
+
+/// Returns `true` if `trimmed` is a mid-block branch clause (`else`, `elsif`, `rescue`, etc.).
+fn is_mid_block_clause(trimmed: &str) -> bool {
+    for kw in [
+        "else", "elsif", "elseif", "elif", "rescue", "ensure", "when", "then", "catch", "after",
+        "except", "finally",
+    ] {
+        if trimmed == kw
+            || trimmed.starts_with(&format!("{kw} "))
+            || trimmed.starts_with(&format!("{kw}:"))
+            || trimmed.starts_with(&format!("{kw}("))
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Returns `true` if `trimmed` is a valid header line for an indentation-scoped block.
+fn is_indentation_block_header(trimmed: &str) -> bool {
+    let clean = strip_inline_hash_comment(trimmed);
+
+    if clean.is_empty() || is_keyword_block_closer(clean) {
+        return false;
+    }
+
+    if clean.ends_with(':')
+        || clean.ends_with(": |")
+        || clean.ends_with(": |-")
+        || clean.ends_with(": |+")
+        || clean.ends_with(": >")
+        || clean.ends_with(": >-")
+        || clean.ends_with(": >+")
+        || clean.starts_with("- ")
+    {
+        return true;
+    }
+
+    for kw in [
+        "proc ",
+        "func ",
+        "method ",
+        "iterator ",
+        "macro ",
+        "template ",
+    ] {
+        if clean.starts_with(kw) && clean.ends_with('=') {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Checks whether `(`, `[`, and `{` delimiters across `lines` are balanced outside string literals.
+fn are_inline_delimiters_balanced(lines: &[&String]) -> bool {
+    let mut paren = 0i32;
+    let mut bracket = 0i32;
+    let mut brace = 0i32;
+
+    for line in lines {
+        let trimmed = strip_inline_hash_comment(line.trim());
+        let mut in_quote: Option<char> = None;
+        let mut escaped = false;
+
+        for ch in trimmed.chars() {
+            if let Some(q) = in_quote {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == q {
+                    in_quote = None;
+                }
+                continue;
+            }
+
+            if matches!(ch, '"' | '\'' | '`') {
+                in_quote = Some(ch);
+                continue;
+            }
+
+            match ch {
+                '(' => paren += 1,
+                ')' => {
+                    paren -= 1;
+                    if paren < 0 {
+                        return false;
+                    }
+                }
+                '[' => bracket += 1,
+                ']' => {
+                    bracket -= 1;
+                    if bracket < 0 {
+                        return false;
+                    }
+                }
+                '{' => brace += 1,
+                '}' => {
+                    brace -= 1;
+                    if brace < 0 {
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    paren == 0 && bracket == 0 && brace == 0
 }
 
 /// Reconciles the core interior of an overlapping hunk via multi-line insertion unioning
@@ -447,7 +744,8 @@ fn chunks_share_structural_key(left: &[String], right: &[String]) -> bool {
     !l_keys.is_disjoint(&r_keys)
 }
 
-/// Checks whether a slice of lines has balanced braces `{ ... }` and matching HTML/XML closing tags.
+/// Checks whether a slice of lines has balanced braces `{ ... }`, matching HTML/XML closing tags,
+/// balanced `end`/`fi`/`esac` closers, or well-formed `[section]` / indentation-scoped block boundaries.
 fn is_structurally_balanced(lines: &[String]) -> bool {
     let mut brace_depth = 0i32;
     let non_empty: Vec<&String> = lines.iter().filter(|l| !l.trim().is_empty()).collect();
@@ -516,6 +814,84 @@ fn is_structurally_balanced(lines: &[String]) -> bool {
                 }
             }
         }
+
+        return true;
+    }
+
+    let non_comment: Vec<&String> = non_empty
+        .iter()
+        .copied()
+        .filter(|l| {
+            let t = l.trim();
+            !t.starts_with('#') && !t.starts_with("//") && !t.starts_with("--")
+        })
+        .collect();
+
+    if non_comment.is_empty() {
+        return false;
+    }
+
+    let min_indent = non_comment
+        .iter()
+        .map(|l| l.len() - l.trim_start().len())
+        .min()
+        .unwrap_or(0);
+
+    let has_keyword_closer_at_min = non_comment.iter().any(|l| {
+        (l.len() - l.trim_start().len()) == min_indent && is_keyword_block_closer(l.trim())
+    });
+
+    if has_keyword_closer_at_min {
+        let mut depth = 0i32;
+
+        for line in &non_comment {
+            let indent = line.len() - line.trim_start().len();
+
+            if indent != min_indent {
+                continue;
+            }
+
+            let t = line.trim();
+
+            if is_keyword_block_closer(t) {
+                depth -= 1;
+                if depth < 0 {
+                    return false;
+                }
+            } else if is_mid_block_clause(t) {
+                if depth != 1 {
+                    return false;
+                }
+            } else if !t.starts_with('@') {
+                if depth != 0 {
+                    return false;
+                }
+                depth = 1;
+            }
+        }
+
+        return depth == 0;
+    }
+
+    let has_section_at_min = non_comment.iter().any(|l| {
+        (l.len() - l.trim_start().len()) == min_indent && is_section_header_line(l.trim())
+    });
+
+    if has_section_at_min {
+        let first_t = non_comment[0].trim();
+        let last_t = non_comment[non_comment.len() - 1].trim();
+        return is_section_header_line(first_t) && !is_section_header_line(last_t);
+    }
+
+    let has_deeper_indent = non_comment
+        .iter()
+        .any(|l| (l.len() - l.trim_start().len()) > min_indent);
+
+    if has_deeper_indent && !non_comment.iter().any(|l| l.contains('{') || l.contains('}')) {
+        let first_indent = non_comment[0].len() - non_comment[0].trim_start().len();
+        if first_indent != min_indent || is_mid_block_clause(non_comment[0].trim()) {
+            return false;
+        }
     }
 
     true
@@ -528,11 +904,22 @@ fn find_disjoint_tail_split(
     other_keys: &std::collections::BTreeSet<String>,
     shared_keys: &std::collections::BTreeSet<String>,
 ) -> Option<usize> {
-    if chunk.len() < 2 {
+    if chunk.len() < 2 || chunk.len() > 256 {
         return None;
     }
 
+    let min_indent = chunk
+        .iter()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.len() - l.trim_start().len())
+        .min()?;
+
     for split_at in 1..chunk.len() {
+        let line = &chunk[split_at];
+        if line.trim().is_empty() || (line.len() - line.trim_start().len()) > min_indent {
+            continue;
+        }
+
         let head = &chunk[..split_at];
         let tail = &chunk[split_at..];
 
@@ -630,8 +1017,8 @@ fn are_compatible_structural_blocks(left: &[String], right: &[String]) -> bool {
     !left_keys.is_empty() && !right_keys.is_empty() && left_keys.is_disjoint(&right_keys)
 }
 
-/// Extracts a set of canonical structural block identifiers (`html:<tag>` or `block:<header>`)
-/// from a multi-line diff hunk.
+/// Extracts a set of canonical structural block identifiers (`html:<tag>`, `block:<header>`,
+/// `endblock:<header>`, `section:<header>`, or `indent:<header>`) from a multi-line diff hunk.
 fn extract_structural_block_keys(chunk: &[String]) -> Option<std::collections::BTreeSet<String>> {
     let raw_non_empty: Vec<&String> = chunk.iter().filter(|l| !l.trim().is_empty()).collect();
 
@@ -646,7 +1033,8 @@ fn extract_structural_block_keys(chunk: &[String]) -> Option<std::collections::B
     // while preserving exact concatenation semantics.
     let is_closing_delim = |s: &str| -> bool {
         let t = s.trim();
-        matches!(t, "}" | "};" | "}," | ")" | ");" | "]" | "];" | "end")
+        matches!(t, "}" | "};" | "}," | ")" | ");" | "]" | "];")
+            || is_keyword_block_closer(t)
             || (t.starts_with("</") && t.ends_with('>'))
     };
 
@@ -738,6 +1126,189 @@ fn extract_structural_block_keys(chunk: &[String]) -> Option<std::collections::B
         return Some(keys);
     }
 
+    let non_comment: Vec<&String> = non_empty
+        .iter()
+        .copied()
+        .filter(|l| {
+            let t = l.trim();
+            !t.starts_with('#') && !t.starts_with("//") && !t.starts_with("--")
+        })
+        .collect();
+
+    if non_comment.len() < 2 || !are_inline_delimiters_balanced(&non_comment) {
+        return None;
+    }
+
+    let min_indent = non_comment
+        .iter()
+        .map(|l| l.len() - l.trim_start().len())
+        .min()
+        .unwrap_or(0);
+
+    // Keyword-closed blocks (`def` / `do` / `function` ... `end`, `if` ... `fi`, `case` ... `esac`).
+    let has_closer_at_min = non_comment.iter().any(|l| {
+        (l.len() - l.trim_start().len()) == min_indent && is_keyword_block_closer(l.trim())
+    });
+
+    if has_closer_at_min {
+        let mut kw_keys = std::collections::BTreeSet::new();
+        let mut open_depth = 0i32;
+        let mut saw_closed = false;
+        let mut valid_kw = true;
+
+        for line in &non_comment {
+            let indent = line.len() - line.trim_start().len();
+
+            if indent != min_indent {
+                continue;
+            }
+
+            let t = strip_inline_hash_comment(line.trim());
+
+            if is_keyword_block_closer(t) {
+                if open_depth != 1 {
+                    valid_kw = false;
+                    break;
+                }
+                open_depth = 0;
+                saw_closed = true;
+            } else if is_mid_block_clause(t) {
+                if open_depth != 1 {
+                    valid_kw = false;
+                    break;
+                }
+            } else if !t.starts_with('@') {
+                if open_depth != 0 {
+                    valid_kw = false;
+                    break;
+                }
+                kw_keys.insert(format!("endblock:{t}"));
+                open_depth = 1;
+            }
+        }
+
+        if valid_kw && saw_closed && open_depth == 0 && !kw_keys.is_empty() {
+            return Some(kw_keys);
+        }
+    }
+
+    // Section / stanza blocks (`[section]` in INI/config files or `[[package]]` in lockfiles).
+    let section_ordered: Vec<&String> = if !is_section_header_line(non_comment[0].trim())
+        && is_section_header_line(non_comment[non_comment.len() - 1].trim())
+    {
+        let mut trail_start = non_comment.len();
+        while trail_start > 0 && is_section_header_line(non_comment[trail_start - 1].trim()) {
+            trail_start -= 1;
+        }
+        let mut rot = non_comment[trail_start..].to_vec();
+        rot.extend_from_slice(&non_comment[..trail_start]);
+        rot
+    } else {
+        non_comment.clone()
+    };
+
+    if is_section_header_line(section_ordered[0].trim()) {
+        let mut sec_keys = std::collections::BTreeSet::new();
+        let mut valid_sec = true;
+        let mut body_lines_since_header = 0usize;
+
+        for (idx, line) in section_ordered.iter().enumerate() {
+            let indent = line.len() - line.trim_start().len();
+            let t = strip_inline_hash_comment(line.trim());
+
+            if indent == min_indent && is_section_header_line(t) {
+                if idx > 0 && body_lines_since_header == 0 {
+                    valid_sec = false;
+                    break;
+                }
+                body_lines_since_header = 0;
+
+                if t.starts_with("[[") && t.ends_with("]]") {
+                    let next_hint = section_ordered
+                        .get(idx + 1)
+                        .map(|n| strip_inline_hash_comment(n.trim()))
+                        .unwrap_or("");
+                    sec_keys.insert(format!("section:{t}::{next_hint}"));
+                } else {
+                    sec_keys.insert(format!("section:{t}"));
+                }
+            } else {
+                body_lines_since_header += 1;
+            }
+        }
+
+        if valid_sec && body_lines_since_header > 0 && !sec_keys.is_empty() {
+            return Some(sec_keys);
+        }
+    }
+
+    // Indentation-scoped blocks (YAML, `pnpm-lock.yaml`, `yarn.lock`, `pubspec.lock`, `Podfile.lock`,
+    // Python `def`/`class`/`if`, Nim, Makefile targets, etc.).
+    let has_deeper = non_comment
+        .iter()
+        .any(|l| (l.len() - l.trim_start().len()) > min_indent);
+
+    if has_deeper {
+        let first_min_idx = non_comment
+            .iter()
+            .position(|l| (l.len() - l.trim_start().len()) == min_indent)
+            .unwrap_or(0);
+        let last_indent = non_comment[non_comment.len() - 1].len()
+            - non_comment[non_comment.len() - 1].trim_start().len();
+
+        let indent_ordered: Vec<&String> = if first_min_idx > 0 && last_indent > min_indent {
+            let mut rot = non_comment[first_min_idx..].to_vec();
+            rot.extend_from_slice(&non_comment[..first_min_idx]);
+            rot
+        } else {
+            non_comment
+        };
+
+        let mut indent_keys = std::collections::BTreeSet::new();
+        let mut valid_indent = true;
+
+        for (idx, line) in indent_ordered.iter().enumerate() {
+            let indent = line.len() - line.trim_start().len();
+
+            if indent != min_indent {
+                continue;
+            }
+
+            let t = strip_inline_hash_comment(line.trim());
+            let next_indent = indent_ordered
+                .get(idx + 1)
+                .map(|n| n.len() - n.trim_start().len());
+
+            if (t.starts_with('@') || t.ends_with(',')) && next_indent == Some(min_indent) {
+                continue;
+            }
+
+            if !is_indentation_block_header(t) {
+                valid_indent = false;
+                break;
+            }
+
+            if !next_indent.is_some_and(|ni| ni > min_indent) {
+                valid_indent = false;
+                break;
+            }
+
+            if is_mid_block_clause(t) {
+                if indent_keys.is_empty() {
+                    valid_indent = false;
+                    break;
+                }
+                continue;
+            }
+
+            indent_keys.insert(format!("indent:{t}"));
+        }
+
+        if valid_indent && !indent_keys.is_empty() {
+            return Some(indent_keys);
+        }
+    }
+
     None
 }
 
@@ -769,6 +1340,21 @@ fn are_compatible_comma_collection_tails(left: &[String], right: &[String]) -> b
 /// Merges two chunks composed of additive line declarations (imports, constants, key-value pairs,
 /// or markdown bullets), deduplicating identical lines and unioning compatible skeleton lines.
 fn try_merge_additive_chunks(left: &[String], right: &[String]) -> Option<Vec<String>> {
+    let mut base_indent: Option<usize> = None;
+
+    for line in left.iter().chain(right.iter()) {
+        if !line.trim().is_empty() {
+            let ind = line.len() - line.trim_start().len();
+            if let Some(expected) = base_indent {
+                if ind != expected {
+                    return None;
+                }
+            } else {
+                base_indent = Some(ind);
+            }
+        }
+    }
+
     let mut left_keyed: Vec<(Option<String>, String)> = Vec::new();
     let mut has_additive = false;
 
@@ -840,11 +1426,11 @@ fn extract_additive_line_key(line: &str) -> Option<String> {
         return None;
     }
 
-    if t.starts_with("- ") || t.starts_with("* ") || t.starts_with("+ ") {
+    if (t.starts_with("- ") || t.starts_with("* ") || t.starts_with("+ ")) && !t.ends_with(':') {
         return Some(format!("list:{t}"));
     }
 
-    if !t.ends_with('{') && !t.ends_with('(') {
+    if !t.ends_with('{') && !t.ends_with('(') && !t.ends_with(':') {
         if let Some(skel) = delimited_skeleton_key(t) {
             return Some(format!("skel:{skel}"));
         }
@@ -870,16 +1456,18 @@ fn extract_additive_line_key(line: &str) -> Option<String> {
 
     if t.ends_with(',') {
         let without_comma = t.trim_end_matches(',').trim();
-        if let Some((k, _)) = split_top_level_kv(without_comma) {
-            return Some(format!("kv:{}", normalize_key(k)));
+        if let Some((k, v)) = split_top_level_kv(without_comma) {
+            if !v.is_empty() {
+                return Some(format!("kv:{}", normalize_key(k)));
+            }
         }
         return Some(format!("elem:{without_comma}"));
     }
 
-    if !t.ends_with('{') && !t.ends_with('(') {
-        if let Some((k, _)) = split_top_level_kv(t) {
+    if !t.ends_with('{') && !t.ends_with('(') && !t.ends_with(':') {
+        if let Some((k, v)) = split_top_level_kv(t) {
             let norm = normalize_key(k);
-            if !norm.is_empty() {
+            if !norm.is_empty() && !v.is_empty() {
                 return Some(format!("kv:{norm}"));
             }
         }
@@ -1988,6 +2576,211 @@ track_habit :: proc(name: string) {
                 && res_odin.content.contains("track_habit :: proc"),
             "both Odin procedures must be preserved:\n{}",
             res_odin.content
+        );
+    }
+
+    #[test]
+    fn indentation_scoped_blocks_merge_yaml_lockfiles_and_python_cleanly() {
+        let base_pnpm = r#"lockfileVersion: '9.0'
+
+importers:
+  .:
+    dependencies:
+      react:
+        specifier: ^18.2.0
+        version: 18.2.0
+
+packages:
+  /react@18.2.0:
+    resolution: {integrity: sha512-react}
+    dev: false
+"#;
+        let left_pnpm = r#"lockfileVersion: '9.0'
+
+importers:
+  .:
+    dependencies:
+      react:
+        specifier: ^18.2.0
+        version: 18.2.0
+      axios:
+        specifier: ^1.6.0
+        version: 1.6.8
+
+packages:
+  /react@18.2.0:
+    resolution: {integrity: sha512-react}
+    dev: false
+  /axios@1.6.8:
+    resolution: {integrity: sha512-axios}
+    dev: false
+"#;
+        let right_pnpm = r#"lockfileVersion: '9.0'
+
+importers:
+  .:
+    dependencies:
+      react:
+        specifier: ^18.2.0
+        version: 18.2.0
+      zod:
+        specifier: ^3.22.0
+        version: 3.22.4
+
+packages:
+  /react@18.2.0:
+    resolution: {integrity: sha512-react}
+    dev: false
+  /zod@3.22.4:
+    resolution: {integrity: sha512-zod}
+    dev: false
+"#;
+        let res_pnpm = merge_text_3way(base_pnpm, left_pnpm, right_pnpm, "agent-a", "agent-b");
+        assert!(
+            !res_pnpm.has_conflicts,
+            "pnpm-lock.yaml merge should be conflict-free, got:\n{}",
+            res_pnpm.content
+        );
+        assert!(
+            res_pnpm.content.contains("axios:\n        specifier: ^1.6.0")
+                && res_pnpm.content.contains("zod:\n        specifier: ^3.22.0")
+                && res_pnpm.content.contains("/axios@1.6.8:")
+                && res_pnpm.content.contains("/zod@3.22.4:"),
+            "all pnpm importer and package blocks must be preserved:\n{}",
+            res_pnpm.content
+        );
+        assert_eq!(
+            res_pnpm.content.matches("dev: false").count(),
+            3,
+            "shared child lines inside distinct YAML blocks must not be deduplicated across blocks:\n{}",
+            res_pnpm.content
+        );
+
+        let right_conflict = r#"lockfileVersion: '9.0'
+
+importers:
+  .:
+    dependencies:
+      react:
+        specifier: ^18.2.0
+        version: 18.2.0
+      axios:
+        specifier: ^1.7.0
+        version: 1.7.2
+
+packages:
+  /react@18.2.0:
+    resolution: {integrity: sha512-react}
+    dev: false
+"#;
+        let res_conflict =
+            merge_text_3way(base_pnpm, left_pnpm, right_conflict, "agent-a", "agent-b");
+        assert!(
+            res_conflict.has_conflicts,
+            "conflicting versions for the same YAML block key must conflict:\n{}",
+            res_conflict.content
+        );
+    }
+
+    #[test]
+    fn shared_yaml_container_headers_and_yarn_lock_blocks_merge_cleanly() {
+        let base_yaml = "name: service\nversion: 1.0.0\n";
+        let left_yaml = "name: service\nversion: 1.0.0\ndependencies:\n  axios:\n    version: 1.6.8\n";
+        let right_yaml =
+            "name: service\nversion: 1.0.0\ndependencies:\n  zod:\n    version: 3.22.4\n";
+        let res_yaml = merge_text_3way(base_yaml, left_yaml, right_yaml, "a", "b");
+        assert!(
+            !res_yaml.has_conflicts,
+            "shared new YAML container header should merge cleanly:\n{}",
+            res_yaml.content
+        );
+        assert_eq!(res_yaml.content.matches("dependencies:").count(), 1);
+        assert!(res_yaml.content.contains("axios:") && res_yaml.content.contains("zod:"));
+
+        let base_yarn = r#"# yarn lockfile v1
+
+"lodash@^4.17.21":
+  version "4.17.21"
+  resolved "https://registry.yarnpkg.com/lodash/-/lodash-4.17.21.tgz"
+"#;
+        let left_yarn = r#"# yarn lockfile v1
+
+"lodash@^4.17.21":
+  version "4.17.21"
+  resolved "https://registry.yarnpkg.com/lodash/-/lodash-4.17.21.tgz"
+
+"axios@^1.6.0":
+  version "1.6.8"
+  resolved "https://registry.yarnpkg.com/axios/-/axios-1.6.8.tgz"
+"#;
+        let right_yarn = r#"# yarn lockfile v1
+
+"lodash@^4.17.21":
+  version "4.17.21"
+  resolved "https://registry.yarnpkg.com/lodash/-/lodash-4.17.21.tgz"
+
+"zod@^3.22.0":
+  version "3.22.4"
+  resolved "https://registry.yarnpkg.com/zod/-/zod-3.22.4.tgz"
+"#;
+        let res_yarn = merge_text_3way(base_yarn, left_yarn, right_yarn, "a", "b");
+        assert!(
+            !res_yarn.has_conflicts,
+            "yarn.lock should merge cleanly:\n{}",
+            res_yarn.content
+        );
+        assert!(
+            res_yarn.content.contains("\"axios@^1.6.0\":")
+                && res_yarn.content.contains("\"zod@^3.22.0\":")
+        );
+    }
+
+    #[test]
+    fn keyword_closed_and_section_stanza_blocks_merge_cleanly() {
+        let base_rb = "class OrderService\n  def initialize(repo)\n    @repo = repo\n  end\nend\n";
+        let left_rb = "class OrderService\n  def initialize(repo)\n    @repo = repo\n  end\n\n  def charge(order)\n    if order.valid?\n      @repo.save(order)\n    else\n      false\n    end\n  end\nend\n";
+        let right_rb = "class OrderService\n  def initialize(repo)\n    @repo = repo\n  end\n\n  def refund(order)\n    @repo.delete(order)\n  end\nend\n";
+        let res_rb = merge_text_3way(base_rb, left_rb, right_rb, "a", "b");
+        assert!(
+            !res_rb.has_conflicts,
+            "Ruby end-delimited methods should merge cleanly, got:\n{}",
+            res_rb.content
+        );
+        assert!(
+            res_rb.content.contains("def charge(order)")
+                && res_rb.content.contains("def refund(order)")
+        );
+
+        let base_poetry = r#"[[package]]
+name = "certifi"
+version = "2024.2.2"
+"#;
+        let left_poetry = r#"[[package]]
+name = "certifi"
+version = "2024.2.2"
+
+[[package]]
+name = "fastapi"
+version = "0.110.0"
+"#;
+        let right_poetry = r#"[[package]]
+name = "certifi"
+version = "2024.2.2"
+
+[[package]]
+name = "uvicorn"
+version = "0.29.0"
+"#;
+        let res_poetry = merge_text_3way(base_poetry, left_poetry, right_poetry, "a", "b");
+        assert!(
+            !res_poetry.has_conflicts,
+            "poetry.lock [[package]] stanzas should merge cleanly, got:\n{}",
+            res_poetry.content
+        );
+        assert_eq!(res_poetry.content.matches("[[package]]").count(), 3);
+        assert!(
+            res_poetry.content.contains("name = \"fastapi\"")
+                && res_poetry.content.contains("name = \"uvicorn\"")
         );
     }
 }
