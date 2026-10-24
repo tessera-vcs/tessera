@@ -1818,7 +1818,7 @@ tes init [options]
 The `init` command sets up Tessera inside your project by:
 1. Initializing `.git` and creating an initial commit if the directory is not already a Git repository.
 2. Creating the `.git/tessera` store and default configuration.
-3. Installing workspace rules (`AGENTS.md`, `.agents/rules/tessera.md`, `.codex/config.toml`, `.codex/hooks.json`, and detected editor rules) and MCP configuration so AI coding agents coordinate through Tessera automatically.
+3. Installing workspace rules and MCP configuration for detected or specified AI editors (`.agents/rules/tessera.md`, `.cursor/rules/tessera.mdc`, `.windsurf/rules/tessera.md`, `.kiro/steering/tessera.md`, `CLAUDE.md`, `AGENTS.md`, `.codex/config.toml`, `.codex/hooks.json`) so AI coding agents coordinate through Tessera automatically.
 4. Installing lightweight Git `post-commit` and `post-merge` hooks to keep `.git/tessera` synchronized with native `git` commands.
 
 ## Examples
