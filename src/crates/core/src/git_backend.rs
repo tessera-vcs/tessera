@@ -327,6 +327,16 @@ impl GitBackend {
                 return Ok(Self::with_paths(curr, dot_git));
             }
 
+            if curr.file_name().and_then(|s| s.to_str()) == Some("tmp")
+                && curr
+                    .parent()
+                    .and_then(|p| p.file_name())
+                    .and_then(|s| s.to_str())
+                    == Some(".tessera")
+            {
+                return Err(CoreError::RepoNotFound(start_dir.display().to_string()));
+            }
+
             if let Some(target_root) = is_valid_sandbox_repo_root(&curr, None) {
                 let target_git = target_root.join(".git");
 
