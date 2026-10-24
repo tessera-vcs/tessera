@@ -1257,19 +1257,22 @@ export class VisualGraphPanel {
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:; script-src 'nonce-${nonce}';">
 <style>
   * { box-sizing: border-box; }
-  body {
+  html, body {
     margin: 0;
     padding: 0;
+    width: 100%;
+    height: 100vh;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
     background-color: var(--vscode-editor-background);
     color: var(--vscode-foreground);
     font-family: var(--vscode-font-family);
     font-size: var(--vscode-font-size, 13px);
-    overflow: auto;
   }
   .topbar {
-    position: sticky;
-    top: 0;
-    left: 0;
+    flex-shrink: 0;
+    width: 100%;
     z-index: 20;
     display: flex;
     align-items: center;
@@ -1320,9 +1323,23 @@ export class VisualGraphPanel {
     color: var(--vscode-errorForeground, var(--vscode-foreground));
     border: 1px solid var(--vscode-inputValidation-errorBorder, var(--vscode-errorForeground));
   }
+  .graph-viewport {
+    flex: 1;
+    width: 100%;
+    min-height: 0;
+    overflow: auto;
+    position: relative;
+  }
   .graph-stage {
     position: relative;
-    margin: 8px auto 24px;
+    margin: 0 auto 24px;
+  }
+  .col-header-bar {
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    height: ${HEADER_HEIGHT}px;
+    background-color: var(--vscode-editor-background);
   }
   .graph-svg {
     position: absolute;
@@ -1614,12 +1631,16 @@ export class VisualGraphPanel {
     </div>
   </div>
 
-  <div class="graph-stage" style="width: ${canvasWidth}px; height: ${canvasHeight}px;">
-    <svg class="graph-svg" width="${canvasWidth}" height="${canvasHeight}" viewBox="0 0 ${canvasWidth} ${canvasHeight}">
-      ${svgElements.join("\n      ")}
-    </svg>
-    ${colHeaderHtml}
-    ${nodesHtml}
+  <div class="graph-viewport">
+    <div class="graph-stage" style="width: ${canvasWidth}px; height: ${canvasHeight}px;">
+      <svg class="graph-svg" width="${canvasWidth}" height="${canvasHeight}" viewBox="0 0 ${canvasWidth} ${canvasHeight}">
+        ${svgElements.join("\n        ")}
+      </svg>
+      <div class="col-header-bar" style="width: ${canvasWidth}px;">
+        ${colHeaderHtml}
+      </div>
+      ${nodesHtml}
+    </div>
   </div>
 
   <script nonce="${nonce}">
