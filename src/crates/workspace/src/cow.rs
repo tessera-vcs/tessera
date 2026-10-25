@@ -685,6 +685,11 @@ const PRESERVED_CACHE_DIRS: &[&str] = &[
     ".next",
     ".nuxt",
     ".svelte-kit",
+    ".astro",
+    ".angular",
+    ".vite",
+    ".parcel-cache",
+    ".cache",
     "dist",
     "build",
     ".venv",
@@ -724,6 +729,11 @@ const PRESERVED_TOP_DIRS: &[&str] = &[
     ".next",
     ".nuxt",
     ".svelte-kit",
+    ".astro",
+    ".angular",
+    ".vite",
+    ".parcel-cache",
+    ".cache",
     "dist",
     "build",
     ".venv",
@@ -976,6 +986,8 @@ mod tests {
         let ws_dir = tempfile::tempdir().expect("ws tempdir");
 
         std::process::Command::new("git")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
             .args(["init"])
             .current_dir(repo_dir.path())
             .output()

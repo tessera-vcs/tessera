@@ -1186,7 +1186,7 @@ impl Default for RepoConfig {
                 "services/*".to_string(),
             ],
             verify_command: None,
-            watch_interval_ms: 75,
+            watch_interval_ms: 25,
             watch_timeout_secs: 90,
             co_author: false,
             co_author_trailer: "Tessera <noreply@tessera.getlunaris.dev>".to_string(),

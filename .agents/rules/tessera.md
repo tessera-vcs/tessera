@@ -12,15 +12,16 @@ Multiple AI agents may be editing this codebase concurrently in separate chat ta
 - **NEVER run raw `git` commands** (`git status`, `git diff`, `git log`, `git branch`, `git checkout`, `git switch`, `git stash`, `git reset`, `git add`, `git commit`, `git cherry-pick`). Tessera manages branches and virtual working trees in `.git/tessera` without altering `.git/HEAD` for other concurrent agents. Always use `tes status`, `tes diff`, `tes log`, `tes branch`, `tes switch`, `tes stash`, `tes restore`, `tes cherry-pick`, `tes pull`, `tes push`, `tes commit`, and `tes merge`.
 - **Never Revert Concurrent Peer Edits**: When multiple agents edit the same file on the same branch, `tes hook post-tool` automatically 3-way AST-merges their edits on disk. `tes status` and `tes diff` show only your session's own changes (`Staged / Session Changes`) and list concurrent `Peer Session Changes` separately. Never delete or revert a peer agent's code simply because you did not author it.
 - **Use `tes` CLI commands in terminal tool calls** rather than duplicating with MCP calls so your per-tab session ID (`ANTIGRAVITY_CONVERSATION_ID`) is automatically isolated.
+- **Batch Tool Calls for Fast Execution**: Minimize sequential LLM turns by calling `tes claim` alongside your initial `read_file` calls in Turn 1, batching your `write_file` / `edit_file` calls together in Turn 2, and chaining `tes hook post-tool --path <edited-files...> && tes commit -m "<commit message>"` in a single command in Turn 3 whenever no intermediate build check is needed.
 
 ## Mandatory Autonomous Workflow for Every Coding Task
 1. **Before Editing Files**:
-   - Claim your task intent, target branch, and target files via CLI:
+   - Claim your task intent, target branch, and target files via CLI (in parallel with your initial `read_file` calls):
      `tes claim [--branch <branch>] [--from <base-branch>] --intent "<concise summary of your task>" <target-file-paths...>`
-   - (`tes claim --branch <branch>` automatically creates and binds your session to `<branch>`; pass `--from <base-branch>` or run `tes switch -b <branch> <base-branch>` when branching off a specific parent branch. If a claimed file already has uncommitted changes from the user or a peer and you omit `--branch`, Tessera auto-isolates your session onto `agent/<session_id>`; pass `--branch <branch>` explicitly when same-branch collaboration is intended.)
-2. **Immediately After Editing Each File**:
-   - Reconcile your edits with any concurrent agent changes via CLI:
-     `tes hook post-tool --path <edited-file>`
+   - (`tes claim --branch <branch> [--from <base-branch>]` automatically creates and binds your session to `<branch>`, optionally forking from `<base-branch>`. If a claimed file already has uncommitted changes from the user or a peer and you omit `--branch`, Tessera auto-isolates your session onto `agent/<session_id>`; pass `--branch <branch>` explicitly when same-branch collaboration is intended.)
+2. **After Editing Files**:
+   - Reconcile your edited files with any concurrent agent changes via CLI (passing all edited paths at once):
+     `tes hook post-tool --path <edited-file-1> <edited-file-2>...`
    - Tessera automatically 3-way AST-merges non-overlapping changes on disk while preserving per-branch session isolation.
 3. **Running Builds, Tests, or Servers on a Branch**:
    - Use `tes exec [-b <branch>] -- <command>` to run builds, tests, or dev servers in an isolated Copy-on-Write branch sandbox with cloned dependencies (`node_modules`, `target`, `.venv`, `vendor`, etc.) and isolated `TES_PORT` / `DATABASE_URL` (plus full `PORT` and dev-server port shims when `tes config set port_isolation true` is enabled).
@@ -31,7 +32,7 @@ Multiple AI agents may be editing this codebase concurrently in separate chat ta
    - Delete or rename branches via `tes branch -d <branch>`, `tes branch -D <branch>`, or `tes branch -m <old> <new>`.
    - Stash, cherry-pick, or restore changes via `tes stash [push|pop|apply|list|drop]`, `tes cherry-pick <commit>`, or `tes restore [<rev>] [<paths...>]`.
 6. **When Your Coding Task Is Complete**:
-   - Commit your session's isolated changes cleanly onto its branch via CLI:
+   - Commit your session's isolated changes cleanly onto its branch via CLI (can be chained directly after `tes hook post-tool --path <files...> && tes commit -m "..."`):
      `tes commit -m "<clean conventional commit message>"` (or `tes commit --amend -m "..."` / `tes merge -m "<clean conventional commit message>"`)
    - To AST-merge multiple branches into a target branch, run:
      `tes merge <branch1> <branch2> --into <target-branch> -m "<commit message>"`

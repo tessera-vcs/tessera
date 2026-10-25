@@ -839,9 +839,11 @@ enum Commands {
         /// Optional explicit session ID.
         #[arg(short = 'a', long, visible_alias = "agent")]
         session: Option<String>,
-        /// Optional file path for `pre-tool` / `post-tool`.
-        #[arg(long)]
-        path: Option<String>,
+        /// Optional file path(s) for `pre-tool` / `post-tool`.
+        #[arg(long, num_args = 1..)]
+        path: Vec<String>,
+        /// Optional positional file path(s) for `pre-tool` / `post-tool`.
+        paths: Vec<String>,
         /// Optional prompt text for `prompt`.
         #[arg(long)]
         prompt: Option<String>,
@@ -2580,9 +2582,11 @@ fn run_cli() -> anyhow::Result<()> {
         Commands::Hook {
             event,
             session,
-            path,
+            mut path,
+            paths,
             prompt,
         } => {
+            path.extend(paths);
             handle_cli_hook(&cwd, &event, session, path, prompt, cli.json)?;
         }
         Commands::Branch {
@@ -2733,14 +2737,20 @@ fn run_cli() -> anyhow::Result<()> {
                 }
 
                 if cli.json {
-                    let main_files = coord
+                    let trunk_cid_opt = coord
                         .git()
                         .resolve_ref(&format!("refs/heads/{}", cfg.trunk_branch))
                         .ok()
-                        .flatten()
+                        .flatten();
+                    let main_files = trunk_cid_opt
                         .and_then(|cid| coord.git().read_commit(&cid).ok())
                         .and_then(|c| coord.git().read_tree_to_map(&c.tree_id).ok())
                         .unwrap_or_default();
+                    let stride = if cfg.port_stride == 0 {
+                        100
+                    } else {
+                        cfg.port_stride
+                    };
 
                     let mut branch_details = Vec::new();
                     for br in &all_branches {
@@ -2760,20 +2770,45 @@ fn run_cli() -> anyhow::Result<()> {
                             .unwrap_or_default();
 
                         let mut modified_files = std::collections::BTreeSet::new();
-                        if let Some(cid) = &cid_opt {
-                            if let Ok(c) = coord.git().read_commit(cid) {
-                                if let Ok(br_files) = coord.git().read_tree_to_map(&c.tree_id) {
-                                    for (p, entry) in &br_files {
-                                        if main_files.get(p).map(|e| &e.blob_id)
-                                            != Some(&entry.blob_id)
-                                        {
-                                            modified_files.insert(p.clone());
-                                        }
-                                    }
+                        if *br != cfg.trunk_branch {
+                            if let Some(cid) = &cid_opt {
+                                if let Ok(c) = coord.git().read_commit(cid) {
+                                    let base_files = trunk_cid_opt
+                                        .and_then(|t_cid| {
+                                            std::process::Command::new("git")
+                                                .env_remove("GIT_DIR")
+                                                .env_remove("GIT_WORK_TREE")
+                                                .current_dir(coord.git().repo_root())
+                                                .args(["merge-base", t_cid.as_str(), cid.as_str()])
+                                                .output()
+                                                .ok()
+                                                .filter(|o| o.status.success())
+                                                .and_then(|o| {
+                                                    core::ObjectId::from_hex(
+                                                        String::from_utf8_lossy(&o.stdout).trim(),
+                                                    )
+                                                    .ok()
+                                                })
+                                        })
+                                        .filter(|mb_cid| mb_cid != cid)
+                                        .or_else(|| c.parents.first().copied())
+                                        .and_then(|b_cid| coord.git().read_commit(&b_cid).ok())
+                                        .and_then(|bc| coord.git().read_tree_to_map(&bc.tree_id).ok())
+                                        .unwrap_or_else(|| main_files.clone());
 
-                                    for p in main_files.keys() {
-                                        if !br_files.contains_key(p) {
-                                            modified_files.insert(p.clone());
+                                    if let Ok(br_files) = coord.git().read_tree_to_map(&c.tree_id) {
+                                        for (p, entry) in &br_files {
+                                            if base_files.get(p).map(|e| &e.blob_id)
+                                                != Some(&entry.blob_id)
+                                            {
+                                                modified_files.insert(p.clone());
+                                            }
+                                        }
+
+                                        for p in base_files.keys() {
+                                            if !br_files.contains_key(p) {
+                                                modified_files.insert(p.clone());
+                                            }
                                         }
                                     }
                                 }
@@ -2781,17 +2816,22 @@ fn run_cli() -> anyhow::Result<()> {
                         }
 
                         let mut sessions = Vec::new();
-                        let mut port = cfg.base_port;
                         for (aid, a) in &current.view.agents {
                             let a_br = a.target_branch.as_deref().unwrap_or(&editor_branch);
                             if a_br == br {
                                 sessions.push(aid.clone());
-                                port = cfg.base_port + a.slot.saturating_mul(cfg.port_stride);
                                 for p in a.own_blobs.keys() {
                                     modified_files.insert(p.clone());
                                 }
                             }
                         }
+
+                        let br_slot = coord.branch_slot(&current.view, br, &cfg.trunk_branch);
+                        let port = coord
+                            .active_leased_port_for_branch(br, &cfg.trunk_branch)
+                            .unwrap_or_else(|| {
+                                cfg.base_port.saturating_add(br_slot.saturating_mul(stride))
+                            });
 
                         let ws_dir = coord.branch_sandbox_dir(br);
                         branch_details.push(json!({
@@ -2993,14 +3033,20 @@ fn run_cli() -> anyhow::Result<()> {
                 }
 
                 if cli.json {
-                    let main_files = coord
+                    let trunk_cid_opt = coord
                         .git()
                         .resolve_ref(&format!("refs/heads/{}", cfg.trunk_branch))
                         .ok()
-                        .flatten()
+                        .flatten();
+                    let main_files = trunk_cid_opt
                         .and_then(|cid| coord.git().read_commit(&cid).ok())
                         .and_then(|c| coord.git().read_tree_to_map(&c.tree_id).ok())
                         .unwrap_or_default();
+                    let stride = if cfg.port_stride == 0 {
+                        100
+                    } else {
+                        cfg.port_stride
+                    };
 
                     let mut branch_details = Vec::new();
                     for br in &all_branches {
@@ -3020,20 +3066,45 @@ fn run_cli() -> anyhow::Result<()> {
                             .unwrap_or_default();
 
                         let mut modified_files = std::collections::BTreeSet::new();
-                        if let Some(cid) = &cid_opt {
-                            if let Ok(c) = coord.git().read_commit(cid) {
-                                if let Ok(br_files) = coord.git().read_tree_to_map(&c.tree_id) {
-                                    for (p, entry) in &br_files {
-                                        if main_files.get(p).map(|e| &e.blob_id)
-                                            != Some(&entry.blob_id)
-                                        {
-                                            modified_files.insert(p.clone());
-                                        }
-                                    }
+                        if *br != cfg.trunk_branch {
+                            if let Some(cid) = &cid_opt {
+                                if let Ok(c) = coord.git().read_commit(cid) {
+                                    let base_files = trunk_cid_opt
+                                        .and_then(|t_cid| {
+                                            std::process::Command::new("git")
+                                                .env_remove("GIT_DIR")
+                                                .env_remove("GIT_WORK_TREE")
+                                                .current_dir(coord.git().repo_root())
+                                                .args(["merge-base", t_cid.as_str(), cid.as_str()])
+                                                .output()
+                                                .ok()
+                                                .filter(|o| o.status.success())
+                                                .and_then(|o| {
+                                                    core::ObjectId::from_hex(
+                                                        String::from_utf8_lossy(&o.stdout).trim(),
+                                                    )
+                                                    .ok()
+                                                })
+                                        })
+                                        .filter(|mb_cid| mb_cid != cid)
+                                        .or_else(|| c.parents.first().copied())
+                                        .and_then(|b_cid| coord.git().read_commit(&b_cid).ok())
+                                        .and_then(|bc| coord.git().read_tree_to_map(&bc.tree_id).ok())
+                                        .unwrap_or_else(|| main_files.clone());
 
-                                    for p in main_files.keys() {
-                                        if !br_files.contains_key(p) {
-                                            modified_files.insert(p.clone());
+                                    if let Ok(br_files) = coord.git().read_tree_to_map(&c.tree_id) {
+                                        for (p, entry) in &br_files {
+                                            if base_files.get(p).map(|e| &e.blob_id)
+                                                != Some(&entry.blob_id)
+                                            {
+                                                modified_files.insert(p.clone());
+                                            }
+                                        }
+
+                                        for p in base_files.keys() {
+                                            if !br_files.contains_key(p) {
+                                                modified_files.insert(p.clone());
+                                            }
                                         }
                                     }
                                 }
@@ -3041,17 +3112,22 @@ fn run_cli() -> anyhow::Result<()> {
                         }
 
                         let mut sessions = Vec::new();
-                        let mut port = cfg.base_port;
                         for (aid, a) in &current.view.agents {
                             let a_br = a.target_branch.as_deref().unwrap_or(&editor_branch);
                             if a_br == br {
                                 sessions.push(aid.clone());
-                                port = cfg.base_port + a.slot.saturating_mul(cfg.port_stride);
                                 for p in a.own_blobs.keys() {
                                     modified_files.insert(p.clone());
                                 }
                             }
                         }
+
+                        let br_slot = coord.branch_slot(&current.view, br, &cfg.trunk_branch);
+                        let port = coord
+                            .active_leased_port_for_branch(br, &cfg.trunk_branch)
+                            .unwrap_or_else(|| {
+                                cfg.base_port.saturating_add(br_slot.saturating_mul(stride))
+                            });
 
                         let ws_dir = coord.branch_sandbox_dir(br);
                         branch_details.push(json!({
@@ -3229,7 +3305,17 @@ fn run_cli() -> anyhow::Result<()> {
                 }
             } else if zsh {
                 let zsh_plugin = r#"# Tessera branch prompt & tab-completion integration for Zsh (Powerlevel10k, Oh My Zsh, Starship, standard Zsh)
-export TES_SESSION_ID="term-$$"
+_tes_init_session() {
+  local cur_tty="${TTY:-}"
+  if [[ -z "$cur_tty" ]]; then
+    cur_tty="$(tty 2>/dev/null)"
+  fi
+  if [[ -z "$TES_SESSION_ID" || "$TES_SESSION_ID" != term-* || -z "$cur_tty" || "$cur_tty" == "not a tty" || "$_TES_SESSION_TTY" != "$cur_tty" ]]; then
+    export _TES_SESSION_TTY="$cur_tty"
+    export TES_SESSION_ID="term-$$"
+  fi
+}
+_tes_init_session
 setopt PROMPT_SUBST
 
 tes_prompt_info() {
@@ -3257,6 +3343,9 @@ _tes_restore_repo_pwd() {
   local check_dir="$PWD"
   local depth=0
   while [[ -n "$check_dir" && "$check_dir" != "/" && $depth -lt 8 ]]; do
+    if [[ -d "$check_dir/.git" || ( "${check_dir:t}" == "tmp" && "${check_dir:h:t}" == ".tessera" ) ]]; then
+      return
+    fi
     if [[ -f "$check_dir/.tessera/repo_root" && ! -L "$check_dir/.tessera/repo_root" ]]; then
       local root_dir="$(<"$check_dir/.tessera/repo_root")"
       if [[ -n "$root_dir" && -d "$root_dir/.git/tessera" ]]; then
@@ -3277,18 +3366,42 @@ _tes_restore_repo_pwd() {
 _tes_preexec() {
   unset _TES_CHAINED_AFTER_TES
   _tes_restore_repo_pwd
-  if [[ "$1" == (tes\ *)*((\&\&|\;|\|\|))* ]]; then
+  local norm_line="${1//&&/;}"
+  norm_line="${norm_line//\|\|/;}"
+  local saw_tes=0
+  local need_ws_after_tes=0
+  local need_ws_now=0
+  local line seg w
+  for line in "${(@f)norm_line}"; do
+    for seg in "${(@s:;:)line}"; do
+      seg="${seg#"${seg%%[![:space:]]*}"}"
+      [[ -z "$seg" ]] && continue
+      w="${seg%%[[:space:]]*}"
+      w="${w##*/}"
+      case "$w" in
+        tes)
+          saw_tes=1
+          need_ws_after_tes=0
+          ;;
+        git|cd|pushd|popd|pwd|dirs|agy|agy-*|antigravity|antigravity-*|code|code-insiders|codium|cursor|cursor-agent|windsurf|zed|kiro|kiro-cli|claude|claude-code|codex|opencode|aider|aider-chat|gemini|gemini-cli|copilot|amp|goose|crush|auggie|augment|droid|cline|roo|continue|openhands|plandex|mentat|q|subl|idea|webstorm|pycharm|goland|rustrover|clion|fleet|open|eval|source|.|export|unset|alias|unalias|which|type|clear|reset|exit|logout|jobs|fg|bg|disown|wait|kill|killall|pkill|ps|lsof|top|htop|_tes_*|tes_prompt_info*)
+          ;;
+        *)
+          if (( saw_tes )); then
+            need_ws_after_tes=1
+          else
+            need_ws_now=1
+          fi
+          ;;
+      esac
+    done
+  done
+  if (( need_ws_after_tes )); then
     _TES_CHAINED_AFTER_TES=1
     return
   fi
-  local cmd_line="${1#"${1%%[![:space:]]*}"}"
-  local first_word="${cmd_line%%[[:space:]\;\&\|]*}"
-  first_word="${first_word##*/}"
-  case "$first_word" in
-    tes|git|cd|pushd|popd|pwd|dirs|agy|antigravity|antigravity-cli|code|code-insiders|codium|cursor|cursor-agent|windsurf|zed|kiro|kiro-cli|claude|claude-code|codex|opencode|aider|aider-chat|gemini|gemini-cli|copilot|amp|goose|crush|auggie|augment|droid|cline|roo|continue|openhands|plandex|mentat|q|subl|idea|webstorm|pycharm|goland|rustrover|clion|fleet|open|eval|source|.|export|unset|alias|unalias|which|type|clear|reset|exit|logout|jobs|fg|bg|disown|wait|kill|killall|pkill|ps|lsof|top|htop|_tes_*|tes_prompt_info*)
-      return
-      ;;
-  esac
+  if (( ! need_ws_now )); then
+    return
+  fi
   local phys_pwd="${PWD:A}"
   if [[ -n "$TES_WORKSPACE" && -n "$TES_REPO_ROOT" && "$TES_WORKSPACE" != "$TES_REPO_ROOT" && -d "$TES_REPO_ROOT/.git/tessera" && "$phys_pwd" == "$TES_REPO_ROOT"* ]]; then
     local env_out
@@ -3308,7 +3421,7 @@ _tes_preexec() {
 }
 
 _tes_precmd() {
-  export TES_SESSION_ID="term-$$"
+  _tes_init_session
   unset _TES_CHAINED_AFTER_TES
   _tes_restore_repo_pwd
   local env_out
@@ -3328,7 +3441,7 @@ _tes_ensure_prompt() {
 }
 
 tes() {
-  export TES_SESSION_ID="term-$$"
+  _tes_init_session
   local chained="$_TES_CHAINED_AFTER_TES"
   _tes_restore_repo_pwd
   command tes "$@"
@@ -3414,6 +3527,9 @@ _tes_restore_repo_pwd() {
   local check_dir="$PWD"
   local depth=0
   while [ -n "$check_dir" ] && [ "$check_dir" != "/" ] && [ "$depth" -lt 8 ]; do
+    if [ -d "$check_dir/.git" ] || { [ "${check_dir##*/}" = "tmp" ] && [ "${check_dir%/*}" != "${check_dir%/.tessera/tmp}" ]; }; then
+      return
+    fi
     if [ -f "$check_dir/.tessera/repo_root" ] && [ ! -L "$check_dir/.tessera/repo_root" ]; then
       local root_dir
       root_dir="$(cat "$check_dir/.tessera/repo_root" 2>/dev/null)"
@@ -3522,6 +3638,9 @@ function _tes_restore_repo_pwd
     set -l check_dir "$PWD"
     set -l depth 0
     while test -n "$check_dir"; and test "$check_dir" != "/"; and test $depth -lt 8
+        if test -d "$check_dir/.git"; or string match -q "*/.tessera/tmp" -- "$check_dir"
+            return
+        end
         if test -f "$check_dir/.tessera/repo_root"; and not test -L "$check_dir/.tessera/repo_root"
             set -l root_dir (cat "$check_dir/.tessera/repo_root" 2>/dev/null)
             if test -n "$root_dir"; and test -d "$root_dir/.git/tessera"
@@ -3777,7 +3896,17 @@ _tes_sync
                 } else {
                     cfg.port_stride
                 };
-                let port = cfg.base_port.saturating_add(slot.saturating_mul(stride));
+                let effective_slot = if branch_name != cfg.trunk_branch {
+                    coord.branch_slot(&current.view, &branch_name, &cfg.trunk_branch)
+                } else {
+                    slot
+                };
+                let port = coord
+                    .active_leased_port_for_branch(&branch_name, &cfg.trunk_branch)
+                    .unwrap_or_else(|| {
+                        cfg.base_port
+                            .saturating_add(effective_slot.saturating_mul(stride))
+                    });
                 let port_str = port.to_string();
                 let port_isolation = cfg.is_port_isolation_enabled();
                 let shim_bin_dir = coord.sandboxes_root().join("bin");
@@ -3887,7 +4016,7 @@ _tes_sync
                             fish_single_quote(&shim_bin_str)
                         );
                         println!(
-                            "if not contains -- {} $PATH; set -gx PATH {} $PATH; end;",
+                            "if test \"$PATH[1]\" != {}; set -gx PATH {} $PATH; end;",
                             fish_single_quote(&shim_bin_str),
                             fish_single_quote(&shim_bin_str)
                         );
@@ -4008,7 +4137,7 @@ _tes_sync
                             posix_single_quote(&shim_bin_str)
                         );
                         println!(
-                            r#"case ":${{PATH:-}}:" in *:"$TES_SHIM_BIN":*) ;; *) export PATH="$TES_SHIM_BIN${{PATH:+:$PATH}}" ;; esac"#
+                            r#"case "${{PATH:-}}:" in "$TES_SHIM_BIN":*) ;; *) export PATH="$TES_SHIM_BIN${{PATH:+:$PATH}}" ;; esac"#
                         );
                     } else {
                         let non_tes_port_keys: Vec<&str> = workspace::POLYGLOT_PORT_ENV_KEYS
@@ -4049,6 +4178,9 @@ _tes_sync
     local check_dir="$PWD"
     local depth=0
     while [[ -n "$check_dir" && "$check_dir" != "/" && $depth -lt 8 ]]; do
+      if [[ -d "$check_dir/.git" || ( "${{check_dir:t}}" == "tmp" && "${{check_dir:h:t}}" == ".tessera" ) ]]; then
+        return
+      fi
       if [[ -f "$check_dir/.tessera/repo_root" && ! -L "$check_dir/.tessera/repo_root" ]]; then
         local root_dir="$(<"$check_dir/.tessera/repo_root")"
         if [[ -n "$root_dir" && -d "$root_dir/.git/tessera" ]]; then
@@ -4064,16 +4196,42 @@ _tes_sync
   _tes_preexec() {{
     unset _TES_CHAINED_AFTER_TES
     _tes_restore_repo_pwd
-    if [[ "$1" == (tes\ *)*((\&\&|\;|\|\|))* ]]; then
+    local norm_line="${{1//&&/;}}"
+    norm_line="${{norm_line//\|\|/;}}"
+    local saw_tes=0
+    local need_ws_after_tes=0
+    local need_ws_now=0
+    local line seg w
+    for line in "${{(@f)norm_line}}"; do
+      for seg in "${{(@s:;:)line}}"; do
+        seg="${{seg#"${{seg%%[![:space:]]*}}"}}"
+        [[ -z "$seg" ]] && continue
+        w="${{seg%%[[:space:]]*}}"
+        w="${{w##*/}}"
+        case "$w" in
+          tes)
+            saw_tes=1
+            need_ws_after_tes=0
+            ;;
+          git|cd|pushd|popd|pwd|dirs|agy|agy-*|antigravity|antigravity-*|code|code-insiders|codium|cursor|cursor-agent|windsurf|zed|kiro|kiro-cli|claude|claude-code|codex|opencode|aider|aider-chat|gemini|gemini-cli|copilot|amp|goose|crush|auggie|augment|droid|cline|roo|continue|openhands|plandex|mentat|q|subl|idea|webstorm|pycharm|goland|rustrover|clion|fleet|open|eval|source|.|export|unset|alias|unalias|which|type|clear|reset|exit|logout|jobs|fg|bg|disown|wait|kill|killall|pkill|ps|lsof|top|htop|_tes_*|tes_prompt_info*)
+            ;;
+          *)
+            if (( saw_tes )); then
+              need_ws_after_tes=1
+            else
+              need_ws_now=1
+            fi
+            ;;
+        esac
+      done
+    done
+    if (( need_ws_after_tes )); then
       _TES_CHAINED_AFTER_TES=1
       return
     fi
-    local cmd_line="${{1#"${{1%%[![:space:]]*}}"}}"
-    local first_word="${{cmd_line%%[[:space:]\;\&\|]*}}"
-    first_word="${{first_word##*/}}"
-    case "$first_word" in
-      tes|git|cd|pushd|popd|pwd|dirs|agy|antigravity|antigravity-cli|code|code-insiders|codium|cursor|cursor-agent|windsurf|zed|kiro|kiro-cli|claude|claude-code|codex|opencode|aider|aider-chat|gemini|gemini-cli|copilot|amp|goose|crush|auggie|augment|droid|cline|roo|continue|openhands|plandex|mentat|q|subl|idea|webstorm|pycharm|goland|rustrover|clion|fleet|open|eval|source|.|export|unset|alias|unalias|which|type|clear|reset|exit|logout|jobs|fg|bg|disown|wait|kill|killall|pkill|ps|lsof|top|htop|_tes_*|tes_prompt_info*) return ;;
-    esac
+    if (( ! need_ws_now )); then
+      return
+    fi
     local phys_pwd="${{PWD:A}}"
     if [[ -n "$TES_WORKSPACE" && -n "$TES_REPO_ROOT" && "$TES_WORKSPACE" != "$TES_REPO_ROOT" && -d "$TES_REPO_ROOT/.git/tessera" && "$phys_pwd" == "$TES_REPO_ROOT"* ]]; then
       local env_out
@@ -4119,6 +4277,36 @@ _tes_sync
     return $ret
   }}
   preexec_functions=(_tes_preexec ${{preexec_functions:#_tes_preexec}})
+  if (( ${{funcstack[(I)tes]}} )); then
+    local hist_cmd="$(fc -ln -1 2>/dev/null)"
+    if [[ -n "$hist_cmd" ]]; then
+      local norm_hist="${{hist_cmd//&&/;}}"
+      norm_hist="${{norm_hist//\|\|/;}}"
+      local saw_t=0 need_after=0 hline hseg hw
+      for hline in "${{(@f)norm_hist}}"; do
+        for hseg in "${{(@s:;:)hline}}"; do
+          hseg="${{hseg#"${{hseg%%[![:space:]]*}}"}}"
+          [[ -z "$hseg" ]] && continue
+          hw="${{hseg%%[[:space:]]*}}"
+          hw="${{hw##*/}}"
+          case "$hw" in
+            tes) saw_t=1; need_after=0 ;;
+            git|cd|pushd|popd|pwd|dirs|agy|agy-*|antigravity|antigravity-*|code|code-insiders|codium|cursor|cursor-agent|windsurf|zed|kiro|kiro-cli|claude|claude-code|codex|opencode|aider|aider-chat|gemini|gemini-cli|copilot|amp|goose|crush|auggie|augment|droid|cline|roo|continue|openhands|plandex|mentat|q|subl|idea|webstorm|pycharm|goland|rustrover|clion|fleet|open|eval|source|.|export|unset|alias|unalias|which|type|clear|reset|exit|logout|jobs|fg|bg|disown|wait|kill|killall|pkill|ps|lsof|top|htop|_tes_*|tes_prompt_info*) ;;
+            *) (( saw_t )) && need_after=1 ;;
+          esac
+        done
+      done
+      if (( need_after )); then
+        _TES_CHAINED_AFTER_TES=1
+        local phys_pwd="${{PWD:A}}"
+        if [[ -n "$TES_WORKSPACE" && -d "$TES_WORKSPACE" && -n "$TES_REPO_ROOT" && "$TES_WORKSPACE" != "$TES_REPO_ROOT" && -d "$TES_REPO_ROOT/.git/tessera" && "$phys_pwd" == "$TES_REPO_ROOT"* ]]; then
+          _TES_PREV_PWD="$PWD"
+          local rel_sub="${{phys_pwd#$TES_REPO_ROOT}}"
+          if [[ -d "${{TES_WORKSPACE}}${{rel_sub}}" ]]; then builtin cd -q "${{TES_WORKSPACE}}${{rel_sub}}"; else builtin cd -q "$TES_WORKSPACE"; fi
+        fi
+      fi
+    fi
+  fi
   '
 fi"#
                         );
@@ -5564,7 +5752,7 @@ fn handle_cli_hook(
     cwd: &Path,
     event: &str,
     session_flag: Option<String>,
-    path_flag: Option<String>,
+    path_flags: Vec<String>,
     prompt_flag: Option<String>,
     json_out: bool,
 ) -> anyhow::Result<()> {
@@ -5572,7 +5760,11 @@ fn handle_cli_hook(
         return Ok(());
     };
 
-    let stdin_json = read_nonblocking_stdin_json();
+    let stdin_json = if !path_flags.is_empty() || prompt_flag.is_some() || event == "git-sync" {
+        None
+    } else {
+        read_nonblocking_stdin_json()
+    };
     let payload_session = stdin_json
         .as_ref()
         .and_then(|v| v.get("session_id"))
@@ -5595,8 +5787,8 @@ fn handle_cli_hook(
             }
         }
         "pre-tool" => {
-            let paths = if let Some(p) = path_flag {
-                vec![p]
+            let paths = if !path_flags.is_empty() {
+                path_flags
             } else {
                 extract_hook_file_paths(&stdin_json)
             };
@@ -5610,8 +5802,9 @@ fn handle_cli_hook(
             }
         }
         "post-tool" => {
-            let paths = if let Some(p) = path_flag {
-                vec![p]
+            let explicit_cli_path = !path_flags.is_empty();
+            let paths = if !path_flags.is_empty() {
+                path_flags
             } else {
                 extract_hook_file_paths(&stdin_json)
             };
@@ -5621,6 +5814,13 @@ fn handle_cli_hook(
                     println!("{}", serde_json::to_string_pretty(&outcome)?);
                 } else if let Some(notice) = outcome.context_notice {
                     println!("{notice}");
+                } else if explicit_cli_path {
+                    println!(
+                        "{} Reconciled '{}' for session '{}'",
+                        c_green("✓"),
+                        outcome.path,
+                        c_cyan(&outcome.session_id)
+                    );
                 }
             }
         }

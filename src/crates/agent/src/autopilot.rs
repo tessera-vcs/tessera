@@ -691,7 +691,7 @@ pub fn detect_session_waypoint(session_id: &str) -> SessionWaypoint {
         .strip_prefix("term-")
         .or_else(|| session_id.strip_prefix("session-"))
         .and_then(|s| s.parse::<i32>().ok())
-        .filter(|&pid| pid > 1 && pid == ppid);
+        .filter(|&pid| pid > 1 && is_pid_or_ancestor(pid, ppid));
 
     if harness.is_none() && explicit_term_pid.is_none() {
         if let Some((prefix, _pid)) = detect_ancestor_harness_process(ppid) {
@@ -723,6 +723,36 @@ pub fn detect_session_waypoint(session_id: &str) -> SessionWaypoint {
         shell_pid,
         ide_pid,
     }
+}
+
+/// Returns `true` if `target_pid` equals `start_pid` or is an ancestor process of `start_pid`.
+fn is_pid_or_ancestor(target_pid: i32, start_pid: i32) -> bool {
+    if target_pid <= 1 || start_pid <= 1 {
+        return false;
+    }
+
+    if target_pid == start_pid {
+        return true;
+    }
+
+    let mut curr = start_pid;
+    for _ in 0..8 {
+        let Some((next_ppid, _)) = query_process_parent_and_name(curr) else {
+            break;
+        };
+
+        if next_ppid == target_pid {
+            return true;
+        }
+
+        if next_ppid <= 1 || next_ppid == curr {
+            break;
+        }
+
+        curr = next_ppid;
+    }
+
+    false
 }
 
 /// Queries the controlling TTY device path (e.g. `"/dev/ttys003"` or `"/dev/pts/2"`) for `pid`.
@@ -1480,11 +1510,11 @@ pub fn install_harness_integrations_for(
 
 This repository is version-controlled with **Tessera** (`.git/tessera`). Note: Tessera (`tes`) is strictly the source-control tool managing this repository. Never add Tessera/`tes` branding or copy into the user's application UI or code unless explicitly asked.
 **IMPORTANT: Do NOT run raw `git` commands (`git status`, `git diff`, `git log`, `git branch`, `git checkout`, `git switch`, `git stash`, `git reset`, `git add`, `git commit`, `git cherry-pick`). Always use `tes` CLI commands instead:**
-1. **Before editing files**: Run `tes claim [--branch <branch>] [--from <base-branch>] --intent "<your task goal>" <target-files...>` (automatically creates/switches your session to `<branch>`, optionally branching off `<base-branch>`, and records baselines; pass `--branch <branch>` explicitly to collaborate on a branch that already has uncommitted edits).
-2. **Immediately after editing each file**: Run `tes hook post-tool --path <file>` to auto-reconcile concurrent edits via 3-way AST & token merge. Never revert or delete lines added by concurrent peer sessions.
+1. **Before editing files**: Run `tes claim [--branch <branch>] [--from <base-branch>] --intent "<your task goal>" <target-files...>` (automatically creates/switches your session to `<branch>`, optionally branching off `<base-branch>`, and records baselines; pass `--branch <branch>` explicitly to collaborate on a branch that already has uncommitted edits). Batch `tes claim` with your initial `read_file` calls in the same turn to minimize round-trips.
+2. **After editing files**: Batch related `write_file` / `edit_file` calls in the same turn, then run `tes hook post-tool --path <edited-files...>` to auto-reconcile concurrent edits via 3-way AST & token merge. Never revert or delete lines added by concurrent peer sessions.
 3. **Running builds, tests, or dev servers on a branch**: Run `tes exec [-b <branch>] -- <command>` to execute in an isolated Copy-on-Write sandbox with cloned dependencies and isolated `TES_PORT` / `DATABASE_URL` (plus full `PORT` and dev-server port isolation when `port_isolation = true`).
 4. **Branch, Stash, Restore & History**: Use `tes status`, `tes diff`, `tes log`, `tes branch [-d|-D|-m]`, `tes stash [push|pop|apply|list|drop]`, `tes restore`, `tes cherry-pick`, `tes pull`, and `tes push`.
-5. **When finished**: Run `tes commit [-m "<commit message>" | --amend]` (or `tes merge -m "<commit message>"`) once to commit your session's isolated changes onto its branch.
+5. **When finished**: Run `tes commit [-m "<commit message>" | --amend]` (or chain `tes hook post-tool --path <edited-files...> && tes commit -m "<commit message>"` in a single command) to commit your session's isolated changes onto its branch.
 <!-- tessera:end -->
 "#;
 
@@ -1498,15 +1528,16 @@ Multiple AI agents may be editing this codebase concurrently in separate chat ta
 - **NEVER run raw `git` commands** (`git status`, `git diff`, `git log`, `git branch`, `git checkout`, `git switch`, `git stash`, `git reset`, `git add`, `git commit`, `git cherry-pick`). Tessera manages branches and virtual working trees in `.git/tessera` without altering `.git/HEAD` for other concurrent agents. Always use `tes status`, `tes diff`, `tes log`, `tes branch`, `tes switch`, `tes stash`, `tes restore`, `tes cherry-pick`, `tes pull`, `tes push`, `tes commit`, and `tes merge`.
 - **Never Revert Concurrent Peer Edits**: When multiple agents edit the same file on the same branch, `tes hook post-tool` automatically 3-way AST-merges their edits on disk. `tes status` and `tes diff` show only your session's own changes (`Staged / Session Changes`) and list concurrent `Peer Session Changes` separately. Never delete or revert a peer agent's code simply because you did not author it.
 - **Use `tes` CLI commands in terminal tool calls** rather than duplicating with MCP calls so your per-tab session ID (`ANTIGRAVITY_CONVERSATION_ID`) is automatically isolated.
+- **Batch Tool Calls for Fast Execution**: Minimize sequential LLM turns by calling `tes claim` alongside your initial `read_file` calls in Turn 1, batching your `write_file` / `edit_file` calls together in Turn 2, and chaining `tes hook post-tool --path <edited-files...> && tes commit -m "<commit message>"` in a single command in Turn 3 whenever no intermediate build check is needed.
 
 ## Mandatory Autonomous Workflow for Every Coding Task
 1. **Before Editing Files**:
-   - Claim your task intent, target branch, and target files via CLI:
+   - Claim your task intent, target branch, and target files via CLI (in parallel with your initial `read_file` calls):
      `tes claim [--branch <branch>] [--from <base-branch>] --intent "<concise summary of your task>" <target-file-paths...>`
-   - (`tes claim --branch <branch> [--from <base-branch>]` automatically creates and binds your session to `<branch>`, optionally forking from `<base-branch>`; when branching off a specific parent branch, run `tes claim` before reading or editing target files so Tessera stages that parent branch's baseline. If a claimed file already has uncommitted changes from the user or a peer and you omit `--branch`, Tessera auto-isolates your session onto `agent/<session_id>`; pass `--branch <branch>` explicitly when same-branch collaboration is intended.)
-2. **Immediately After Editing Each File**:
-   - Reconcile your edits with any concurrent agent changes via CLI:
-     `tes hook post-tool --path <edited-file>`
+   - (`tes claim --branch <branch> [--from <base-branch>]` automatically creates and binds your session to `<branch>`, optionally forking from `<base-branch>`. If a claimed file already has uncommitted changes from the user or a peer and you omit `--branch`, Tessera auto-isolates your session onto `agent/<session_id>`; pass `--branch <branch>` explicitly when same-branch collaboration is intended.)
+2. **After Editing Files**:
+   - Reconcile your edited files with any concurrent agent changes via CLI (passing all edited paths at once):
+     `tes hook post-tool --path <edited-file-1> <edited-file-2>...`
    - Tessera automatically 3-way AST-merges non-overlapping changes on disk while preserving per-branch session isolation.
 3. **Running Builds, Tests, or Servers on a Branch**:
    - Use `tes exec [-b <branch>] -- <command>` to run builds, tests, or dev servers in an isolated Copy-on-Write branch sandbox with cloned dependencies (`node_modules`, `target`, `.venv`, `vendor`, etc.) and isolated `TES_PORT` / `DATABASE_URL` (plus full `PORT` and dev-server port shims when `tes config set port_isolation true` is enabled).
@@ -1517,7 +1548,7 @@ Multiple AI agents may be editing this codebase concurrently in separate chat ta
    - Delete or rename branches via `tes branch -d <branch>`, `tes branch -D <branch>`, or `tes branch -m <old> <new>`.
    - Stash, cherry-pick, or restore changes via `tes stash [push|pop|apply|list|drop]`, `tes cherry-pick <commit>`, or `tes restore [<rev>] [<paths...>]`.
 6. **When Your Coding Task Is Complete**:
-   - Commit your session's isolated changes cleanly onto its branch via CLI:
+   - Commit your session's isolated changes cleanly onto its branch via CLI (can be chained directly after `tes hook post-tool --path <files...> && tes commit -m "..."`):
      `tes commit -m "<clean conventional commit message>"` (or `tes commit --amend -m "..."` / `tes merge -m "<clean conventional commit message>"`)
    - To AST-merge multiple branches into a target branch, run:
      `tes merge <branch1> <branch2> --into <target-branch> -m "<commit message>"`
@@ -2410,8 +2441,9 @@ pub fn handle_post_tool_hook(
         is_active_peer(other_id, other_agent)
             && !is_same_branch_peer(other_id, other_agent)
             && other_agent.own_blobs.get(&normalized_path) == Some(&disk_after_blob)
-    }) || (my_eff_branch != default_branch
-        && Some(&disk_after_blob) == base_blob.as_ref());
+    }) || foreign_blobs.contains(&disk_after_blob)
+        || (my_eff_branch != default_branch
+            && Some(&disk_after_blob) == base_blob.as_ref());
     if disk_is_foreign_peer_own_blob || crate::has_git_conflict_markers(&disk_after_str) {
         if let Some(existing_own) = my_agent.own_blobs.get(&normalized_path) {
             if *existing_own != disk_after_blob {
@@ -2550,7 +2582,9 @@ pub fn handle_post_tool_hook(
         std::collections::BTreeMap::new();
     if effective_my_blob != disk_after_blob {
         assigned_own_blobs.insert(session_id.to_string(), effective_my_blob);
-    } else if any_active_peer_missing_own_blob {
+    }
+
+    if any_active_peer_missing_own_blob {
         let mut attribution_blobs: Vec<ObjectId> = Vec::new();
         if let Some(obs_list) = current_op.view.observed_blobs.get(&normalized_path) {
             for obs_blob in obs_list {
@@ -2564,16 +2598,23 @@ pub fn handle_post_tool_hook(
             }
         }
 
-        if Some(&effective_my_blob) != base_blob.as_ref()
-            && Some(&effective_my_blob) != base_tree_blob.as_ref()
-            && !attribution_blobs.contains(&effective_my_blob)
-        {
-            attribution_blobs.push(effective_my_blob);
+        for extra_blob in [effective_my_blob, disk_after_blob] {
+            if Some(&extra_blob) != base_blob.as_ref()
+                && Some(&extra_blob) != base_tree_blob.as_ref()
+                && !foreign_blobs.contains(&extra_blob)
+                && !attribution_blobs.contains(&extra_blob)
+            {
+                attribution_blobs.push(extra_blob);
+            }
         }
 
         if attribution_blobs.len() >= 2 {
             for (aid, agent_meta) in &current_op.view.agents {
                 if aid != session_id && !is_active_peer(aid, agent_meta) {
+                    continue;
+                }
+
+                if aid == session_id && assigned_own_blobs.contains_key(session_id) {
                     continue;
                 }
 
@@ -2583,6 +2624,13 @@ pub fn handle_post_tool_hook(
 
                 let mut best_blob: Option<(usize, ObjectId)> = None;
                 for cand_blob in &attribution_blobs {
+                    if effective_my_blob != disk_after_blob
+                        && *cand_blob == effective_my_blob
+                        && aid != session_id
+                    {
+                        continue;
+                    }
+
                     if let Ok(cand_bytes) = coord.git().read_blob(cand_blob) {
                         let cand_str = String::from_utf8_lossy(&cand_bytes);
                         let score = score_blob_for_agent(
@@ -3134,8 +3182,37 @@ pub fn handle_post_tool_hook(
         format!("post-tool reconcile {normalized_path}"),
         true,
         |view| {
+            let mut next_obs = Vec::new();
+            let candidate_obs = view
+                .observed_blobs
+                .get(&normalized_path)
+                .into_iter()
+                .flatten()
+                .copied()
+                .chain(std::iter::once(disk_after_blob));
+            for b in candidate_obs {
+                let is_owned = assigned_own_blobs.values().any(|ob| *ob == b)
+                    || view
+                        .agents
+                        .values()
+                        .any(|a| a.own_blobs.get(&normalized_path) == Some(&b));
+                if !is_owned
+                    && Some(&b) != base_blob.as_ref()
+                    && Some(&b) != base_tree_blob.as_ref()
+                    && b != final_blob
+                    && b != my_own_blob
+                    && !next_obs.contains(&b)
+                {
+                    next_obs.push(b);
+                }
+            }
+
+            if !next_obs.contains(&final_blob) {
+                next_obs.push(final_blob);
+            }
+
             view.observed_blobs
-                .insert(normalized_path.clone(), vec![final_blob]);
+                .insert(normalized_path.clone(), next_obs);
 
             for (aid, own_b) in &assigned_own_blobs {
                 if let Some(agent) = view.agents.get_mut(aid) {
@@ -3274,7 +3351,12 @@ pub fn handle_post_tool_hook(
     let eff_branch = my_eff_branch.to_string();
     let branch_ws = coord.branch_sandbox_dir(&eff_branch);
     if branch_ws.is_dir() {
-        crate::write_worktree_rel(&branch_ws, &normalized_path, &my_own_bytes, executable);
+        let ws_bytes = if eff_branch == default_branch {
+            &final_disk_bytes
+        } else {
+            &my_own_bytes
+        };
+        crate::write_worktree_rel(&branch_ws, &normalized_path, ws_bytes, executable);
     }
 
     // If invoked from inside another sandbox (such as `branches/main`), keep that sandbox file synchronized too.

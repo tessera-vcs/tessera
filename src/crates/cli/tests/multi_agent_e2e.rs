@@ -1405,6 +1405,7 @@ fn linux_bsd_terminal_sessions_and_all_shell_env_hooks_e2e() {
         .current_dir(root)
         .env_remove("TES_SESSION_ID")
         .env_remove("ANTIGRAVITY_CONVERSATION_ID")
+        .env_remove("ANTIGRAVITY_AGENT")
         .env_remove("TERM_SESSION_ID")
         .env_remove("ITERM_SESSION_ID")
         .env(
@@ -1420,6 +1421,7 @@ fn linux_bsd_terminal_sessions_and_all_shell_env_hooks_e2e() {
         .current_dir(root)
         .env_remove("TES_SESSION_ID")
         .env_remove("ANTIGRAVITY_CONVERSATION_ID")
+        .env_remove("ANTIGRAVITY_AGENT")
         .env_remove("TERM_SESSION_ID")
         .env_remove("ITERM_SESSION_ID")
         .env("KONSOLE_DBUS_SESSION", "/Sessions/42")
@@ -1432,6 +1434,7 @@ fn linux_bsd_terminal_sessions_and_all_shell_env_hooks_e2e() {
         .current_dir(root)
         .env_remove("TES_SESSION_ID")
         .env_remove("ANTIGRAVITY_CONVERSATION_ID")
+        .env_remove("ANTIGRAVITY_AGENT")
         .env_remove("TERM_SESSION_ID")
         .env_remove("ITERM_SESSION_ID")
         .env(
@@ -1451,6 +1454,7 @@ fn linux_bsd_terminal_sessions_and_all_shell_env_hooks_e2e() {
         .current_dir(root)
         .env_remove("TES_SESSION_ID")
         .env_remove("ANTIGRAVITY_CONVERSATION_ID")
+        .env_remove("ANTIGRAVITY_AGENT")
         .env_remove("TERM_SESSION_ID")
         .env_remove("ITERM_SESSION_ID")
         .env("KONSOLE_DBUS_SESSION", "/Sessions/42")

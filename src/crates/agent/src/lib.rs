@@ -543,6 +543,7 @@ impl Coordinator {
             .ok_or_else(|| CoreError::NotFound("HEAD commit".to_string()))?;
         let commit_obj = self.git.read_commit(&head_commit)?;
         let head_branch = self.git.current_branch_name().unwrap_or_default();
+        let cfg = self.oplog.load_config().unwrap_or_default();
         let current_op = self.oplog.load_current_reconciled().ok();
 
         let is_ai_agent = !session_id.starts_with("term-")
@@ -555,18 +556,34 @@ impl Coordinator {
 
         if let Some(ref cur) = current_op {
             if let Some(existing) = cur.view.agents.get(session_id) {
-                let used_by_others: BTreeSet<u16> = cur
-                    .view
-                    .agents
-                    .iter()
-                    .filter(|(id, _)| *id != session_id)
-                    .map(|(_, a)| a.slot)
-                    .collect();
+                let non_trunk_branch = existing
+                    .target_branch
+                    .as_deref()
+                    .filter(|b| !b.is_empty() && *b != cfg.trunk_branch);
 
-                let max_compact_slot = (used_by_others.len() as u16).saturating_add(1).max(1);
-                let slot_ok = existing.slot > 0
-                    && !used_by_others.contains(&existing.slot)
-                    && (existing.workspace_path.is_some() || existing.slot <= max_compact_slot);
+                let slot_ok = if let Some(br) = non_trunk_branch {
+                    existing.slot == self.branch_slot(&cur.view, br, &cfg.trunk_branch)
+                } else {
+                    let used_by_others: BTreeSet<u16> = cur
+                        .view
+                        .agents
+                        .iter()
+                        .filter(|(id, a)| {
+                            *id != session_id
+                                && is_ai_session_id(id) == is_ai_agent
+                                && a.target_branch
+                                    .as_deref()
+                                    .is_none_or(|b| b.is_empty() || b == cfg.trunk_branch)
+                        })
+                        .map(|(_, a)| a.slot)
+                        .collect();
+
+                    let max_compact_slot =
+                        (used_by_others.len() as u16).saturating_add(1).max(1);
+                    existing.slot > 0
+                        && !used_by_others.contains(&existing.slot)
+                        && (existing.workspace_path.is_some() || existing.slot <= max_compact_slot)
+                };
 
                 let has_placeholder = is_ai_agent
                     && existing.targets_head_branch(&head_branch)
@@ -704,7 +721,13 @@ impl Coordinator {
                 let used_by_others: BTreeSet<u16> = view
                     .agents
                     .iter()
-                    .filter(|(id, _)| *id != session_id)
+                    .filter(|(id, a)| {
+                        *id != session_id
+                            && is_ai_session_id(id) == is_ai_agent
+                            && a.target_branch
+                                .as_deref()
+                                .is_none_or(|b| b.is_empty() || b == cfg.trunk_branch)
+                    })
                     .map(|(_, a)| a.slot)
                     .collect();
 
@@ -716,6 +739,10 @@ impl Coordinator {
                     let max_compact_slot = (used_by_others.len() as u16).saturating_add(1).max(1);
 
                     if existing.workspace_path.is_none()
+                        && existing
+                            .target_branch
+                            .as_deref()
+                            .is_none_or(|b| b.is_empty() || b == cfg.trunk_branch)
                         && (existing.slot == 0
                             || used_by_others.contains(&existing.slot)
                             || existing.slot > max_compact_slot)
@@ -750,6 +777,12 @@ impl Coordinator {
                         existing.target_branch = initial_branch;
                     }
 
+                    let resolved_non_trunk = existing
+                        .target_branch
+                        .as_deref()
+                        .filter(|b| !b.is_empty() && *b != cfg.trunk_branch)
+                        .map(str::to_string);
+
                     if existing.targets_head_branch(&head_branch)
                         && !existing.has_own_changes()
                         && existing.claimed_symbols.is_empty()
@@ -778,8 +811,19 @@ impl Coordinator {
                     }
 
                     existing.updated_at_ms = now_millis();
-                    let active_slot = existing.slot;
-                    out_agent = Some(existing.clone());
+                    let mut active_slot = existing.slot;
+                    let mut cloned = existing.clone();
+
+                    if let Some(ref br) = resolved_non_trunk {
+                        let br_slot = self.branch_slot(view, br, &cfg.trunk_branch);
+                        if let Some(ex) = view.agents.get_mut(session_id) {
+                            ex.slot = br_slot;
+                        }
+                        cloned.slot = br_slot;
+                        active_slot = br_slot;
+                    }
+
+                    out_agent = Some(cloned);
 
                     view.next_agent_slot = used_by_others
                         .iter()
@@ -792,7 +836,7 @@ impl Coordinator {
                     return Ok(());
                 }
 
-                let slot = lowest_free_slot;
+                let mut slot = lowest_free_slot;
 
                 view.next_agent_slot = used_by_others
                     .iter()
@@ -849,6 +893,12 @@ impl Coordinator {
                             head_commit_val = b_cid;
                             head_tree = b_commit.tree_id;
                         }
+                    }
+                }
+
+                if let Some(ref br) = target_branch {
+                    if !br.is_empty() && br != &cfg.trunk_branch {
+                        slot = self.branch_slot(view, br, &cfg.trunk_branch);
                     }
                 }
 
@@ -1752,6 +1802,19 @@ impl Coordinator {
                     }
                     agent.updated_at_ms = now_millis();
                 }
+
+                if let Some(b) = clean_branch {
+                    let b_slot = self.branch_slot(view, b, &cfg.trunk_branch);
+                    if b != cfg.trunk_branch {
+                        for a in view.agents.values_mut() {
+                            if a.target_branch.as_deref() == Some(b) {
+                                a.slot = b_slot;
+                            }
+                        }
+                    } else if let Some(agent) = view.agents.get_mut(agent_id) {
+                        agent.slot = b_slot;
+                    }
+                }
                 Ok(())
             },
         )?;
@@ -1961,7 +2024,18 @@ impl Coordinator {
                         .or_insert_with(|| branch_cid);
                 }
 
+                let target_slot = self.branch_slot(view, clean_branch, &cfg.trunk_branch);
+
+                if clean_branch != cfg.trunk_branch {
+                    for a in view.agents.values_mut() {
+                        if a.target_branch.as_deref() == Some(clean_branch) {
+                            a.slot = target_slot;
+                        }
+                    }
+                }
+
                 if let Some(agent) = view.agents.get_mut(session_id) {
+                    agent.slot = target_slot;
                     agent.target_branch = Some(clean_branch.to_string());
                     if !agent.has_own_changes() {
                         agent.base_commit = branch_cid;
@@ -2313,6 +2387,114 @@ impl Coordinator {
         self.sandboxes_root().join("branches")
     }
 
+    /// Returns the deterministic 1-based slot assigned to `branch`.
+    ///
+    /// The trunk branch (`trunk_branch`) is always assigned slot `1` (`base_port + port_stride`).
+    /// Each non-trunk branch receives a persistent slot `>= 2` stored at
+    /// `<branches_root>/<safe_branch>.slot` so all sessions and dev servers on the same branch
+    /// share a consistent port until the branch is deleted.
+    pub fn branch_slot(&self, view: &View, branch: &str, trunk_branch: &str) -> u16 {
+        let clean = branch.trim();
+        if clean.is_empty() || clean == trunk_branch {
+            return 1;
+        }
+
+        let safe_b = Self::sanitize_branch_name(clean);
+        let slot_file = self.branches_root().join(format!("{safe_b}.slot"));
+        if let Ok(raw) = fs::read_to_string(&slot_file) {
+            if let Ok(parsed) = raw.trim().parse::<u16>() {
+                if parsed >= 2 {
+                    return parsed;
+                }
+            }
+        }
+
+        let mut all_branches: BTreeSet<String> = view.branches.keys().cloned().collect();
+        for git_br in self.git.list_local_branches() {
+            all_branches.insert(git_br);
+        }
+
+        for a in view.agents.values() {
+            if let Some(tb) = &a.target_branch {
+                all_branches.insert(tb.clone());
+            }
+        }
+
+        let mut used_branch_slots = BTreeSet::new();
+        for other_br in &all_branches {
+            if other_br == trunk_branch || other_br == clean {
+                continue;
+            }
+
+            let other_safe = Self::sanitize_branch_name(other_br);
+            let other_file = self.branches_root().join(format!("{other_safe}.slot"));
+            if let Ok(raw) = fs::read_to_string(&other_file) {
+                if let Ok(parsed) = raw.trim().parse::<u16>() {
+                    if parsed >= 2 {
+                        used_branch_slots.insert(parsed);
+                    }
+                }
+            }
+        }
+
+        let assigned = (2u16..=u16::MAX)
+            .find(|s| !used_branch_slots.contains(s))
+            .unwrap_or(2);
+        let _ = atomic_write_file(&slot_file, assigned.to_string().as_bytes());
+        assigned
+    }
+
+    /// Returns the lowest active TCP port currently leased in `<sandboxes_root>/bin/.leases/`
+    /// by a live process running on `branch`, if any.
+    pub fn active_leased_port_for_branch(&self, branch: &str, trunk_branch: &str) -> Option<u16> {
+        let leases_dir = self.sandboxes_root().join("bin").join(".leases");
+        let entries = fs::read_dir(&leases_dir).ok()?;
+        let branch_ws = if branch == trunk_branch {
+            self.git.repo_root().to_path_buf()
+        } else {
+            self.branch_sandbox_dir(branch)
+        };
+        let branch_ws_str = branch_ws.display().to_string();
+        let alt_ws_str = self.branch_sandbox_dir(branch).display().to_string();
+
+        let mut matched_ports = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+
+            let Some(port_num) = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|s| s.parse::<u16>().ok())
+            else {
+                continue;
+            };
+
+            let pid_str = fs::read_to_string(path.join("pid")).unwrap_or_default();
+            let Ok(pid) = pid_str.trim().parse::<i32>() else {
+                continue;
+            };
+
+            if !crate::autopilot::is_process_alive(pid) {
+                continue;
+            }
+
+            let leased_branch = fs::read_to_string(path.join("branch")).unwrap_or_default();
+            let leased_ws = fs::read_to_string(path.join("workspace")).unwrap_or_default();
+            let lb = leased_branch.trim();
+            let lw = leased_ws.trim();
+
+            if lb == branch || (!lw.is_empty() && (lw == branch_ws_str || lw == alt_ws_str)) {
+                matched_ports.push(port_num);
+            }
+        }
+
+        matched_ports.sort_unstable();
+        matched_ports.into_iter().next()
+    }
+
     /// Returns the Copy-on-Write sandbox directory for `branch`, automatically migrating any
     /// legacy `.git/tessera/branches/<safe_branch>` directory if present.
     pub fn branch_sandbox_dir(&self, branch: &str) -> PathBuf {
@@ -2536,6 +2718,17 @@ impl Coordinator {
                         continue;
                     }
 
+                    let owned_on_target = current.view.agents.values().any(|a| {
+                        let eff_b = a.effective_branch(current_head_branch.as_str());
+                        eff_b == target_branch && a.own_blobs.contains_key(rel_path)
+                    });
+                    if target_branch == current_head_branch
+                        && self.invocation_dir.is_none()
+                        && owned_on_target
+                    {
+                        continue;
+                    }
+
                     let changed_since_stamp = stamped_tree_map
                         .get(rel_path)
                         .map(|e| (&e.blob_id, e.executable))
@@ -2709,6 +2902,9 @@ impl Coordinator {
 
         let mut env_meta = meta;
         env_meta.target_branch = Some(target_branch.clone());
+        if target_branch != cfg.trunk_branch {
+            env_meta.slot = self.branch_slot(&current.view, &target_branch, &cfg.trunk_branch);
+        }
         let mut env_map = build_agent_env_with_config(&env_meta, &cfg, &branch_ws_dir);
         env_map.insert("TES_BRANCH".to_string(), target_branch.clone());
         env_map.insert(
@@ -4787,12 +4983,28 @@ impl Coordinator {
                         && a.workspace_path.is_none();
 
                     if is_passive {
-                        a.target_branch = Some(current_head_branch.clone());
-                        a.base_commit = head_branch_cid;
-                        a.head_commit = head_branch_cid;
-                        a.head_tree = head_branch_tree;
-                        a.read_blobs.clear();
-                        a.integrated_peer_blobs.clear();
+                        if a.agent_id == "editor"
+                            || a.target_branch
+                                .as_deref()
+                                .is_none_or(|tb| tb == cfg.trunk_branch)
+                        {
+                            a.target_branch = Some(current_head_branch.clone());
+                            a.base_commit = head_branch_cid;
+                            a.head_commit = head_branch_cid;
+                            a.head_tree = head_branch_tree;
+                            a.read_blobs.clear();
+                            a.integrated_peer_blobs.clear();
+                        } else if let Some(ref tb) = a.target_branch {
+                            if let Some(&tb_cid) = git_branches.get(tb) {
+                                if let Ok(tb_commit) = self.git.read_commit(&tb_cid) {
+                                    a.base_commit = tb_cid;
+                                    a.head_commit = tb_cid;
+                                    a.head_tree = tb_commit.tree_id;
+                                    a.read_blobs.clear();
+                                    a.integrated_peer_blobs.clear();
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -5728,6 +5940,11 @@ impl Coordinator {
             let _ = fs::remove_file(&stamp_file);
         }
 
+        let slot_file = self.branches_root().join(format!("{safe_b}.slot"));
+        if slot_file.exists() {
+            let _ = fs::remove_file(&slot_file);
+        }
+
         let legacy_dir = self.git.git_dir().join("tessera").join("branches").join(&safe_b);
         if legacy_dir.exists() {
             let _ = fs::remove_dir_all(&legacy_dir);
@@ -5745,6 +5962,7 @@ impl Coordinator {
 
                 for (aid, agent) in view.agents.iter_mut() {
                     if agent.target_branch.as_deref() == Some(clean_branch) {
+                        agent.slot = 1;
                         agent.target_branch = None;
                         agent.base_commit = trunk_cid;
                         agent.head_commit = trunk_cid;
@@ -5846,6 +6064,13 @@ impl Coordinator {
 
         if old_stamp.is_file() {
             let _ = fs::rename(&old_stamp, &new_stamp);
+        }
+
+        let old_slot = self.branches_root().join(format!("{safe_old}.slot"));
+        let new_slot = self.branches_root().join(format!("{safe_new}.slot"));
+
+        if old_slot.is_file() {
+            let _ = fs::rename(&old_slot, &new_slot);
         }
 
         self.oplog.record_tx(
