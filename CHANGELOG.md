@@ -1,3 +1,33 @@
+## [0.0.2] - 2026-10-25
+
+### 🚀 Features
+
+- *(merge)* Support indentation, keyword-end, and section structural blocks
+- *(workspace)* Preserve and sync gitignored files and monorepo symlinks
+- Universal structural block merging, CoW ignore preservation, and docs
+- *(branch)* Support branching off specific parent branches in switch and claim
+- *(agent,cli,workspace)* Persistent per-branch slots, active port lease detection, TTY session scoping, and multi-path post-tool batching
+
+### 🐛 Bug Fixes
+
+- *(workspace)* Preserve file and remote database URLs during slot isolation
+- *(core)* Strip existing timestamp suffix when preserving author on commit amend
+- *(vscode)* Lock Branch Graph topbar and make branch headers sticky on scroll (v0.0.2)
+- *(agent,cli)* Preserve watcher-observed in-flight edits across peer commits and support chained tes switch
+- *(agent)* Restore HEAD baseline in repo_root when cross-branch peers await edits
+- *(cli)* Prevent oplog reconciliation storm and sandbox PWD stranding
+- Eliminate IDE refresh subprocess spawns and tighten documentation copy
+
+### 📚 Documentation
+
+- Clarify core problem statement and remove external tool comparisons
+- Remove unreleased NetBSD references from docs and install.sh
+
+### ⚙️ Miscellaneous Tasks
+
+- *(github)* Add pull request template
+- *(release)* Bump CLI binary version to 0.0.2
+- *(ci)* Trigger docs deployment only on manual workflow_dispatch
 ## [0.0.1] - 2026-10-24
 
 ### 🚀 Features
@@ -43,3 +73,4 @@
 - Track npm lockfiles and auto-generate CHANGELOG.md during release
 - *(repo)* Add .editorconfig, .gitattributes, and autonomous agent rules
 - *(actions)* Filter CI jobs by modified paths
+- *(release)* Update CHANGELOG.md for v0.0.1 [skip ci]
