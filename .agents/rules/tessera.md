@@ -16,8 +16,8 @@ Multiple AI agents may be editing this codebase concurrently in separate chat ta
 ## Mandatory Autonomous Workflow for Every Coding Task
 1. **Before Editing Files**:
    - Claim your task intent, target branch, and target files via CLI:
-     `tes claim [--branch <branch>] --intent "<concise summary of your task>" <target-file-paths...>`
-   - (`tes claim --branch <branch>` automatically creates and binds your session to `<branch>`; no separate `tes switch` call is needed. If a claimed file already has uncommitted changes from the user or a peer and you omit `--branch`, Tessera auto-isolates your session onto `agent/<session_id>`; pass `--branch <branch>` explicitly when same-branch collaboration is intended.)
+     `tes claim [--branch <branch>] [--from <base-branch>] --intent "<concise summary of your task>" <target-file-paths...>`
+   - (`tes claim --branch <branch>` automatically creates and binds your session to `<branch>`; pass `--from <base-branch>` or run `tes switch -b <branch> <base-branch>` when branching off a specific parent branch. If a claimed file already has uncommitted changes from the user or a peer and you omit `--branch`, Tessera auto-isolates your session onto `agent/<session_id>`; pass `--branch <branch>` explicitly when same-branch collaboration is intended.)
 2. **Immediately After Editing Each File**:
    - Reconcile your edits with any concurrent agent changes via CLI:
      `tes hook post-tool --path <edited-file>`

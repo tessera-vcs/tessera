@@ -224,6 +224,7 @@ fn dispatch_tool_call(cwd: &Path, tool_name: &str, args: &Value) -> CoreResult<V
         "claim" => {
             let intent = args.get("intent").and_then(Value::as_str);
             let branch = args.get("branch").and_then(Value::as_str);
+            let from = args.get("from").and_then(Value::as_str);
             let symbols: Vec<String> = args
                 .get("symbols")
                 .and_then(Value::as_array)
@@ -234,11 +235,12 @@ fn dispatch_tool_call(cwd: &Path, tool_name: &str, args: &Value) -> CoreResult<V
                         .collect()
                 })
                 .unwrap_or_default();
-            let meta = coord.claim_intent_and_symbols_with_branch(
+            let meta = coord.claim_intent_and_symbols_with_branch_and_base(
                 &session_id,
                 intent,
                 &symbols,
                 branch,
+                from,
             )?;
             serde_json::to_value(meta).map_err(|e| CoreError::Serialization(e.to_string()))
         }
@@ -433,7 +435,8 @@ fn dispatch_tool_call(cwd: &Path, tool_name: &str, args: &Value) -> CoreResult<V
                             "missing 'branch' argument for switch".to_string(),
                         )
                     })?;
-                    let meta = coord.switch_branch(&session_id, b)?;
+                    let from = args.get("from").and_then(Value::as_str);
+                    let meta = coord.switch_branch_with_base(&session_id, b, from)?;
                     serde_json::to_value(meta)
                         .map_err(|e| CoreError::Serialization(e.to_string()))
                 }

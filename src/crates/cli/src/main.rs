@@ -561,6 +561,9 @@ enum Commands {
         /// Optional target Git branch for this session (e.g., `feat/locale`).
         #[arg(short = 'b', long)]
         branch: Option<String>,
+        /// Optional parent branch or revision to fork `--branch` from (e.g., `feat/parent`).
+        #[arg(long, visible_alias = "base")]
+        from: Option<String>,
         /// Optional explicit agent/session ID.
         #[arg(long)]
         agent: Option<String>,
@@ -875,11 +878,16 @@ enum Commands {
     /// Switch or bind the current terminal/session to a specific branch without altering `.git/HEAD` for other sessions.
     #[command(alias = "checkout")]
     Switch {
-        /// Target branch name (created from HEAD if it does not exist yet; omit to display the current branch).
+        /// Target branch name (or start-point when paired with `-b`/`-c <new-branch>`).
         branch: Option<String>,
+        /// Optional parent branch or start-point when creating a branch (`tes switch <new-branch> <start-point>`).
+        start_point: Option<String>,
         /// Create or switch to a branch (`-b <branch>` or `-c <branch>`).
         #[arg(short = 'b', short_alias = 'c', long = "create")]
         create: Option<String>,
+        /// Optional parent branch or revision to fork from (`--from <base>`).
+        #[arg(long, visible_alias = "base")]
+        from: Option<String>,
         /// Switch the primary editor working tree (`repo_root` and `.git/HEAD`) to `<branch>` while keeping terminal sandboxes isolated.
         #[arg(short = 'e', long)]
         editor: bool,
@@ -1840,16 +1848,18 @@ fn run_cli() -> anyhow::Result<()> {
         Commands::Claim {
             intent,
             branch,
+            from,
             agent,
             symbols,
         } => {
             let coord = Coordinator::open(&cwd)?;
             let session_id = detect_session_id(agent.as_deref());
-            let meta = coord.claim_intent_and_symbols_with_branch(
+            let meta = coord.claim_intent_and_symbols_with_branch_and_base(
                 &session_id,
                 intent.as_deref(),
                 &symbols,
                 branch.as_deref(),
+                from.as_deref(),
             )?;
 
             if cli.json {
@@ -2882,14 +2892,27 @@ fn run_cli() -> anyhow::Result<()> {
         }
         Commands::Switch {
             branch,
+            start_point,
             create,
+            from,
             editor,
             agent,
         } => {
             let coord = Coordinator::open(&cwd)?;
             let session_id = detect_session_id(agent.as_deref());
-            if let Some(target_br) = create.or(branch) {
+            let (target_opt, base_opt) = match create {
+                Some(new_br) => (Some(new_br), from.or(branch).or(start_point)),
+                None => (branch, from.or(start_point)),
+            };
+            if let Some(target_br) = target_opt {
                 if editor {
+                    if let Some(base_ref) = base_opt.as_deref() {
+                        let _ = coord.switch_branch_with_base(
+                            &session_id,
+                            &target_br,
+                            Some(base_ref),
+                        )?;
+                    }
                     let switched = coord.switch_editor_branch(&target_br)?;
                     let should_bind_caller = session_id != "editor"
                         && (agent.is_some()
@@ -2919,7 +2942,11 @@ fn run_cli() -> anyhow::Result<()> {
                         );
                     }
                 } else {
-                    let meta = coord.switch_branch(&session_id, &target_br)?;
+                    let meta = coord.switch_branch_with_base(
+                        &session_id,
+                        &target_br,
+                        base_opt.as_deref(),
+                    )?;
 
                     if cli.json {
                         println!("{}", serde_json::to_string_pretty(&meta)?);

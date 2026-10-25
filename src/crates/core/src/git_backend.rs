@@ -1496,13 +1496,25 @@ impl GitBackend {
     pub fn resolve_revision(&self, rev_spec: &str) -> CoreResult<ObjectId> {
         let trimmed = rev_spec.trim();
 
-        if trimmed.is_empty() || trimmed.starts_with('-') || trimmed.contains('\0') {
+        if trimmed.is_empty()
+            || trimmed.starts_with('-')
+            || trimmed.contains("..")
+            || trimmed.chars().any(|c| c.is_control() || c.is_whitespace())
+        {
             return Err(CoreError::InvalidArgument(format!(
                 "invalid revision specification '{trimmed}'"
             )));
         }
 
         if let Ok(Some(cid)) = self.resolve_ref(&format!("refs/heads/{trimmed}")) {
+            return Ok(cid);
+        }
+
+        if let Ok(Some(cid)) = self.resolve_ref(&format!("refs/remotes/origin/{trimmed}")) {
+            return Ok(cid);
+        }
+
+        if let Ok(Some(cid)) = self.resolve_ref(&format!("refs/remotes/{trimmed}")) {
             return Ok(cid);
         }
 

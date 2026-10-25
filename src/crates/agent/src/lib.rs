@@ -1443,10 +1443,38 @@ impl Coordinator {
         symbols: &[String],
         target_branch: Option<&str>,
     ) -> CoreResult<AgentMetadata> {
+        self.claim_intent_and_symbols_with_branch_and_base(
+            agent_id,
+            intent,
+            symbols,
+            target_branch,
+            None,
+        )
+    }
+
+    /// Explicitly updates the `intent`, claimed AST/file symbols, optional per-session
+    /// `target_branch` (`--branch <name>`), and optional parent revision `from_branch` (`--from <base>`)
+    /// for `agent_id`, recording pre-edit baselines (`read_blobs`).
+    ///
+    /// # Errors
+    /// Returns [`CoreError`] if `target_branch` or `from_branch` is invalid/missing or updating the `OpLog` fails.
+    pub fn claim_intent_and_symbols_with_branch_and_base(
+        &self,
+        agent_id: &str,
+        intent: Option<&str>,
+        symbols: &[String],
+        target_branch: Option<&str>,
+        from_branch: Option<&str>,
+    ) -> CoreResult<AgentMetadata> {
         let requested_branch = target_branch.map(str::trim).filter(|s| !s.is_empty());
         if let Some(b) = requested_branch {
             validate_ref_name(b)?;
         }
+
+        let explicit_from_cid = match from_branch.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(base_spec) => Some(self.git.resolve_revision(base_spec)?),
+            None => None,
+        };
 
         let meta_now = self.ensure_session(agent_id, intent)?;
         let cfg = self.oplog.load_config()?;
@@ -1497,11 +1525,39 @@ impl Coordinator {
                 .resolve_ref(&format!("refs/heads/{b}"))
                 .ok()
                 .flatten();
-            let resolved_cid = match existing_ref {
-                Some(cid) => Some(cid),
-                None => {
+            let resolved_cid = match (existing_ref, explicit_from_cid) {
+                (_, Some(fcid)) if !meta_now.has_own_changes() => {
+                    let _ = self.git.update_ref(&format!("refs/heads/{b}"), &fcid);
+                    Some(fcid)
+                }
+                (Some(cid), _) => Some(cid),
+                (None, Some(fcid)) => {
+                    let _ = self.git.update_ref(&format!("refs/heads/{b}"), &fcid);
+                    Some(fcid)
+                }
+                (None, None) => {
+                    let remote_ref = self
+                        .git
+                        .resolve_ref(&format!("refs/remotes/origin/{b}"))
+                        .ok()
+                        .flatten();
+                    let session_prev_cid = meta_now
+                        .target_branch
+                        .as_deref()
+                        .filter(|prev_b| *prev_b != b && *prev_b != cfg.trunk_branch)
+                        .and_then(|prev_b| {
+                            self.git
+                                .resolve_ref(&format!("refs/heads/{prev_b}"))
+                                .ok()
+                                .flatten()
+                                .or(Some(meta_now.base_commit))
+                        });
                     let fork_cid = if auto_branch.is_some() {
                         head_cid
+                    } else if remote_ref.is_some() {
+                        remote_ref
+                    } else if session_prev_cid.is_some() {
+                        session_prev_cid
                     } else {
                         self.git
                             .resolve_ref(&format!("refs/heads/{}", cfg.trunk_branch))
@@ -1526,9 +1582,13 @@ impl Coordinator {
             false,
             |view| {
                 if let Some((b, (b_cid, _))) = clean_branch.zip(branch_commit_opt.as_ref()) {
-                    view.branches
-                        .entry(b.to_string())
-                        .or_insert_with(|| *b_cid);
+                    if explicit_from_cid.is_some() && !meta_now.has_own_changes() {
+                        view.branches.insert(b.to_string(), *b_cid);
+                    } else {
+                        view.branches
+                            .entry(b.to_string())
+                            .or_insert_with(|| *b_cid);
+                    }
                 }
 
                 if let Some(agent) = view.agents.get_mut(agent_id) {
@@ -1550,6 +1610,10 @@ impl Coordinator {
                                 agent.base_commit = *b_cid;
                                 agent.head_commit = *b_cid;
                                 agent.head_tree = *b_tid;
+                                if explicit_from_cid.is_some() {
+                                    agent.read_blobs.clear();
+                                    agent.integrated_peer_blobs.clear();
+                                }
                             }
                         }
                     }
@@ -1569,7 +1633,15 @@ impl Coordinator {
 
         for sym in symbols {
             let file_part = sym.split("::").next().unwrap_or(sym.as_str()).trim();
-            if !file_part.is_empty() && self.git.repo_root().join(file_part).is_file() {
+            let exists_on_disk_or_branch = self.git.repo_root().join(file_part).is_file()
+                || branch_commit_opt.as_ref().is_some_and(|(_, b_tid)| {
+                    self.git
+                        .read_tree_entry_at_path(b_tid, file_part)
+                        .ok()
+                        .flatten()
+                        .is_some()
+                });
+            if !file_part.is_empty() && exists_on_disk_or_branch {
                 let _ = handle_pre_tool_hook(self, agent_id, file_part);
             }
         }
@@ -1646,7 +1718,8 @@ impl Coordinator {
     }
 
     /// Switches or binds the specified terminal/agent session (`session_id`) to `branch`,
-    /// creating `refs/heads/<branch>` at `HEAD` if the branch does not exist yet.
+    /// creating `refs/heads/<branch>` at the session's current branch commit (or `HEAD`) if the
+    /// branch does not exist yet.
     ///
     /// Unlike `git checkout`, this does not overwrite `.git/HEAD` for other concurrent terminals
     /// or sessions in the same repository.
@@ -1654,19 +1727,61 @@ impl Coordinator {
     /// # Errors
     /// Returns [`CoreError`] if resolving `HEAD` or updating the `OpLog` fails.
     pub fn switch_branch(&self, session_id: &str, branch: &str) -> CoreResult<AgentMetadata> {
+        self.switch_branch_with_base(session_id, branch, None)
+    }
+
+    /// Switches or binds the specified terminal/agent session (`session_id`) to `branch`,
+    /// optionally forking `branch` from an explicit `from_branch` revision (`--from <base>` or
+    /// `<start-point>`).
+    ///
+    /// # Errors
+    /// Returns [`CoreError`] if `branch` or `from_branch` is invalid/missing or updating the `OpLog` fails.
+    pub fn switch_branch_with_base(
+        &self,
+        session_id: &str,
+        branch: &str,
+        from_branch: Option<&str>,
+    ) -> CoreResult<AgentMetadata> {
         let clean_branch = branch.trim();
         validate_ref_name(clean_branch)?;
+
+        let explicit_from_cid = match from_branch.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(base_spec) => Some(self.git.resolve_revision(base_spec)?),
+            None => None,
+        };
+
         self.reconcile_in_flight_sessions();
-        let _ = self.ensure_session(session_id, None)?;
+        let prev_meta = self.ensure_session(session_id, None)?;
         let ref_name = format!("refs/heads/{clean_branch}");
-        let branch_cid = match self.git.resolve_ref(&ref_name)? {
-            Some(cid) => cid,
-            None => {
-                let target_cid = match self
+        let existing_cid = self.git.resolve_ref(&ref_name)?;
+
+        let branch_cid = match (existing_cid, explicit_from_cid) {
+            (_, Some(from_cid)) if !prev_meta.has_own_changes() => {
+                self.git.update_ref(&ref_name, &from_cid)?;
+                from_cid
+            }
+            (Some(cid), _) => cid,
+            (None, Some(from_cid)) => {
+                self.git.update_ref(&ref_name, &from_cid)?;
+                from_cid
+            }
+            (None, None) => {
+                let remote_cid = self
                     .git
-                    .resolve_ref(&format!("refs/remotes/origin/{clean_branch}"))?
-                {
-                    Some(remote_cid) => remote_cid,
+                    .resolve_ref(&format!("refs/remotes/origin/{clean_branch}"))?;
+                let session_prev_cid = prev_meta
+                    .target_branch
+                    .as_deref()
+                    .filter(|prev_b| *prev_b != clean_branch)
+                    .and_then(|prev_b| {
+                        self.git
+                            .resolve_ref(&format!("refs/heads/{prev_b}"))
+                            .ok()
+                            .flatten()
+                            .or(Some(prev_meta.base_commit))
+                    });
+                let target_cid = match remote_cid.or(session_prev_cid) {
+                    Some(cid) => cid,
                     None => self
                         .git
                         .resolve_head_commit()?
@@ -1709,9 +1824,14 @@ impl Coordinator {
             format!("switch session {session_id} to branch {clean_branch}"),
             false,
             |view| {
-                view.branches
-                    .entry(clean_branch.to_string())
-                    .or_insert_with(|| branch_cid);
+                if explicit_from_cid.is_some() && !caller_has_uncommitted_edits {
+                    view.branches.insert(clean_branch.to_string(), branch_cid);
+                } else {
+                    view.branches
+                        .entry(clean_branch.to_string())
+                        .or_insert_with(|| branch_cid);
+                }
+
                 if let Some(agent) = view.agents.get_mut(session_id) {
                     agent.target_branch = Some(clean_branch.to_string());
                     if !agent.has_own_changes() {

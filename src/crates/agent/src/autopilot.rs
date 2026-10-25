@@ -1342,7 +1342,7 @@ pub fn install_harness_integrations_for(
 
 This repository is version-controlled with **Tessera** (`.git/tessera`). Note: Tessera (`tes`) is strictly the source-control tool managing this repository. Never add Tessera/`tes` branding or copy into the user's application UI or code unless explicitly asked.
 **IMPORTANT: Do NOT run raw `git` commands (`git status`, `git diff`, `git log`, `git branch`, `git checkout`, `git switch`, `git stash`, `git reset`, `git add`, `git commit`, `git cherry-pick`). Always use `tes` CLI commands instead:**
-1. **Before editing files**: Run `tes claim [--branch <branch>] --intent "<your task goal>" <target-files...>` (automatically creates/switches your session to `<branch>` and records baselines; pass `--branch <branch>` explicitly to collaborate on a branch that already has uncommitted edits).
+1. **Before editing files**: Run `tes claim [--branch <branch>] [--from <base-branch>] --intent "<your task goal>" <target-files...>` (automatically creates/switches your session to `<branch>`, optionally branching off `<base-branch>`, and records baselines; pass `--branch <branch>` explicitly to collaborate on a branch that already has uncommitted edits).
 2. **Immediately after editing each file**: Run `tes hook post-tool --path <file>` to auto-reconcile concurrent edits via 3-way AST & token merge. Never revert or delete lines added by concurrent peer sessions.
 3. **Running builds, tests, or dev servers on a branch**: Run `tes exec [-b <branch>] -- <command>` to execute in an isolated Copy-on-Write sandbox with cloned dependencies and isolated `TES_PORT` / `DATABASE_URL` (plus full `PORT` and dev-server port isolation when `port_isolation = true`).
 4. **Branch, Stash, Restore & History**: Use `tes status`, `tes diff`, `tes log`, `tes branch [-d|-D|-m]`, `tes stash [push|pop|apply|list|drop]`, `tes restore`, `tes cherry-pick`, `tes pull`, and `tes push`.
@@ -1364,8 +1364,8 @@ Multiple AI agents may be editing this codebase concurrently in separate chat ta
 ## Mandatory Autonomous Workflow for Every Coding Task
 1. **Before Editing Files**:
    - Claim your task intent, target branch, and target files via CLI:
-     `tes claim [--branch <branch>] --intent "<concise summary of your task>" <target-file-paths...>`
-   - (`tes claim --branch <branch>` automatically creates and binds your session to `<branch>`; no separate `tes switch` call is needed. If a claimed file already has uncommitted changes from the user or a peer and you omit `--branch`, Tessera auto-isolates your session onto `agent/<session_id>`; pass `--branch <branch>` explicitly when same-branch collaboration is intended.)
+     `tes claim [--branch <branch>] [--from <base-branch>] --intent "<concise summary of your task>" <target-file-paths...>`
+   - (`tes claim --branch <branch> [--from <base-branch>]` automatically creates and binds your session to `<branch>`, optionally forking from `<base-branch>`; when branching off a specific parent branch, run `tes claim` before reading or editing target files so Tessera stages that parent branch's baseline. If a claimed file already has uncommitted changes from the user or a peer and you omit `--branch`, Tessera auto-isolates your session onto `agent/<session_id>`; pass `--branch <branch>` explicitly when same-branch collaboration is intended.)
 2. **Immediately After Editing Each File**:
    - Reconcile your edits with any concurrent agent changes via CLI:
      `tes hook post-tool --path <edited-file>`
@@ -1838,7 +1838,9 @@ pub fn handle_pre_tool_hook(
     let cur_op_opt = coord.oplog().load_current_reconciled().ok();
 
     // If `source_path` is in `repo_root` and currently holds an uncommitted blob from a foreign
-    // branch session, restore `session_id`'s own branch version to `repo_root` before reading.
+    // branch session (or `session_id` is on a branch whose base commit differs from `HEAD` while
+    // no other active session owns or awaits `disk_blob`), restore `session_id`'s own branch
+    // version to `repo_root` before reading.
     if source_path == full_path && full_path.is_file() {
         if let (Ok(disk_bytes), Some(cur_op)) = (fs::read(&full_path), cur_op_opt.as_ref()) {
             if let Ok(disk_blob) = coord.git().write_blob(&disk_bytes) {
@@ -1851,7 +1853,28 @@ pub fn handle_pre_tool_hook(
                         && other.effective_branch(&default_branch) != my_eff_branch
                         && other.own_blobs.get(&normalized_path) == Some(&disk_blob)
                 });
-                if owned_by_foreign_branch && my_expected != Some(&disk_blob) {
+                let head_cid_opt = coord.git().resolve_head_commit().ok().flatten();
+                let foreign_peer_awaiting_disk = cur_op.view.agents.values().any(|other| {
+                    let is_passive = (other.agent_id.starts_with("term-")
+                        || other.agent_id.starts_with("session-")
+                        || other.agent_id == "editor")
+                        && other.intent_inferred
+                        && other.claimed_symbols.is_empty()
+                        && !other.has_own_changes();
+                    !is_passive
+                        && other.agent_id != session_id
+                        && other.effective_branch(&default_branch) != my_eff_branch
+                        && (other.own_blobs.get(&normalized_path) == Some(&disk_blob)
+                            || (!other.owns_path(&normalized_path)
+                                && other.read_blobs.get(&normalized_path) == Some(&disk_blob)))
+                });
+                let diverged_branch_base = my_eff_branch != default_branch
+                    && head_cid_opt.is_some_and(|hcid| hcid != meta.base_commit)
+                    && !foreign_peer_awaiting_disk;
+
+                if (owned_by_foreign_branch || diverged_branch_base)
+                    && my_expected != Some(&disk_blob)
+                {
                     if let Some(exp_blob) = my_expected {
                         if let Ok(exp_bytes) = coord.git().read_blob(exp_blob) {
                             let _ = atomic_write_file(&full_path, &exp_bytes);
@@ -2685,15 +2708,30 @@ pub fn handle_post_tool_hook(
     let mut conflict_to_save: Option<ConflictRecord> = None;
     let mut merged_peer_blobs: Vec<ObjectId> = Vec::new();
 
-    let preserve_head_baseline_for_peer = my_eff_branch != default_branch
-        && current_op.view.agents.iter().any(|(other_id, other)| {
-            is_active_peer(other_id, other)
-                && !is_same_branch_peer(other_id, other)
-                && (other.targets_head_branch(&default_branch)
-                    || (!other.owns_path(&normalized_path)
-                        && !assigned_own_blobs.contains_key(other_id)
-                        && other.base_commit == my_agent.base_commit))
-        });
+    let waiting_peer_baseline_blob: Option<ObjectId> = if my_eff_branch != default_branch {
+        current_op
+            .view
+            .agents
+            .iter()
+            .filter(|(other_id, other)| {
+                is_active_peer(other_id, other)
+                    && !is_same_branch_peer(other_id, other)
+                    && (other.targets_head_branch(&default_branch)
+                        || (!other.owns_path(&normalized_path)
+                            && !assigned_own_blobs.contains_key(*other_id)))
+            })
+            .find_map(|(_, other)| {
+                other
+                    .own_blobs
+                    .get(&normalized_path)
+                    .or_else(|| other.read_blobs.get(&normalized_path))
+                    .copied()
+                    .or(base_blob)
+            })
+    } else {
+        None
+    };
+    let preserve_head_baseline_for_peer = waiting_peer_baseline_blob.is_some();
 
     if candidate_blobs.len() >= 2 {
         let (first_id, first_intent, first_blob_id) = &candidate_blobs[0];
@@ -2772,10 +2810,10 @@ pub fn handle_post_tool_hook(
         if !default_branch_peer_owns_path && !preserve_head_baseline_for_peer {
             atomic_write_file(&full_path, acc_str.as_bytes())?;
             crate::set_worktree_executable(&full_path, executable);
-        } else if preserve_head_baseline_for_peer {
-            if let Some(b_id) = base_blob {
-                if disk_after_blob != b_id && !crate::has_git_conflict_markers(&disk_after_str) {
-                    let _ = atomic_write_file(&full_path, &base_bytes);
+        } else if let Some(b_id) = waiting_peer_baseline_blob {
+            if disk_after_blob != b_id && !crate::has_git_conflict_markers(&disk_after_str) {
+                if let Ok(peer_base_bytes) = coord.git().read_blob(&b_id) {
+                    let _ = atomic_write_file(&full_path, &peer_base_bytes);
                 }
             }
         }
@@ -2788,10 +2826,10 @@ pub fn handle_post_tool_hook(
                 normalized_path
             ));
         }
-    } else if preserve_head_baseline_for_peer {
-        if let Some(b_id) = base_blob {
-            if disk_after_blob != b_id && !crate::has_git_conflict_markers(&disk_after_str) {
-                let _ = atomic_write_file(&full_path, &base_bytes);
+    } else if let Some(b_id) = waiting_peer_baseline_blob {
+        if disk_after_blob != b_id && !crate::has_git_conflict_markers(&disk_after_str) {
+            if let Ok(peer_base_bytes) = coord.git().read_blob(&b_id) {
+                let _ = atomic_write_file(&full_path, &peer_base_bytes);
             }
         }
     } else if my_own_blob != disk_after_blob && !crate::has_git_conflict_markers(&disk_after_str) {
@@ -4918,5 +4956,119 @@ mod tests {
             .expect("App.vue exists");
         let committed_bytes = coord.git().read_blob(&entry.blob_id).expect("read blob");
         assert_eq!(String::from_utf8_lossy(&committed_bytes), habit_code);
+    }
+
+    #[test]
+    fn branching_off_feature_branch_via_from_or_switch_stages_parent_baseline_and_rejects_invalid_base() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let app_vue = tmp.path().join("src/App.vue");
+        fs::create_dir_all(app_vue.parent().expect("parent")).expect("mkdir src");
+        let main_vue = "<script setup lang=\"ts\">\nimport HelloWorld from './components/HelloWorld.vue'\n</script>\n<template>\n  <HelloWorld />\n</template>\n";
+        fs::write(&app_vue, main_vue).expect("write initial App.vue");
+
+        let (coord, _) = Coordinator::init_repo(tmp.path()).expect("init_repo");
+        coord
+            .claim_intent_and_symbols_with_branch(
+                "agent-init",
+                Some("Initial App.vue"),
+                &["src/App.vue".to_string()],
+                Some("main"),
+            )
+            .expect("claim main");
+        handle_post_tool_hook(&coord, "agent-init", "src/App.vue").expect("post-tool init");
+        coord
+            .merge_agents(&["agent-init".to_string()], Some("main"), None, false)
+            .expect("commit main");
+
+        let habit_vue = "<script setup lang=\"ts\">\nconst habits = ['Read', 'Run']\n</script>\n<template>\n  <section id=\"habits\">Daily Habits</section>\n</template>\n";
+        coord
+            .claim_intent_and_symbols_with_branch(
+                "agent-habit",
+                Some("Create habit tracker on feat/habit-tracker"),
+                &["src/App.vue".to_string()],
+                Some("feat/habit-tracker"),
+            )
+            .expect("claim feat/habit-tracker");
+        fs::write(&app_vue, habit_vue).expect("write habit_vue");
+        handle_post_tool_hook(&coord, "agent-habit", "src/App.vue").expect("post-tool habit");
+        let habit_commit = coord
+            .merge_agents(
+                &["agent-habit".to_string()],
+                Some("feat/habit-tracker"),
+                None,
+                false,
+            )
+            .expect("commit feat/habit-tracker");
+
+        assert_eq!(
+            fs::read_to_string(&app_vue).expect("read main App.vue"),
+            main_vue,
+            "repo_root must remain on main after feat/habit-tracker commits"
+        );
+
+        assert!(
+            coord
+                .switch_branch_with_base(
+                    "agent-sec",
+                    "feat/evil",
+                    Some("--upload-pack=evil")
+                )
+                .is_err()
+        );
+        assert!(
+            coord
+                .switch_branch_with_base("agent-sec", "feat/evil", Some("../evil"))
+                .is_err()
+        );
+        assert!(
+            coord
+                .switch_branch_with_base(
+                    "agent-sec",
+                    "feat/missing",
+                    Some("feat/does-not-exist")
+                )
+                .is_err()
+        );
+        assert!(
+            coord
+                .claim_intent_and_symbols_with_branch_and_base(
+                    "agent-sec",
+                    Some("Invalid base"),
+                    &["src/App.vue".to_string()],
+                    Some("feat/missing"),
+                    Some("feat/does-not-exist"),
+                )
+                .is_err()
+        );
+
+        let analytics_meta = coord
+            .claim_intent_and_symbols_with_branch_and_base(
+                "agent-analytics",
+                Some("Add analytics chart onto feat/habit-tracker"),
+                &["src/App.vue".to_string()],
+                Some("feat/habit-analytics"),
+                Some("feat/habit-tracker"),
+            )
+            .expect("claim feat/habit-analytics from feat/habit-tracker");
+        assert_eq!(
+            analytics_meta.base_commit, habit_commit.merged_commit_id,
+            "--from feat/habit-tracker must fork feat/habit-analytics from feat/habit-tracker's commit"
+        );
+        assert_eq!(
+            fs::read_to_string(&app_vue).expect("read staged App.vue"),
+            habit_vue,
+            "claiming src/App.vue on feat/habit-analytics must stage feat/habit-tracker's App.vue in repo_root"
+        );
+
+        coord
+            .switch_branch("agent-two-step", "feat/habit-tracker")
+            .expect("switch to feat/habit-tracker");
+        let export_meta = coord
+            .switch_branch("agent-two-step", "feat/habit-export")
+            .expect("switch to new child branch feat/habit-export");
+        assert_eq!(
+            export_meta.base_commit, habit_commit.merged_commit_id,
+            "switching to a new branch from a session on feat/habit-tracker must fork from feat/habit-tracker"
+        );
     }
 }
