@@ -12,7 +12,7 @@ aside: false
   </p>
 
   <p style="font-size: 1.2rem; opacity: 0.85; margin-bottom: 2.5rem; line-height: 1.6;">
-    Tessera works on top of your existing Git repository so concurrent AI agents and terminal sessions can share one checkout, work on independent branches, and merge edits structurally without lockfile collisions, port conflicts, or overwritten files.
+    Tessera coordinates concurrent AI agents and terminal sessions inside your existing Git repository. Sessions share one checkout, work on independent branches, and merge edits at the AST level.
   </p>
 
   <div style="display: flex; gap: 1rem; justify-content: center; flex-wrap: wrap;">
@@ -26,12 +26,12 @@ aside: false
 
 ## Why Tessera?
 
-In a standard Git checkout, every open terminal and AI agent shares a single `.git/HEAD` and working directory on disk. Running multiple agents at once overwrites uncommitted files, switches branches underneath active processes, and collides on local ports and databases. Tessera coordinates sessions inside `.git/tessera` and writes standard Git commits so you stay in one folder while each session owns its own branch, sandbox environment, and structurally merged changes. [Read Why Tessera? →](/getting-started/why-tessera)
+In a standard Git checkout, every open terminal and AI agent shares a single `.git/HEAD` and working directory. Concurrent agents overwrite uncommitted files, switch branches underneath active processes, and collide on local ports. Tessera tracks each session in `.git/tessera` and writes standard Git commits so every agent and terminal tab gets its own branch, Copy-on-Write sandbox, and AST-merged edits inside one folder. [Read Why Tessera? →](/getting-started/why-tessera)
 
 <HowTesseraWorks />
 
 ### **Semantic Merging**
-Line-based Git merges break when two agents edit the same file. Tessera parses your code with Tree-sitter to merge functions, imports, class methods, and manifest files structurally.
+Tessera parses source files with Tree-sitter to merge functions, imports, class methods, and manifest files at the syntax-tree level rather than line by line.
 
 ```ts
 // Agent 1 adds `locale`, Agent 2 adds `decimals` to the same signature:

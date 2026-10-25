@@ -1,8 +1,6 @@
 # Sandboxes
 
-Running builds, tests, or dev servers on another branch normally requires stashing uncommitted work or switching `.git/HEAD` underneath your editor and other running processes.
-
-Tessera creates Copy-on-Write branch sandboxes that reuse your existing dependencies, preserve your untracked `.env*` secrets and `.gitignore`d files, and assign each session its own port and local database slot.
+Tessera creates Copy-on-Write branch sandboxes that reuse your existing dependencies, preserve your untracked `.env*` secrets and `.gitignore`d files, and assign each branch its own port (`localhost:3100`, `localhost:3200`) and local database slot.
 
 ## Running Commands
 

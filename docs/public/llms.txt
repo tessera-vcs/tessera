@@ -2,7 +2,7 @@
 
 > Multi-agent coordination layer on top of Git for running concurrent AI coding agents and terminal sessions in the same repository.
 
-Tessera (`tes`) does not replace Git. It works on top of your existing Git checkout (`.git/tessera`), isolating every AI agent and terminal session so they can work on independent branches or the same branch simultaneously, running builds and dev servers inside Copy-on-Write branch sandboxes with isolated ports and test databases, and merging concurrent edits structurally at the Tree-sitter AST level. Every commit and merge writes standard Git blobs, trees, and commits directly into `.git/objects/` and `refs/heads/*`.
+Tessera (`tes`) coordinates concurrent AI coding agents and terminal sessions inside an existing Git checkout (`.git/tessera`). Each session gets its own branch state, Copy-on-Write sandbox, port slot, and test database, and concurrent edits merge at the Tree-sitter AST level. Every commit and merge writes standard Git blobs, trees, and commits directly into `.git/objects/` and `refs/heads/*`.
 
 ## Machine-Readable Bundles
 
@@ -11,8 +11,8 @@ Tessera (`tes`) does not replace Git. It works on top of your existing Git check
 
 ## Getting Started
 
-- [Introduction](https://tessera.getlunaris.dev/getting-started/): Install `tes`, initialize a repository with `tes init`, and run your first multi-branch workflow.
-- [Why Tessera?](https://tessera.getlunaris.dev/getting-started/why-tessera): How Tessera works on top of Git to eliminate `.git/HEAD` collisions, merge conflicts, and port/database collisions when running parallel AI agents.
+- [Introduction](https://tessera.getlunaris.dev/getting-started/): Install `tes`, initialize a repository with `tes init`, and run a multi-branch workflow.
+- [Why Tessera?](https://tessera.getlunaris.dev/getting-started/why-tessera): How Tessera isolates concurrent AI coding agents and terminal sessions inside a single Git repository.
 - [Installation](https://tessera.getlunaris.dev/getting-started/installation): Install on macOS, Linux, Windows, FreeBSD, or OpenBSD, enable `(tes:<branch>)` shell prompts (`tes env --install`), and configure AI editor harnesses.
 - [Your First Workflow](https://tessera.getlunaris.dev/getting-started/first-workflow): Walk through parallel feature branches (`feat/pricing` and `feat/faq`), live session inspection (`tes radar`), and 3-way AST merging (`tes merge`).
 

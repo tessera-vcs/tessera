@@ -2774,22 +2774,7 @@ fn run_cli() -> anyhow::Result<()> {
                             if let Some(cid) = &cid_opt {
                                 if let Ok(c) = coord.git().read_commit(cid) {
                                     let base_files = trunk_cid_opt
-                                        .and_then(|t_cid| {
-                                            std::process::Command::new("git")
-                                                .env_remove("GIT_DIR")
-                                                .env_remove("GIT_WORK_TREE")
-                                                .current_dir(coord.git().repo_root())
-                                                .args(["merge-base", t_cid.as_str(), cid.as_str()])
-                                                .output()
-                                                .ok()
-                                                .filter(|o| o.status.success())
-                                                .and_then(|o| {
-                                                    core::ObjectId::from_hex(
-                                                        String::from_utf8_lossy(&o.stdout).trim(),
-                                                    )
-                                                    .ok()
-                                                })
-                                        })
+                                        .and_then(|t_cid| coord.git().find_merge_base(&t_cid, cid))
                                         .filter(|mb_cid| mb_cid != cid)
                                         .or_else(|| c.parents.first().copied())
                                         .and_then(|b_cid| coord.git().read_commit(&b_cid).ok())
@@ -3070,22 +3055,7 @@ fn run_cli() -> anyhow::Result<()> {
                             if let Some(cid) = &cid_opt {
                                 if let Ok(c) = coord.git().read_commit(cid) {
                                     let base_files = trunk_cid_opt
-                                        .and_then(|t_cid| {
-                                            std::process::Command::new("git")
-                                                .env_remove("GIT_DIR")
-                                                .env_remove("GIT_WORK_TREE")
-                                                .current_dir(coord.git().repo_root())
-                                                .args(["merge-base", t_cid.as_str(), cid.as_str()])
-                                                .output()
-                                                .ok()
-                                                .filter(|o| o.status.success())
-                                                .and_then(|o| {
-                                                    core::ObjectId::from_hex(
-                                                        String::from_utf8_lossy(&o.stdout).trim(),
-                                                    )
-                                                    .ok()
-                                                })
-                                        })
+                                        .and_then(|t_cid| coord.git().find_merge_base(&t_cid, cid))
                                         .filter(|mb_cid| mb_cid != cid)
                                         .or_else(|| c.parents.first().copied())
                                         .and_then(|b_cid| coord.git().read_commit(&b_cid).ok())

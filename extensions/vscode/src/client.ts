@@ -519,7 +519,7 @@ export class CliClient {
   public async fetchSnapshot(): Promise<WorkspaceStateSnapshot> {
     const [branchReport, radarReport, conflicts, oplog, stashes] =
       await Promise.all([
-        this.runJson<BranchReport>(["branch"]),
+        this.runJson<BranchReport>(["branch", "--agent", "editor"]),
         this.runJson<RadarReport>(["radar"]),
         this.runJson<ConflictItem[]>(["conflicts"]),
         this.runJson<OpLogEntry[]>(["oplog", "--limit", "30"]),

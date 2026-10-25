@@ -83,6 +83,10 @@ pub fn detect_session_id(explicit: Option<&str>) -> String {
         }
     }
 
+    if std::env::var_os("TES_FROM_IDE_EXTENSION").is_some() {
+        return "editor".to_string();
+    }
+
     // SAFETY: `libc::getppid()` is a pure POSIX syscall with no arguments or memory dereferences.
     #[cfg(unix)]
     let ppid = unsafe { libc::getppid() };
