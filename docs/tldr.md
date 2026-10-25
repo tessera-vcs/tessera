@@ -5,7 +5,7 @@ outline: false
 
 # TL;DR
 
-Tessera works on top of your existing Git repository so multiple AI agents and terminal sessions can work in the same checkout on separate branches or the same branch without overwriting files, colliding on `.git/HEAD`, or conflicting on local ports and databases. `tes init` writes the instruction files (`AGENTS.md`, `CLAUDE.md`, `.cursor/rules`) into your project so your agents use `tes` automatically.
+Tessera coordinates multiple AI agents and terminal sessions in the same Git checkout on separate branches or the same branch. Each session gets its own branch state, Copy-on-Write sandbox, and port slot inside one repository folder. `tes init` writes the instruction files (`AGENTS.md`, `CLAUDE.md`, `.cursor/rules`) into your project so your agents use `tes` automatically.
 
 ## Install
 

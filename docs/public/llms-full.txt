@@ -8,7 +8,7 @@
 
 > Run multiple agents in the same Git repository.
 
-Tessera works on top of your existing Git repository so concurrent AI agents and terminal sessions can share one checkout, work on independent branches, and merge edits at the AST level without manual worktrees or overwritten files.
+Tessera coordinates concurrent AI agents and terminal sessions inside your existing Git repository. Sessions share one checkout, work on independent branches, and merge edits at the AST level.
 
 ```ts
 // Live Multi-Agent Attribution in src/currency.ts (main):
@@ -33,7 +33,7 @@ export function formatCompact(cents: number) {
 
 ## Why Tessera?
 
-In a standard Git checkout, every open terminal and AI agent shares a single `.git/HEAD` and working directory on disk. Running multiple agents at once overwrites uncommitted files, switches branches underneath active processes, and collides on local ports and databases. Tessera coordinates sessions inside `.git/tessera` and writes standard Git commits so you stay in one folder while each session owns its own branch, sandbox environment, and structurally merged changes. [Read Why Tessera? →](/getting-started/why-tessera)
+In a standard Git checkout, every open terminal and AI agent shares a single `.git/HEAD` and working directory. Concurrent agents overwrite uncommitted files, switch branches underneath active processes, and collide on local ports. Tessera tracks each session in `.git/tessera` and writes standard Git commits so every agent and terminal tab gets its own branch, Copy-on-Write sandbox, and AST-merged edits inside one folder. [Read Why Tessera? →](/getting-started/why-tessera)
 
 ```text
 [Workflow: Parallel Agents in One Repository]
@@ -57,7 +57,7 @@ In a standard Git checkout, every open terminal and AI agent shares a single `.g
 ```
 
 ### **Semantic Merging**
-Line-based Git merges break when two agents edit the same file. Tessera parses your code with Tree-sitter to merge functions, imports, class methods, and manifest files structurally.
+Tessera parses source files with Tree-sitter to merge functions, imports, class methods, and manifest files at the syntax-tree level rather than line by line.
 
 ```ts
 // Agent 1 adds `locale`, Agent 2 adds `decimals` to the same signature:
@@ -143,7 +143,7 @@ tes push
 
 # Getting Started
 
-Tessera works on top of your existing Git repository so multiple AI coding agents and terminal sessions can work in the same checkout without overwriting files or colliding on `.git/HEAD`. This guide covers installing the `tes` CLI, initializing a repository, and running your first multi-branch workflow.
+Tessera coordinates multiple AI coding agents and terminal sessions inside an existing Git repository. This guide covers installing the `tes` CLI, initializing a repository, and running a multi-branch workflow.
 
 ## Prerequisites
 
@@ -216,9 +216,7 @@ tes merge feat/pricing --into main -m "feat: add pricing calculator"
 
 ## Working in a Single Folder
 
-Because every terminal tab and AI agent in a project normally shares `.git/HEAD` and the same working tree on disk, running two agents on separate tasks at the same time risks overwriting uncommitted files or colliding on `localhost` ports.
-
-With Tessera, every session works inside a **single repository folder** with its own isolated branch state and port slot:
+In a standard Git checkout, every terminal tab and AI agent shares `.git/HEAD` and the working tree on disk. Tessera isolates each session inside a **single repository folder** with its own branch state and port slot:
 
 ```bash
 # Terminal 1 works on feat/pricing (assigned port 3100)
@@ -249,13 +247,11 @@ The workspace rules installed by `tes init` instruct the agent to claim the bran
 
 # Why Tessera?
 
-A Git checkout has a single `.git/HEAD` pointer and a single working tree on disk. Every terminal tab, background process, and AI coding agent opened in your project directory reads and writes that shared state.
+A Git checkout has a single `.git/HEAD` pointer and a single working tree on disk. Every terminal tab, background process, and AI coding agent opened in a project directory reads and writes that shared state:
 
-When you run two or three AI coding agents in parallel inside the same project, three things break down:
-
-1. **Working tree and branch collisions**: If two agents edit `src/App.vue` concurrently, the second agent to save overwrites the first agent's lines, or sees unfamiliar edits and reverts them. If one agent switches branches to test its work, it changes `.git/HEAD` underneath your editor, your running dev server, and every other session in the folder.
-2. **Line-based merge conflicts**: Concurrent tasks frequently touch adjacent lines in shared files, such as adding imports at the top of a module, registering routes or components, or updating dependencies in `package.json` and lockfiles. Line-based diffing flags these compatible additions as conflicts.
-3. **Runtime collisions**: Running tests or dev servers for two tasks at the same time collides on hardcoded ports (`localhost:3000`), build caches (`target/`, `node_modules/`), and local test databases.
+1. **Working tree and branch overwrites**: If two agents edit `src/App.vue` concurrently, the second save overwrites the first agent's lines, or an agent sees unfamiliar edits on disk and reverts them. Switching branches to test a task changes `.git/HEAD` underneath your editor, running dev servers, and every other open terminal.
+2. **Line-based merge conflicts**: Concurrent tasks frequently modify adjacent lines in shared files, such as adding imports at the top of a module, registering routes or components, or updating dependencies in `package.json` and lockfiles. Line-based diffing flags these compatible additions as conflicts.
+3. **Port and cache collisions**: Running test suites or dev servers for two tasks at the same time collides on hardcoded ports (`localhost:3000`), build caches (`target/`, `node_modules/`), and local test databases.
 
 ## One Folder, Isolated Sessions
 
@@ -284,19 +280,19 @@ Tessera lets multiple AI agents and terminal tabs work in the **same repository 
 
 When an agent claims a branch like `feat/pricing`, Tessera isolates that session inside `.git/tessera/` without changing `.git/HEAD` for the rest of your workspace. Concurrent agents can edit `src/App.vue` on their own branches in `~/acme-web` at the same time without touching each other's uncommitted files.
 
-When you want to build, test, or preview a branch, `tes exec -b feat/pricing -- npm run dev` executes inside a Copy-on-Write sandbox. It clones your existing `node_modules`, `target`, or `.venv` directories (including monorepo workspace symlinks), preserves your untracked `.env*` secrets and `.gitignore`d local files (such as local SQLite databases or `.dev.vars`), and assigns each session its own port (`localhost:3100`, `localhost:3200`) and local database slot so you can run multiple branches side by side.
+When you want to build, test, or preview a branch, `tes exec -b feat/pricing -- npm run dev` executes inside a Copy-on-Write sandbox. It clones your existing `node_modules`, `target`, or `.venv` directories (including monorepo workspace symlinks), preserves your untracked `.env*` secrets and `.gitignore`d local files (such as local SQLite databases or `.dev.vars`), and assigns each branch its own port (`localhost:3100`, `localhost:3200`) and local database slot so you can run multiple branches side by side.
 
 ## Structural Merging Across Code, Configs, and Lockfiles
 
-When you run `tes merge feat/pricing feat/faq --into main`, Tessera merges changes structurally rather than line by line:
+When you run `tes merge feat/pricing feat/faq --into main`, Tessera merges changes at the syntax-tree level rather than line by line:
 
-- **Source code**: Parses modules into syntax trees with Tree-sitter to merge functions, class methods, imports, and JSX/Vue templates.
+- **Source code**: Parses modules with Tree-sitter to merge functions, class methods, imports, and JSX/Vue templates.
 - **Manifests and lockfiles**: Merges JSON, TOML, `Cargo.lock`, `pnpm-lock.yaml`, `yarn.lock`, and `poetry.lock` blocks by key and stanza.
-- **Universal block structure**: Recognizes braced blocks (`{ ... }`), HTML/XML tags, indentation-scoped blocks (YAML, Python), keyword-delimited blocks (`def ... end`, `if ... fi`), and `[section]` stanzas so compatible additions merge cleanly across any language or configuration format.
+- **Universal block structure**: Recognizes braced blocks (`{ ... }`), HTML/XML tags, indentation-scoped blocks (YAML, Python), keyword-delimited blocks (`def ... end`, `if ... fi`), and `[section]` stanzas so compatible additions merge across any language or configuration format.
 
 ## Editing on the Same Branch
 
-You do not always want separate branches. When two agents work directly on `main` at the same time, Tessera runs a 3-way structural merge on disk every time an agent saves a file.
+When two agents work directly on `main` at the same time, Tessera runs a 3-way structural merge on disk whenever either agent saves a file.
 
 ```text
 [Workflow: Same-Branch AST Merging on main]
@@ -308,11 +304,9 @@ You do not always want separate branches. When two agents work directly on `main
 
 If one agent updates `formatCurrency()` while another adds `formatCompact()` in `src/currency.ts`, both edits are preserved on disk. In VS Code and Cursor, the Tessera extension highlights each agent's lines so you can see which session owns each change.
 
-## Built on Top of Git, Not a Replacement
+## Git Compatibility
 
-Tessera is not a replacement for Git and does not use a hosted server. Instead, it gives each AI agent and terminal session its own isolated state in `.git/tessera/` so concurrent sessions can use Git branches, diffs, and commits safely in the same working directory.
-
-Every `tes commit` or `tes merge` writes standard Git blobs, trees, and commits directly into `.git/objects/` and `refs/heads/*`. Your existing `git push`, GitHub pull requests, and CI pipelines work without changes.
+Tessera stores session state locally in `.git/tessera/` with no external server. Every `tes commit` or `tes merge` writes standard Git blobs, trees, and commits directly into `.git/objects/` and `refs/heads/*`, so `git push`, GitHub pull requests, and CI pipelines work without changes.
 
 ---
 
@@ -681,7 +675,7 @@ Step-by-step guides and tutorials for working with Tessera.
 
 # Agents
 
-Once a repository is initialized with `tes init`, editors and CLI harnesses like Antigravity, Claude Code, Codex, Cursor, Windsurf, Kiro, and OpenCode can work in the same checkout simultaneously without overwriting each other's files.
+After running `tes init`, editors and CLI harnesses (Antigravity, Claude Code, Codex, Cursor, Windsurf, Kiro, and OpenCode) coordinate edits automatically inside the repository.
 
 ## Automatic Coordination
 
@@ -689,19 +683,19 @@ You do not need to change how you prompt your AI agents or manually manage locks
 
 ```text
 [Workflow: How Agents Coordinate Automatically]
-1. Claim Task        -> tes claim --branch <branch> --intent "<goal>" <files...>
-2. Reconcile Edits   -> tes hook post-tool --path <file>   (3-way AST merge on save)
-3. Verify in Sandbox -> tes exec -- npm run build          (CoW sandbox on isolated port)
-4. Commit to Git     -> tes commit -m "..." / tes merge    (standard Git commit on branch)
+1. Claim Task        -> tes claim [--branch <branch>] [--from <base>] --intent "<goal>" <files...>
+2. Reconcile Edits   -> tes hook post-tool --path <files...> (3-way AST merge on save)
+3. Verify in Sandbox -> tes exec -- npm run build            (CoW sandbox on isolated port)
+4. Commit to Git     -> tes commit -m "..." / tes merge      (standard Git commit on branch)
 ```
 
-1. **Claim the task (`tes claim`)**: Before editing files, the agent declares what it is working on, which files it will touch, and (optionally) which branch it is targeting:
+1. **Claim the task (`tes claim`)**: Before editing files, the agent declares what it is working on, which files it will touch, and (optionally) which branch and base branch it is targeting:
    ```bash
    tes claim --branch feat/pricing --intent "Add pricing calculator" src/components/PricingCalculator.vue src/App.vue
    ```
-2. **Reconcile edits (`tes hook post-tool`)**: Immediately after modifying a file, the agent reconciles its edit:
+2. **Reconcile edits (`tes hook post-tool`)**: Immediately after modifying files, the agent reconciles its edits:
    ```bash
-   tes hook post-tool --path src/App.vue
+   tes hook post-tool --path src/components/PricingCalculator.vue src/App.vue
    ```
 3. **Verify in a sandbox (`tes exec`)**: To run a compiler, type-checker, or test suite, the agent executes inside its branch's Copy-on-Write sandbox:
    ```bash
@@ -729,7 +723,7 @@ When you ask Agent 1 to work on `feat/pricing` and Agent 2 to work on `feat/faq`
 
 Tessera keeps each branch isolated:
 - Changes made on `feat/pricing` never leak into `feat/faq`'s sandbox or commit tree.
-- Two agents on different branches will never trigger a conflict against each other while building their features.
+- Agents on different branches edit independent trees and do not conflict while building their features.
 - When both agents finish, you can inspect each branch independently or merge both into `main` with `tes merge feat/pricing feat/faq --into main`.
 
 ## Status and Diffs
@@ -740,10 +734,11 @@ Check modified files in your current session or branch with `tes status`:
 tes status
 ```
 
-`tes status` groups files into three sections:
-- **Staged Changes**: Changes recorded in the active session (`M`, `A`, `D`)
-- **Unstaged Changes**: Working tree edits on disk not yet reconciled
-- **Committed on Branch**: Files committed on the current feature branch ahead of `main`
+`tes status` groups files into sections:
+- **Staged / Session Changes**: Changes recorded in the active session (`M`, `A`, `D`)
+- **Peer Session Changes on `<branch>`**: Files modified by other concurrent sessions on the same branch
+- **Unstaged Changes**: Working tree edits on disk not yet claimed by any session
+- **Committed on `<branch>`**: Files committed on the current feature branch ahead of `main`
 
 Use `tes diff` to view line-by-line diffs:
 
@@ -783,7 +778,7 @@ tes radar
 
 In standard Git, all open terminals and editor windows share a single `.git/HEAD`. Running `git checkout feat/pricing` in one terminal switches the branch underneath every other open terminal and AI agent.
 
-Tessera separates **per-terminal branches**, **per-agent branches**, and your **editor branch** so they never step on each other.
+Tessera tracks **per-terminal branches**, **per-agent branches**, and your **editor branch** independently.
 
 ```text
 [Architecture: Editor, Terminal & Agent Branches in One Folder]
@@ -898,9 +893,7 @@ tes push -u origin feat/pricing
 
 # Sandboxes
 
-Running builds, tests, or dev servers on another branch normally requires stashing uncommitted work or switching `.git/HEAD` underneath your editor and other running processes.
-
-Tessera creates Copy-on-Write branch sandboxes that reuse your existing dependencies, preserve your untracked `.env*` secrets and `.gitignore`d files, and assign each session its own port and local database slot.
+Tessera creates Copy-on-Write branch sandboxes that reuse your existing dependencies, preserve your untracked `.env*` secrets and `.gitignore`d files, and assign each branch its own port (`localhost:3100`, `localhost:3200`) and local database slot.
 
 ## Running Commands
 
@@ -1009,9 +1002,9 @@ To customize `base_port`, `port_stride`, `port_isolation`, or custom environment
 
 # Conflicts
 
-Most of the time, Tessera combines concurrent edits automatically using 3-way Tree-sitter AST merging and manifest drivers.
+Tessera combines concurrent edits to separate functions, imports, class methods, and manifest entries using 3-way Tree-sitter AST merging and manifest drivers.
 
-A conflict is recorded **only** when two sessions or branches modify the exact same statement or expression in incompatible ways (for example, both rewriting the same heading or return expression to different strings).
+A conflict occurs when two sessions or branches modify the same statement or expression in incompatible ways, such as rewriting the same heading or return expression to different values.
 
 ## Resolving in the Editor
 

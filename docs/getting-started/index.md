@@ -1,6 +1,6 @@
 # Getting Started
 
-Tessera works on top of your existing Git repository so multiple AI coding agents and terminal sessions can work in the same checkout without overwriting files or colliding on `.git/HEAD`. This guide covers installing the `tes` CLI, initializing a repository, and running your first multi-branch workflow.
+Tessera coordinates multiple AI coding agents and terminal sessions inside an existing Git repository. This guide covers installing the `tes` CLI, initializing a repository, and running a multi-branch workflow.
 
 ## Prerequisites
 
@@ -73,9 +73,7 @@ tes merge feat/pricing --into main -m "feat: add pricing calculator"
 
 ## Working in a Single Folder
 
-Because every terminal tab and AI agent in a project normally shares `.git/HEAD` and the same working tree on disk, running two agents on separate tasks at the same time risks overwriting uncommitted files or colliding on `localhost` ports.
-
-With Tessera, every session works inside a **single repository folder** with its own isolated branch state and port slot:
+In a standard Git checkout, every terminal tab and AI agent shares `.git/HEAD` and the working tree on disk. Tessera isolates each session inside a **single repository folder** with its own branch state and port slot:
 
 ```bash:no-line-numbers
 # Terminal 1 works on feat/pricing (assigned port 3100)

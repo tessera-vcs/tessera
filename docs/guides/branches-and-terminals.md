@@ -2,7 +2,7 @@
 
 In standard Git, all open terminals and editor windows share a single `.git/HEAD`. Running `git checkout feat/pricing` in one terminal switches the branch underneath every other open terminal and AI agent.
 
-Tessera separates **per-terminal branches**, **per-agent branches**, and your **editor branch** so they never step on each other.
+Tessera tracks **per-terminal branches**, **per-agent branches**, and your **editor branch** independently.
 
 <BranchesAndTerminalsIllustration />
 

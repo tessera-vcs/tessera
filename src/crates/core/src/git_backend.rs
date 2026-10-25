@@ -1353,6 +1353,53 @@ impl GitBackend {
             .is_ok_and(|s| s.success())
     }
 
+    /// Finds the lowest common ancestor (merge-base) between commits `a` and `b` in the commit DAG
+    /// using an in-memory breadth-first traversal without spawning a child `git` process.
+    #[must_use]
+    pub fn find_merge_base(&self, a: &ObjectId, b: &ObjectId) -> Option<ObjectId> {
+        if a == b {
+            return Some(*a);
+        }
+
+        let mut ancestors_a = BTreeSet::new();
+        let mut queue_a = std::collections::VecDeque::new();
+        queue_a.push_back(*a);
+
+        while let Some(curr) = queue_a.pop_front() {
+            if !ancestors_a.insert(curr) || ancestors_a.len() > 4096 {
+                continue;
+            }
+
+            if let Ok(commit) = self.read_commit(&curr) {
+                for p in commit.parents {
+                    queue_a.push_back(p);
+                }
+            }
+        }
+
+        let mut visited_b = BTreeSet::new();
+        let mut queue_b = std::collections::VecDeque::new();
+        queue_b.push_back(*b);
+
+        while let Some(curr) = queue_b.pop_front() {
+            if ancestors_a.contains(&curr) {
+                return Some(curr);
+            }
+
+            if !visited_b.insert(curr) || visited_b.len() > 4096 {
+                continue;
+            }
+
+            if let Ok(commit) = self.read_commit(&curr) {
+                for p in commit.parents {
+                    queue_b.push_back(p);
+                }
+            }
+        }
+
+        None
+    }
+
     /// Updates `.git/HEAD` to point symbolically at `refs/heads/<branch>`.
     ///
     /// # Errors

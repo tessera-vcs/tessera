@@ -1,8 +1,8 @@
 # Conflicts
 
-Most of the time, Tessera combines concurrent edits automatically using 3-way Tree-sitter AST merging and manifest drivers.
+Tessera combines concurrent edits to separate functions, imports, class methods, and manifest entries using 3-way Tree-sitter AST merging and manifest drivers.
 
-A conflict is recorded **only** when two sessions or branches modify the exact same statement or expression in incompatible ways (for example, both rewriting the same heading or return expression to different strings).
+A conflict occurs when two sessions or branches modify the same statement or expression in incompatible ways, such as rewriting the same heading or return expression to different values.
 
 ## Resolving in the Editor
 

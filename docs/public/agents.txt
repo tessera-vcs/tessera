@@ -2,7 +2,7 @@
 
 > URL: https://tessera.getlunaris.dev/agents.txt | Related: https://tessera.getlunaris.dev/llms.txt | https://tessera.getlunaris.dev/llms-full.txt
 
-Tessera (`tes`) is a multi-agent coordination layer built on top of your existing Git repository (`.git/tessera`). It does not replace Git. Every commit, branch, and merge is stored as standard Git objects and refs. Instead, Tessera isolates concurrent AI coding agents and terminal sessions inside a single Git checkout, provides Copy-on-Write branch sandboxes with isolated ports and test databases, and merges concurrent edits structurally using 3-way Tree-sitter AST merging.
+Tessera (`tes`) is a multi-agent coordination layer for Git repositories (`.git/tessera`). Every commit, branch, and merge is stored as standard Git objects and refs. Tessera isolates concurrent AI coding agents and terminal sessions inside a single Git checkout, provides Copy-on-Write branch sandboxes with isolated ports and test databases, and merges concurrent edits using 3-way Tree-sitter AST merging.
 
 ---
 
@@ -23,14 +23,14 @@ Tessera (`tes`) is a multi-agent coordination layer built on top of your existin
 
 ### Step 1: Before Editing Files (Claim Intent, Branch & Paths)
 ```bash
-tes claim [--branch <branch>] --intent "<concise summary of your task>" <target-file-paths...>
+tes claim [--branch <branch>] [--from <base-branch>] --intent "<concise summary of your task>" <target-file-paths...>
 ```
-- If `--branch <branch>` is passed, Tessera automatically creates `<branch>` (if needed) and binds your agent session to `<branch>` without changing `.git/HEAD` for the user's editor or other agents.
+- If `--branch <branch>` is passed, Tessera automatically creates `<branch>` (if needed, optionally forked from `--from <base-branch>`) and binds your agent session to `<branch>` without changing `.git/HEAD` for the user's editor or other agents.
 - Records base file snapshots so your edits can be 3-way AST-reconciled.
 
-### Step 2: Immediately After Editing Each File (Reconcile Edits)
+### Step 2: After Editing Files (Reconcile Edits)
 ```bash
-tes hook post-tool --path <edited-file>
+tes hook post-tool --path <edited-file-1> <edited-file-2>...
 ```
 - Runs a 3-way Tree-sitter AST and token merge against the branch state and any concurrent same-branch peer edits.
 - Preserves per-branch isolation so edits on a feature branch never leak into `main`.

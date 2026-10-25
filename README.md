@@ -10,7 +10,7 @@
   <strong>Run multiple agents in the same Git repository.</strong>
 </p>
 
-Tessera works on top of your existing Git repository. Instead of replacing Git, it acts as a local coordination layer in `.git/tessera` that lets concurrent AI agents and terminal tabs share one checkout, work on independent branches, and merge edits at the AST level without overwriting files.
+Tessera coordinates concurrent AI agents and terminal tabs inside your existing Git repository. It stores session state in `.git/tessera`, isolates per-session branches and Copy-on-Write sandboxes, and merges source code and lockfiles at the AST level.
 
 ## Quick Start
 

@@ -1,6 +1,6 @@
 # Agents
 
-Once a repository is initialized with `tes init`, editors and CLI harnesses like Antigravity, Claude Code, Codex, Cursor, Windsurf, Kiro, and OpenCode can work in the same checkout simultaneously without overwriting each other's files.
+After running `tes init`, editors and CLI harnesses (Antigravity, Claude Code, Codex, Cursor, Windsurf, Kiro, and OpenCode) coordinate edits automatically inside the repository.
 
 ## Automatic Coordination
 
@@ -8,13 +8,13 @@ You do not need to change how you prompt your AI agents or manually manage locks
 
 <AgentWorkflowIllustration />
 
-1. **Claim the task (`tes claim`)**: Before editing files, the agent declares what it is working on, which files it will touch, and (optionally) which branch it is targeting:
+1. **Claim the task (`tes claim`)**: Before editing files, the agent declares what it is working on, which files it will touch, and (optionally) which branch and base branch it is targeting:
    ```bash:no-line-numbers
    tes claim --branch feat/pricing --intent "Add pricing calculator" src/components/PricingCalculator.vue src/App.vue
    ```
-2. **Reconcile edits (`tes hook post-tool`)**: Immediately after modifying a file, the agent reconciles its edit:
+2. **Reconcile edits (`tes hook post-tool`)**: Immediately after modifying files, the agent reconciles its edits:
    ```bash:no-line-numbers
-   tes hook post-tool --path src/App.vue
+   tes hook post-tool --path src/components/PricingCalculator.vue src/App.vue
    ```
 3. **Verify in a sandbox (`tes exec`)**: To run a compiler, type-checker, or test suite, the agent executes inside its branch's Copy-on-Write sandbox:
    ```bash:no-line-numbers
@@ -42,7 +42,7 @@ When you ask Agent 1 to work on `feat/pricing` and Agent 2 to work on `feat/faq`
 
 Tessera keeps each branch isolated:
 - Changes made on `feat/pricing` never leak into `feat/faq`'s sandbox or commit tree.
-- Two agents on different branches will never trigger a conflict against each other while building their features.
+- Agents on different branches edit independent trees and do not conflict while building their features.
 - When both agents finish, you can inspect each branch independently or merge both into `main` with `tes merge feat/pricing feat/faq --into main`.
 
 ## Status and Diffs
@@ -53,10 +53,11 @@ Check modified files in your current session or branch with `tes status`:
 tes status
 ```
 
-`tes status` groups files into three sections:
-- **Staged Changes**: Changes recorded in the active session (`M`, `A`, `D`)
-- **Unstaged Changes**: Working tree edits on disk not yet reconciled
-- **Committed on Branch**: Files committed on the current feature branch ahead of `main`
+`tes status` groups files into sections:
+- **Staged / Session Changes**: Changes recorded in the active session (`M`, `A`, `D`)
+- **Peer Session Changes on `<branch>`**: Files modified by other concurrent sessions on the same branch
+- **Unstaged Changes**: Working tree edits on disk not yet claimed by any session
+- **Committed on `<branch>`**: Files committed on the current feature branch ahead of `main`
 
 Use `tes diff` to view line-by-line diffs:
 

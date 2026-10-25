@@ -36,10 +36,10 @@ const HOW_TESSERA_WORKS_ASCII = [
 const AGENT_WORKFLOW_ASCII = [
   '```text',
   '[Workflow: How Agents Coordinate Automatically]',
-  '1. Claim Task        -> tes claim --branch <branch> --intent "<goal>" <files...>',
-  '2. Reconcile Edits   -> tes hook post-tool --path <file>   (3-way AST merge on save)',
-  '3. Verify in Sandbox -> tes exec -- npm run build          (CoW sandbox on isolated port)',
-  '4. Commit to Git     -> tes commit -m "..." / tes merge    (standard Git commit on branch)',
+  '1. Claim Task        -> tes claim [--branch <branch>] [--from <base>] --intent "<goal>" <files...>',
+  '2. Reconcile Edits   -> tes hook post-tool --path <files...> (3-way AST merge on save)',
+  '3. Verify in Sandbox -> tes exec -- npm run build            (CoW sandbox on isolated port)',
+  '4. Commit to Git     -> tes commit -m "..." / tes merge      (standard Git commit on branch)',
   '```'
 ].join('\n')
 
@@ -91,7 +91,7 @@ const HOME_HERO_MARKDOWN = [
   '',
   '> Run multiple agents in the same Git repository.',
   '',
-  'Tessera works on top of your existing Git repository so concurrent AI agents and terminal sessions can share one checkout, work on independent branches, and merge edits at the AST level without manual worktrees or overwritten files.',
+  'Tessera coordinates concurrent AI agents and terminal sessions inside your existing Git repository. Sessions share one checkout, work on independent branches, and merge edits at the AST level.',
   '',
   EDITOR_ATTRIBUTION_ASCII
 ].join('\n')
