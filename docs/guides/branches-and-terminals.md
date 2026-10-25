@@ -18,7 +18,13 @@ tes switch feat/pricing
 tes switch feat/faq
 ```
 
-If the target branch does not exist yet, Tessera creates it automatically from `HEAD`.
+If the target branch does not exist yet, Tessera creates it automatically from `HEAD` (or from your session's current branch if that tab is already on a feature branch). To branch off a specific parent branch explicitly, pass `--from <base-branch>` or use `tes switch -b <new-branch> <base-branch>`:
+
+```bash:no-line-numbers
+tes switch -b feat/pricing-tiers feat/pricing
+# or
+tes switch feat/pricing-tiers --from feat/pricing
+```
 
 In a switched terminal tab:
 - Your shell prompt displays `(tes:feat/pricing)` so you always see which branch that tab is on.
@@ -48,6 +54,12 @@ The agent claims the branch automatically:
 
 ```bash:no-line-numbers
 tes claim --branch feat/faq --intent "Add Testimonials and FAQ section" src/components/TestimonialsFaq.vue src/App.vue
+```
+
+To have an agent create a new branch stacked on top of an existing feature branch, specify the parent branch in your prompt (for example, *"Branch off `feat/pricing` into `feat/pricing-tiers`..."*). The agent passes `--from feat/pricing` when claiming or switching:
+
+```bash:no-line-numbers
+tes claim --branch feat/pricing-tiers --from feat/pricing --intent "Add enterprise pricing tier" src/components/PricingCalculator.vue
 ```
 
 When the agent finishes and commits onto `feat/faq`, your `main` working tree remains clean.

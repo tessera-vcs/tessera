@@ -543,9 +543,92 @@ impl Coordinator {
             .ok_or_else(|| CoreError::NotFound("HEAD commit".to_string()))?;
         let commit_obj = self.git.read_commit(&head_commit)?;
         let head_branch = self.git.current_branch_name().unwrap_or_default();
-        let foreign_baseline = if is_ai_session_id(session_id) {
-            match self.oplog.load_current_reconciled() {
-                Ok(cur) if !cur.view.agents.contains_key(session_id) => {
+        let cfg = self.oplog.load_config().unwrap_or_default();
+        let current_op = self.oplog.load_current_reconciled().ok();
+
+        let is_ai_agent = !session_id.starts_with("term-")
+            && !session_id.starts_with("session-")
+            && !session_id.starts_with("mcp-")
+            && session_id != "editor";
+
+        let is_term_session =
+            session_id.starts_with("term-") || session_id.starts_with("session-");
+
+        if let Some(ref cur) = current_op {
+            if let Some(existing) = cur.view.agents.get(session_id) {
+                let non_trunk_branch = existing
+                    .target_branch
+                    .as_deref()
+                    .filter(|b| !b.is_empty() && *b != cfg.trunk_branch);
+
+                let slot_ok = if let Some(br) = non_trunk_branch {
+                    existing.slot == self.branch_slot(&cur.view, br, &cfg.trunk_branch)
+                } else {
+                    let used_by_others: BTreeSet<u16> = cur
+                        .view
+                        .agents
+                        .iter()
+                        .filter(|(id, a)| {
+                            *id != session_id
+                                && is_ai_session_id(id) == is_ai_agent
+                                && a.target_branch
+                                    .as_deref()
+                                    .is_none_or(|b| b.is_empty() || b == cfg.trunk_branch)
+                        })
+                        .map(|(_, a)| a.slot)
+                        .collect();
+
+                    let max_compact_slot =
+                        (used_by_others.len() as u16).saturating_add(1).max(1);
+                    existing.slot > 0
+                        && !used_by_others.contains(&existing.slot)
+                        && (existing.workspace_path.is_some() || existing.slot <= max_compact_slot)
+                };
+
+                let has_placeholder = is_ai_agent
+                    && existing.targets_head_branch(&head_branch)
+                    && existing.intent_inferred
+                    && !existing.has_own_changes()
+                    && cur.view.agents.iter().any(|(id, a)| {
+                        id.starts_with("mcp-")
+                            || ((id.starts_with("term-") || id.starts_with("session-"))
+                                && !a.intent_inferred
+                                && !a.has_own_changes()
+                                && (a.target_branch.is_some() || !a.claimed_symbols.is_empty()))
+                    });
+
+                let branch_ok = existing.target_branch.is_some() || !is_term_session;
+
+                let commit_ok = !(existing.targets_head_branch(&head_branch)
+                    && !existing.has_own_changes()
+                    && existing.claimed_symbols.is_empty()
+                    && existing.read_blobs.is_empty()
+                    && existing.head_commit == existing.base_commit
+                    && existing.base_commit != head_commit);
+
+                let intent_ok = explicit_intent.is_none_or(|s| {
+                    let trimmed = s.trim();
+                    trimmed.is_empty()
+                        || (!existing.intent_inferred && existing.intent == trimmed)
+                });
+
+                let waypoint_ok = session_id == "editor" || existing.waypoint.is_some();
+
+                if slot_ok
+                    && !has_placeholder
+                    && branch_ok
+                    && commit_ok
+                    && intent_ok
+                    && waypoint_ok
+                {
+                    return Ok(existing.clone());
+                }
+            }
+        }
+
+        let foreign_baseline = if is_ai_agent {
+            match current_op.as_ref() {
+                Some(cur) if !cur.view.agents.contains_key(session_id) => {
                     self.unowned_worktree_changes(&cur.view, &commit_obj.tree_id)
                 }
                 _ => BTreeSet::new(),
@@ -555,22 +638,19 @@ impl Coordinator {
         };
 
         let mut out_agent: Option<AgentMetadata> = None;
+
         self.oplog.record_tx(
             session_id,
             format!("ensure session {session_id}"),
             true,
             |view| {
-                let is_ai_agent = !session_id.starts_with("term-")
-                    && !session_id.starts_with("session-")
-                    && !session_id.starts_with("mcp-")
-                    && session_id != "editor";
-
                 let adopted_placeholder = if is_ai_agent {
                     let existing_needs_adoption = view.agents.get(session_id).is_none_or(|a| {
                         a.targets_head_branch(&head_branch)
                             && a.intent_inferred
                             && !a.has_own_changes()
                     });
+
                     if existing_needs_adoption {
                         let placeholder_id = view
                             .agents
@@ -584,6 +664,7 @@ impl Coordinator {
                             })
                             .max_by_key(|(_, a)| a.updated_at_ms)
                             .map(|(id, _)| id.clone());
+
                         placeholder_id.and_then(|pid| view.agents.remove(&pid))
                     } else {
                         None
@@ -592,28 +673,76 @@ impl Coordinator {
                     None
                 };
 
-                let is_term_session =
-                    session_id.starts_with("term-") || session_id.starts_with("session-");
                 let initial_branch = if is_term_session {
                     self.git.current_branch_name().ok()
                 } else {
                     None
                 };
-                let detected_waypoint =
-                    (session_id != "editor").then(|| detect_session_waypoint(session_id));
+
+                let inherited_term_branch = if is_ai_agent {
+                    let env_root_matches = std::env::var("TES_REPO_ROOT").ok().is_some_and(|r| {
+                        let env_path = Path::new(r.trim());
+                        env_path == self.git.repo_root()
+                            || (env_path.canonicalize().ok()
+                                == self.git.repo_root().canonicalize().ok()
+                                && env_path.canonicalize().is_ok())
+                    });
+
+                    if env_root_matches {
+                        std::env::var("TES_BRANCH")
+                            .ok()
+                            .map(|b| b.trim().to_string())
+                            .filter(|b| !b.is_empty() && validate_ref_name(b).is_ok())
+                            .or_else(|| {
+                                std::env::var("TES_SESSION_ID")
+                                    .ok()
+                                    .map(|s| s.trim().to_string())
+                                    .filter(|s| s.starts_with("term-") || s.starts_with("session-"))
+                                    .and_then(|s| {
+                                        view.agents.get(&s).and_then(|a| a.target_branch.clone())
+                                    })
+                            })
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                let needs_waypoint = session_id != "editor"
+                    && view
+                        .agents
+                        .get(session_id)
+                        .and_then(|a| a.waypoint.as_ref())
+                        .is_none();
+
+                let detected_waypoint = needs_waypoint.then(|| detect_session_waypoint(session_id));
+
                 let used_by_others: BTreeSet<u16> = view
                     .agents
                     .iter()
-                    .filter(|(id, _)| *id != session_id)
+                    .filter(|(id, a)| {
+                        *id != session_id
+                            && is_ai_session_id(id) == is_ai_agent
+                            && a.target_branch
+                                .as_deref()
+                                .is_none_or(|b| b.is_empty() || b == cfg.trunk_branch)
+                    })
                     .map(|(_, a)| a.slot)
                     .collect();
+
                 let lowest_free_slot = (1u16..=u16::MAX)
                     .find(|s| !used_by_others.contains(s))
                     .unwrap_or(1);
 
                 if let Some(existing) = view.agents.get_mut(session_id) {
                     let max_compact_slot = (used_by_others.len() as u16).saturating_add(1).max(1);
+
                     if existing.workspace_path.is_none()
+                        && existing
+                            .target_branch
+                            .as_deref()
+                            .is_none_or(|b| b.is_empty() || b == cfg.trunk_branch)
                         && (existing.slot == 0
                             || used_by_others.contains(&existing.slot)
                             || existing.slot > max_compact_slot)
@@ -629,6 +758,7 @@ impl Coordinator {
 
                         if existing.targets_head_branch(&head_branch) {
                             existing.target_branch = adopted.target_branch;
+
                             if !existing.has_own_changes() {
                                 existing.base_commit = adopted.base_commit;
                                 existing.head_commit = adopted.head_commit;
@@ -637,6 +767,7 @@ impl Coordinator {
                         }
 
                         existing.claimed_symbols.extend(adopted.claimed_symbols);
+
                         for (k, v) in adopted.read_blobs {
                             existing.read_blobs.entry(k).or_insert(v);
                         }
@@ -645,6 +776,12 @@ impl Coordinator {
                     if existing.target_branch.is_none() && is_term_session {
                         existing.target_branch = initial_branch;
                     }
+
+                    let resolved_non_trunk = existing
+                        .target_branch
+                        .as_deref()
+                        .filter(|b| !b.is_empty() && *b != cfg.trunk_branch)
+                        .map(str::to_string);
 
                     if existing.targets_head_branch(&head_branch)
                         && !existing.has_own_changes()
@@ -667,15 +804,27 @@ impl Coordinator {
                         }
                     }
 
-                    if session_id != "editor"
-                        && (existing.waypoint.is_none() || detect_session_id(None) == session_id)
-                    {
-                        existing.waypoint = detected_waypoint.clone();
+                    if existing.waypoint.is_none() {
+                        if let Some(wp) = detected_waypoint.clone() {
+                            existing.waypoint = Some(wp);
+                        }
                     }
 
                     existing.updated_at_ms = now_millis();
-                    let active_slot = existing.slot;
-                    out_agent = Some(existing.clone());
+                    let mut active_slot = existing.slot;
+                    let mut cloned = existing.clone();
+
+                    if let Some(ref br) = resolved_non_trunk {
+                        let br_slot = self.branch_slot(view, br, &cfg.trunk_branch);
+                        if let Some(ex) = view.agents.get_mut(session_id) {
+                            ex.slot = br_slot;
+                        }
+                        cloned.slot = br_slot;
+                        active_slot = br_slot;
+                    }
+
+                    out_agent = Some(cloned);
+
                     view.next_agent_slot = used_by_others
                         .iter()
                         .copied()
@@ -683,10 +832,12 @@ impl Coordinator {
                         .unwrap_or(0)
                         .max(active_slot)
                         .saturating_add(1);
+
                     return Ok(());
                 }
 
-                let slot = lowest_free_slot;
+                let mut slot = lowest_free_slot;
+
                 view.next_agent_slot = used_by_others
                     .iter()
                     .copied()
@@ -694,8 +845,10 @@ impl Coordinator {
                     .unwrap_or(0)
                     .max(slot)
                     .saturating_add(1);
+
                 let change_id =
                     ChangeId::from_seed(&format!("{session_id}-{}", head_commit.as_str()));
+
                 let (mut intent, mut intent_inferred) = match explicit_intent {
                     Some(s) if !s.trim().is_empty() => (s.trim().to_string(), false),
                     _ => (format!("Active session {session_id}"), true),
@@ -714,14 +867,38 @@ impl Coordinator {
                         intent = adopted.intent;
                         intent_inferred = false;
                     }
+
                     base_commit = adopted.base_commit;
                     head_commit_val = adopted.head_commit;
                     head_tree = adopted.head_tree;
                     claimed_symbols = adopted.claimed_symbols;
                     read_blobs = adopted.read_blobs;
                     target_branch = adopted.target_branch;
+
                     if waypoint.is_none() {
                         waypoint = adopted.waypoint;
+                    }
+                } else if let Some(env_b) = inherited_term_branch {
+                    let resolved_cid = self
+                        .git
+                        .resolve_ref(&format!("refs/heads/{env_b}"))
+                        .ok()
+                        .flatten()
+                        .or_else(|| view.branches.get(&env_b).copied());
+
+                    if let Some(b_cid) = resolved_cid {
+                        if let Ok(b_commit) = self.git.read_commit(&b_cid) {
+                            target_branch = Some(env_b);
+                            base_commit = b_cid;
+                            head_commit_val = b_cid;
+                            head_tree = b_commit.tree_id;
+                        }
+                    }
+                }
+
+                if let Some(ref br) = target_branch {
+                    if !br.is_empty() && br != &cfg.trunk_branch {
+                        slot = self.branch_slot(view, br, &cfg.trunk_branch);
                     }
                 }
 
@@ -747,9 +924,11 @@ impl Coordinator {
                     waypoint,
                     updated_at_ms: now_millis(),
                 };
+
                 view.changes.insert(change_id, head_commit_val);
                 view.agents.insert(session_id.to_string(), meta.clone());
                 out_agent = Some(meta);
+
                 Ok(())
             },
         )?;
@@ -1443,10 +1622,38 @@ impl Coordinator {
         symbols: &[String],
         target_branch: Option<&str>,
     ) -> CoreResult<AgentMetadata> {
+        self.claim_intent_and_symbols_with_branch_and_base(
+            agent_id,
+            intent,
+            symbols,
+            target_branch,
+            None,
+        )
+    }
+
+    /// Explicitly updates the `intent`, claimed AST/file symbols, optional per-session
+    /// `target_branch` (`--branch <name>`), and optional parent revision `from_branch` (`--from <base>`)
+    /// for `agent_id`, recording pre-edit baselines (`read_blobs`).
+    ///
+    /// # Errors
+    /// Returns [`CoreError`] if `target_branch` or `from_branch` is invalid/missing or updating the `OpLog` fails.
+    pub fn claim_intent_and_symbols_with_branch_and_base(
+        &self,
+        agent_id: &str,
+        intent: Option<&str>,
+        symbols: &[String],
+        target_branch: Option<&str>,
+        from_branch: Option<&str>,
+    ) -> CoreResult<AgentMetadata> {
         let requested_branch = target_branch.map(str::trim).filter(|s| !s.is_empty());
         if let Some(b) = requested_branch {
             validate_ref_name(b)?;
         }
+
+        let explicit_from_cid = match from_branch.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(base_spec) => Some(self.git.resolve_revision(base_spec)?),
+            None => None,
+        };
 
         let meta_now = self.ensure_session(agent_id, intent)?;
         let cfg = self.oplog.load_config()?;
@@ -1497,11 +1704,39 @@ impl Coordinator {
                 .resolve_ref(&format!("refs/heads/{b}"))
                 .ok()
                 .flatten();
-            let resolved_cid = match existing_ref {
-                Some(cid) => Some(cid),
-                None => {
+            let resolved_cid = match (existing_ref, explicit_from_cid) {
+                (_, Some(fcid)) if !meta_now.has_own_changes() => {
+                    let _ = self.git.update_ref(&format!("refs/heads/{b}"), &fcid);
+                    Some(fcid)
+                }
+                (Some(cid), _) => Some(cid),
+                (None, Some(fcid)) => {
+                    let _ = self.git.update_ref(&format!("refs/heads/{b}"), &fcid);
+                    Some(fcid)
+                }
+                (None, None) => {
+                    let remote_ref = self
+                        .git
+                        .resolve_ref(&format!("refs/remotes/origin/{b}"))
+                        .ok()
+                        .flatten();
+                    let session_prev_cid = meta_now
+                        .target_branch
+                        .as_deref()
+                        .filter(|prev_b| *prev_b != b && *prev_b != cfg.trunk_branch)
+                        .and_then(|prev_b| {
+                            self.git
+                                .resolve_ref(&format!("refs/heads/{prev_b}"))
+                                .ok()
+                                .flatten()
+                                .or(Some(meta_now.base_commit))
+                        });
                     let fork_cid = if auto_branch.is_some() {
                         head_cid
+                    } else if remote_ref.is_some() {
+                        remote_ref
+                    } else if session_prev_cid.is_some() {
+                        session_prev_cid
                     } else {
                         self.git
                             .resolve_ref(&format!("refs/heads/{}", cfg.trunk_branch))
@@ -1526,9 +1761,13 @@ impl Coordinator {
             false,
             |view| {
                 if let Some((b, (b_cid, _))) = clean_branch.zip(branch_commit_opt.as_ref()) {
-                    view.branches
-                        .entry(b.to_string())
-                        .or_insert_with(|| *b_cid);
+                    if explicit_from_cid.is_some() && !meta_now.has_own_changes() {
+                        view.branches.insert(b.to_string(), *b_cid);
+                    } else {
+                        view.branches
+                            .entry(b.to_string())
+                            .or_insert_with(|| *b_cid);
+                    }
                 }
 
                 if let Some(agent) = view.agents.get_mut(agent_id) {
@@ -1550,6 +1789,10 @@ impl Coordinator {
                                 agent.base_commit = *b_cid;
                                 agent.head_commit = *b_cid;
                                 agent.head_tree = *b_tid;
+                                if explicit_from_cid.is_some() {
+                                    agent.read_blobs.clear();
+                                    agent.integrated_peer_blobs.clear();
+                                }
                             }
                         }
                     }
@@ -1558,6 +1801,19 @@ impl Coordinator {
                         agent.claimed_symbols.insert(s.clone());
                     }
                     agent.updated_at_ms = now_millis();
+                }
+
+                if let Some(b) = clean_branch {
+                    let b_slot = self.branch_slot(view, b, &cfg.trunk_branch);
+                    if b != cfg.trunk_branch {
+                        for a in view.agents.values_mut() {
+                            if a.target_branch.as_deref() == Some(b) {
+                                a.slot = b_slot;
+                            }
+                        }
+                    } else if let Some(agent) = view.agents.get_mut(agent_id) {
+                        agent.slot = b_slot;
+                    }
                 }
                 Ok(())
             },
@@ -1569,7 +1825,15 @@ impl Coordinator {
 
         for sym in symbols {
             let file_part = sym.split("::").next().unwrap_or(sym.as_str()).trim();
-            if !file_part.is_empty() && self.git.repo_root().join(file_part).is_file() {
+            let exists_on_disk_or_branch = self.git.repo_root().join(file_part).is_file()
+                || branch_commit_opt.as_ref().is_some_and(|(_, b_tid)| {
+                    self.git
+                        .read_tree_entry_at_path(b_tid, file_part)
+                        .ok()
+                        .flatten()
+                        .is_some()
+                });
+            if !file_part.is_empty() && exists_on_disk_or_branch {
                 let _ = handle_pre_tool_hook(self, agent_id, file_part);
             }
         }
@@ -1646,7 +1910,8 @@ impl Coordinator {
     }
 
     /// Switches or binds the specified terminal/agent session (`session_id`) to `branch`,
-    /// creating `refs/heads/<branch>` at `HEAD` if the branch does not exist yet.
+    /// creating `refs/heads/<branch>` at the session's current branch commit (or `HEAD`) if the
+    /// branch does not exist yet.
     ///
     /// Unlike `git checkout`, this does not overwrite `.git/HEAD` for other concurrent terminals
     /// or sessions in the same repository.
@@ -1654,19 +1919,61 @@ impl Coordinator {
     /// # Errors
     /// Returns [`CoreError`] if resolving `HEAD` or updating the `OpLog` fails.
     pub fn switch_branch(&self, session_id: &str, branch: &str) -> CoreResult<AgentMetadata> {
+        self.switch_branch_with_base(session_id, branch, None)
+    }
+
+    /// Switches or binds the specified terminal/agent session (`session_id`) to `branch`,
+    /// optionally forking `branch` from an explicit `from_branch` revision (`--from <base>` or
+    /// `<start-point>`).
+    ///
+    /// # Errors
+    /// Returns [`CoreError`] if `branch` or `from_branch` is invalid/missing or updating the `OpLog` fails.
+    pub fn switch_branch_with_base(
+        &self,
+        session_id: &str,
+        branch: &str,
+        from_branch: Option<&str>,
+    ) -> CoreResult<AgentMetadata> {
         let clean_branch = branch.trim();
         validate_ref_name(clean_branch)?;
+
+        let explicit_from_cid = match from_branch.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(base_spec) => Some(self.git.resolve_revision(base_spec)?),
+            None => None,
+        };
+
         self.reconcile_in_flight_sessions();
-        let _ = self.ensure_session(session_id, None)?;
+        let prev_meta = self.ensure_session(session_id, None)?;
         let ref_name = format!("refs/heads/{clean_branch}");
-        let branch_cid = match self.git.resolve_ref(&ref_name)? {
-            Some(cid) => cid,
-            None => {
-                let target_cid = match self
+        let existing_cid = self.git.resolve_ref(&ref_name)?;
+
+        let branch_cid = match (existing_cid, explicit_from_cid) {
+            (_, Some(from_cid)) if !prev_meta.has_own_changes() => {
+                self.git.update_ref(&ref_name, &from_cid)?;
+                from_cid
+            }
+            (Some(cid), _) => cid,
+            (None, Some(from_cid)) => {
+                self.git.update_ref(&ref_name, &from_cid)?;
+                from_cid
+            }
+            (None, None) => {
+                let remote_cid = self
                     .git
-                    .resolve_ref(&format!("refs/remotes/origin/{clean_branch}"))?
-                {
-                    Some(remote_cid) => remote_cid,
+                    .resolve_ref(&format!("refs/remotes/origin/{clean_branch}"))?;
+                let session_prev_cid = prev_meta
+                    .target_branch
+                    .as_deref()
+                    .filter(|prev_b| *prev_b != clean_branch)
+                    .and_then(|prev_b| {
+                        self.git
+                            .resolve_ref(&format!("refs/heads/{prev_b}"))
+                            .ok()
+                            .flatten()
+                            .or(Some(prev_meta.base_commit))
+                    });
+                let target_cid = match remote_cid.or(session_prev_cid) {
+                    Some(cid) => cid,
                     None => self
                         .git
                         .resolve_head_commit()?
@@ -1709,10 +2016,26 @@ impl Coordinator {
             format!("switch session {session_id} to branch {clean_branch}"),
             false,
             |view| {
-                view.branches
-                    .entry(clean_branch.to_string())
-                    .or_insert_with(|| branch_cid);
+                if explicit_from_cid.is_some() && !caller_has_uncommitted_edits {
+                    view.branches.insert(clean_branch.to_string(), branch_cid);
+                } else {
+                    view.branches
+                        .entry(clean_branch.to_string())
+                        .or_insert_with(|| branch_cid);
+                }
+
+                let target_slot = self.branch_slot(view, clean_branch, &cfg.trunk_branch);
+
+                if clean_branch != cfg.trunk_branch {
+                    for a in view.agents.values_mut() {
+                        if a.target_branch.as_deref() == Some(clean_branch) {
+                            a.slot = target_slot;
+                        }
+                    }
+                }
+
                 if let Some(agent) = view.agents.get_mut(session_id) {
+                    agent.slot = target_slot;
                     agent.target_branch = Some(clean_branch.to_string());
                     if !agent.has_own_changes() {
                         agent.base_commit = branch_cid;
@@ -2064,6 +2387,114 @@ impl Coordinator {
         self.sandboxes_root().join("branches")
     }
 
+    /// Returns the deterministic 1-based slot assigned to `branch`.
+    ///
+    /// The trunk branch (`trunk_branch`) is always assigned slot `1` (`base_port + port_stride`).
+    /// Each non-trunk branch receives a persistent slot `>= 2` stored at
+    /// `<branches_root>/<safe_branch>.slot` so all sessions and dev servers on the same branch
+    /// share a consistent port until the branch is deleted.
+    pub fn branch_slot(&self, view: &View, branch: &str, trunk_branch: &str) -> u16 {
+        let clean = branch.trim();
+        if clean.is_empty() || clean == trunk_branch {
+            return 1;
+        }
+
+        let safe_b = Self::sanitize_branch_name(clean);
+        let slot_file = self.branches_root().join(format!("{safe_b}.slot"));
+        if let Ok(raw) = fs::read_to_string(&slot_file) {
+            if let Ok(parsed) = raw.trim().parse::<u16>() {
+                if parsed >= 2 {
+                    return parsed;
+                }
+            }
+        }
+
+        let mut all_branches: BTreeSet<String> = view.branches.keys().cloned().collect();
+        for git_br in self.git.list_local_branches() {
+            all_branches.insert(git_br);
+        }
+
+        for a in view.agents.values() {
+            if let Some(tb) = &a.target_branch {
+                all_branches.insert(tb.clone());
+            }
+        }
+
+        let mut used_branch_slots = BTreeSet::new();
+        for other_br in &all_branches {
+            if other_br == trunk_branch || other_br == clean {
+                continue;
+            }
+
+            let other_safe = Self::sanitize_branch_name(other_br);
+            let other_file = self.branches_root().join(format!("{other_safe}.slot"));
+            if let Ok(raw) = fs::read_to_string(&other_file) {
+                if let Ok(parsed) = raw.trim().parse::<u16>() {
+                    if parsed >= 2 {
+                        used_branch_slots.insert(parsed);
+                    }
+                }
+            }
+        }
+
+        let assigned = (2u16..=u16::MAX)
+            .find(|s| !used_branch_slots.contains(s))
+            .unwrap_or(2);
+        let _ = atomic_write_file(&slot_file, assigned.to_string().as_bytes());
+        assigned
+    }
+
+    /// Returns the lowest active TCP port currently leased in `<sandboxes_root>/bin/.leases/`
+    /// by a live process running on `branch`, if any.
+    pub fn active_leased_port_for_branch(&self, branch: &str, trunk_branch: &str) -> Option<u16> {
+        let leases_dir = self.sandboxes_root().join("bin").join(".leases");
+        let entries = fs::read_dir(&leases_dir).ok()?;
+        let branch_ws = if branch == trunk_branch {
+            self.git.repo_root().to_path_buf()
+        } else {
+            self.branch_sandbox_dir(branch)
+        };
+        let branch_ws_str = branch_ws.display().to_string();
+        let alt_ws_str = self.branch_sandbox_dir(branch).display().to_string();
+
+        let mut matched_ports = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+
+            let Some(port_num) = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|s| s.parse::<u16>().ok())
+            else {
+                continue;
+            };
+
+            let pid_str = fs::read_to_string(path.join("pid")).unwrap_or_default();
+            let Ok(pid) = pid_str.trim().parse::<i32>() else {
+                continue;
+            };
+
+            if !crate::autopilot::is_process_alive(pid) {
+                continue;
+            }
+
+            let leased_branch = fs::read_to_string(path.join("branch")).unwrap_or_default();
+            let leased_ws = fs::read_to_string(path.join("workspace")).unwrap_or_default();
+            let lb = leased_branch.trim();
+            let lw = leased_ws.trim();
+
+            if lb == branch || (!lw.is_empty() && (lw == branch_ws_str || lw == alt_ws_str)) {
+                matched_ports.push(port_num);
+            }
+        }
+
+        matched_ports.sort_unstable();
+        matched_ports.into_iter().next()
+    }
+
     /// Returns the Copy-on-Write sandbox directory for `branch`, automatically migrating any
     /// legacy `.git/tessera/branches/<safe_branch>` directory if present.
     pub fn branch_sandbox_dir(&self, branch: &str) -> PathBuf {
@@ -2287,6 +2718,17 @@ impl Coordinator {
                         continue;
                     }
 
+                    let owned_on_target = current.view.agents.values().any(|a| {
+                        let eff_b = a.effective_branch(current_head_branch.as_str());
+                        eff_b == target_branch && a.own_blobs.contains_key(rel_path)
+                    });
+                    if target_branch == current_head_branch
+                        && self.invocation_dir.is_none()
+                        && owned_on_target
+                    {
+                        continue;
+                    }
+
                     let changed_since_stamp = stamped_tree_map
                         .get(rel_path)
                         .map(|e| (&e.blob_id, e.executable))
@@ -2460,6 +2902,9 @@ impl Coordinator {
 
         let mut env_meta = meta;
         env_meta.target_branch = Some(target_branch.clone());
+        if target_branch != cfg.trunk_branch {
+            env_meta.slot = self.branch_slot(&current.view, &target_branch, &cfg.trunk_branch);
+        }
         let mut env_map = build_agent_env_with_config(&env_meta, &cfg, &branch_ws_dir);
         env_map.insert("TES_BRANCH".to_string(), target_branch.clone());
         env_map.insert(
@@ -3032,49 +3477,68 @@ impl Coordinator {
 
         let mut outcomes = Vec::new();
         for (rel_path, entry) in &snap.files {
-            if base_files.get(rel_path).map(|e| &e.blob_id) == Some(&entry.blob_id) {
-                continue;
-            }
-
-            if meta.own_blobs.get(rel_path) == Some(&entry.blob_id) {
-                continue;
-            }
-
-            let baseline_blob = meta
-                .read_blobs
-                .get(rel_path)
-                .or_else(|| base_files.get(rel_path).map(|e| &e.blob_id));
-            if baseline_blob == Some(&entry.blob_id) {
-                continue;
-            }
-
-            if committed_branch_trees
-                .iter()
-                .any(|bm| bm.get(rel_path).map(|e| &e.blob_id) == Some(&entry.blob_id))
-            {
-                continue;
-            }
-
-            // If this exact disk blob was already reconciled by a previous `post-tool` hook, skip it.
-            let already_reconciled = current
-                .view
-                .observed_blobs
-                .get(rel_path)
-                .and_then(|v| v.last())
-                == Some(&entry.blob_id)
-                || current
+            let claimed_by_me = session_claims_path(&meta, rel_path, &base_files);
+            let has_unreconciled_observed_blob = !meta.own_blobs.contains_key(rel_path)
+                && claimed_by_me
+                && current
                     .view
-                    .agents
-                    .values()
-                    .any(|a| a.own_blobs.get(rel_path) == Some(&entry.blob_id));
-            if already_reconciled {
-                continue;
+                    .observed_blobs
+                    .get(rel_path)
+                    .is_some_and(|obs_list| {
+                        obs_list.iter().any(|obs_b| {
+                            base_files.get(rel_path).map(|e| &e.blob_id) != Some(obs_b)
+                                && meta.read_blobs.get(rel_path) != Some(obs_b)
+                                && !committed_branch_trees
+                                    .iter()
+                                    .any(|bm| bm.get(rel_path).map(|e| &e.blob_id) == Some(obs_b))
+                                && !current
+                                    .view
+                                    .agents
+                                    .values()
+                                    .any(|a| a.own_blobs.get(rel_path) == Some(obs_b))
+                        })
+                    });
+
+            if !has_unreconciled_observed_blob {
+                if base_files.get(rel_path).map(|e| &e.blob_id) == Some(&entry.blob_id) {
+                    continue;
+                }
+
+                if meta.own_blobs.get(rel_path) == Some(&entry.blob_id) {
+                    continue;
+                }
+
+                let baseline_blob = meta
+                    .read_blobs
+                    .get(rel_path)
+                    .or_else(|| base_files.get(rel_path).map(|e| &e.blob_id));
+                if baseline_blob == Some(&entry.blob_id) {
+                    continue;
+                }
+
+                if committed_branch_trees
+                    .iter()
+                    .any(|bm| bm.get(rel_path).map(|e| &e.blob_id) == Some(&entry.blob_id))
+                {
+                    continue;
+                }
+
+                // If this exact disk blob was already reconciled into an active session's `own_blobs`
+                // (or is the post-hook merged `read_blobs` baseline of a session that already owns `rel_path`),
+                // skip it so we do not re-run `post-tool` on an already-reconciled file.
+                let already_reconciled = current.view.agents.values().any(|a| {
+                    a.own_blobs.get(rel_path) == Some(&entry.blob_id)
+                        || (a.owns_path(rel_path)
+                            && a.read_blobs.get(rel_path) == Some(&entry.blob_id))
+                });
+                if already_reconciled {
+                    continue;
+                }
             }
 
             // If this session has explicit claims and did not claim `rel_path`, while another active
             // session did claim `rel_path` (or this session targets a non-HEAD branch), do not steal
             // unclaimed working-tree files from `repo_root`.
-            let claimed_by_me = session_claims_path(&meta, rel_path, &base_files);
             let claimed_by_other = current.view.agents.values().any(|a| {
                 a.agent_id != session_id && session_claims_path(a, rel_path, &base_files)
             });
@@ -3285,6 +3749,7 @@ impl Coordinator {
             Some(raw) if !raw.trim().is_empty() => Some(validate_author_override(raw)?),
             _ => None,
         };
+        self.reconcile_in_flight_sessions();
         let cfg = self.oplog.load_config()?;
         let current = self.oplog.load_current_reconciled()?;
         let caller_id = detect_session_id(None);
@@ -4518,12 +4983,28 @@ impl Coordinator {
                         && a.workspace_path.is_none();
 
                     if is_passive {
-                        a.target_branch = Some(current_head_branch.clone());
-                        a.base_commit = head_branch_cid;
-                        a.head_commit = head_branch_cid;
-                        a.head_tree = head_branch_tree;
-                        a.read_blobs.clear();
-                        a.integrated_peer_blobs.clear();
+                        if a.agent_id == "editor"
+                            || a.target_branch
+                                .as_deref()
+                                .is_none_or(|tb| tb == cfg.trunk_branch)
+                        {
+                            a.target_branch = Some(current_head_branch.clone());
+                            a.base_commit = head_branch_cid;
+                            a.head_commit = head_branch_cid;
+                            a.head_tree = head_branch_tree;
+                            a.read_blobs.clear();
+                            a.integrated_peer_blobs.clear();
+                        } else if let Some(ref tb) = a.target_branch {
+                            if let Some(&tb_cid) = git_branches.get(tb) {
+                                if let Ok(tb_commit) = self.git.read_commit(&tb_cid) {
+                                    a.base_commit = tb_cid;
+                                    a.head_commit = tb_cid;
+                                    a.head_tree = tb_commit.tree_id;
+                                    a.read_blobs.clear();
+                                    a.integrated_peer_blobs.clear();
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -5459,6 +5940,11 @@ impl Coordinator {
             let _ = fs::remove_file(&stamp_file);
         }
 
+        let slot_file = self.branches_root().join(format!("{safe_b}.slot"));
+        if slot_file.exists() {
+            let _ = fs::remove_file(&slot_file);
+        }
+
         let legacy_dir = self.git.git_dir().join("tessera").join("branches").join(&safe_b);
         if legacy_dir.exists() {
             let _ = fs::remove_dir_all(&legacy_dir);
@@ -5476,6 +5962,7 @@ impl Coordinator {
 
                 for (aid, agent) in view.agents.iter_mut() {
                     if agent.target_branch.as_deref() == Some(clean_branch) {
+                        agent.slot = 1;
                         agent.target_branch = None;
                         agent.base_commit = trunk_cid;
                         agent.head_commit = trunk_cid;
@@ -5577,6 +6064,13 @@ impl Coordinator {
 
         if old_stamp.is_file() {
             let _ = fs::rename(&old_stamp, &new_stamp);
+        }
+
+        let old_slot = self.branches_root().join(format!("{safe_old}.slot"));
+        let new_slot = self.branches_root().join(format!("{safe_new}.slot"));
+
+        if old_slot.is_file() {
+            let _ = fs::rename(&old_slot, &new_slot);
         }
 
         self.oplog.record_tx(

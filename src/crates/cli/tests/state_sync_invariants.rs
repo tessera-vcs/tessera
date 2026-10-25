@@ -1458,6 +1458,7 @@ fn slot_reuse_and_polyglot_port_isolation_across_shells_and_dev_servers() {
                 .env("PORT", port)
                 .env("TES_PORT", port)
                 .env("TES_PORT_ISOLATION", "1")
+                .env("TES_SKIP_TCP_PROBE", "1")
                 .args(args)
                 .output()
                 .expect("run shimmed binary");
@@ -1588,5 +1589,133 @@ fn slot_reuse_and_polyglot_port_isolation_across_shells_and_dev_servers() {
             "second concurrent server in the same session must step to 3101 when 3100 is leased"
         );
         let _ = fs::remove_file(lease_dir.join("pid"));
+    }
+}
+
+#[test]
+fn cross_branch_watcher_restored_baseline_preserves_both_sessions_and_multiline_zsh_paste_hops() {
+    let base_app = "<script setup lang=\"ts\">\nimport HelloWorld from './components/HelloWorld.vue'\n</script>\n\n<template>\n  <HelloWorld />\n</template>\n";
+    let repo = Repo::new(&[("src/App.vue", base_app, false)]);
+
+    repo.tes(
+        "habit",
+        &[
+            "claim",
+            "--branch",
+            "feat/habit-tracker",
+            "--intent",
+            "Add HabitTracker component with daily habits and streak counter",
+            "src/App.vue",
+        ],
+    );
+
+    repo.tes(
+        "pomodoro",
+        &[
+            "claim",
+            "--branch",
+            "feat/pomodoro-timer",
+            "--intent",
+            "Build PomodoroTimer component with focus and break countdown",
+            "src/App.vue",
+        ],
+    );
+
+    repo.tes("habit", &["hook", "pre-tool", "--path", "src/App.vue"]);
+    repo.tes("pomodoro", &["hook", "pre-tool", "--path", "src/App.vue"]);
+
+    let habit_app = "<script setup lang=\"ts\">\nimport HelloWorld from './components/HelloWorld.vue'\nimport HabitTracker from './components/HabitTracker.vue'\n</script>\n\n<template>\n  <HelloWorld />\n  <HabitTracker />\n</template>\n";
+    let pomodoro_app = "<script setup lang=\"ts\">\nimport HelloWorld from './components/HelloWorld.vue'\nimport PomodoroTimer from './components/PomodoroTimer.vue'\n</script>\n\n<template>\n  <HelloWorld />\n  <PomodoroTimer />\n</template>\n";
+
+    {
+        let coord = agent::Coordinator::open(&repo.root).expect("open coordinator");
+        let base_bid = coord
+            .git()
+            .write_blob(base_app.as_bytes())
+            .expect("write base blob");
+        let habit_bid = coord
+            .git()
+            .write_blob(habit_app.as_bytes())
+            .expect("write habit blob");
+        let pomo_bid = coord
+            .git()
+            .write_blob(pomodoro_app.as_bytes())
+            .expect("write pomodoro blob");
+
+        coord
+            .oplog()
+            .record_tx(
+                "watcher",
+                "observe intermediate blobs for src/App.vue",
+                true,
+                |view| {
+                    view.observed_blobs.insert(
+                        "src/App.vue".to_string(),
+                        vec![base_bid, habit_bid, pomo_bid],
+                    );
+                    Ok(())
+                },
+            )
+            .expect("record observed blobs");
+    }
+
+    repo.write("src/App.vue", base_app);
+
+    repo.hook("pomodoro", "src/App.vue");
+    repo.hook("habit", "src/App.vue");
+
+    repo.tes("pomodoro", &["commit", "-m", "feat: add pomodoro timer"]);
+    repo.tes("habit", &["commit", "-m", "feat: add habit tracker"]);
+
+    #[cfg(unix)]
+    if Path::new("/bin/zsh").is_file() {
+        let bin = Path::new(env!("CARGO_BIN_EXE_tes"));
+        let bin_dir = bin
+            .parent()
+            .expect("tes bin parent")
+            .display()
+            .to_string();
+        let zsh_script = r#"
+            eval "$("$TES_BIN" env --zsh)"
+            _tes_preexec $'tes switch feat/habit-tracker\nnode -v'
+            tes switch feat/habit-tracker >/dev/null
+            echo "AFTER_MULTILINE_DEV=$PWD"
+            _tes_precmd
+            echo "AFTER_PRECMD=$PWD"
+            _tes_preexec $'tes switch feat/pomodoro-timer\nagy'
+            tes switch feat/pomodoro-timer >/dev/null
+            echo "AFTER_MULTILINE_AGY=$PWD"
+        "#;
+
+        let out = Command::new("/bin/zsh")
+            .args(["-c", zsh_script])
+            .current_dir(&repo.root)
+            .env("TES_BIN", bin)
+            .env(
+                "PATH",
+                format!(
+                    "{bin_dir}:{}",
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .output()
+            .expect("run zsh multiline test");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "zsh multiline script failed: stdout={stdout} stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            stdout.contains("branches/feat-habit-tracker"),
+            "multiline `tes switch feat/habit-tracker\\nnode -v` must hop into branch sandbox: {stdout}"
+        );
+
+        let canonical_root = fs::canonicalize(&repo.root).unwrap_or_else(|_| repo.root.clone());
+        assert!(
+            stdout.contains(&format!("AFTER_MULTILINE_AGY={}", repo.root.display()))
+                || stdout.contains(&format!("AFTER_MULTILINE_AGY={}", canonical_root.display())),
+            "multiline `tes switch feat/pomodoro-timer\\nagy` must keep PWD at repo_root: {stdout}"
+        );
     }
 }

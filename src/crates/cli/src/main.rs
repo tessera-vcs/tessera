@@ -561,6 +561,9 @@ enum Commands {
         /// Optional target Git branch for this session (e.g., `feat/locale`).
         #[arg(short = 'b', long)]
         branch: Option<String>,
+        /// Optional parent branch or revision to fork `--branch` from (e.g., `feat/parent`).
+        #[arg(long, visible_alias = "base")]
+        from: Option<String>,
         /// Optional explicit agent/session ID.
         #[arg(long)]
         agent: Option<String>,
@@ -836,9 +839,11 @@ enum Commands {
         /// Optional explicit session ID.
         #[arg(short = 'a', long, visible_alias = "agent")]
         session: Option<String>,
-        /// Optional file path for `pre-tool` / `post-tool`.
-        #[arg(long)]
-        path: Option<String>,
+        /// Optional file path(s) for `pre-tool` / `post-tool`.
+        #[arg(long, num_args = 1..)]
+        path: Vec<String>,
+        /// Optional positional file path(s) for `pre-tool` / `post-tool`.
+        paths: Vec<String>,
         /// Optional prompt text for `prompt`.
         #[arg(long)]
         prompt: Option<String>,
@@ -875,11 +880,16 @@ enum Commands {
     /// Switch or bind the current terminal/session to a specific branch without altering `.git/HEAD` for other sessions.
     #[command(alias = "checkout")]
     Switch {
-        /// Target branch name (created from HEAD if it does not exist yet; omit to display the current branch).
+        /// Target branch name (or start-point when paired with `-b`/`-c <new-branch>`).
         branch: Option<String>,
+        /// Optional parent branch or start-point when creating a branch (`tes switch <new-branch> <start-point>`).
+        start_point: Option<String>,
         /// Create or switch to a branch (`-b <branch>` or `-c <branch>`).
         #[arg(short = 'b', short_alias = 'c', long = "create")]
         create: Option<String>,
+        /// Optional parent branch or revision to fork from (`--from <base>`).
+        #[arg(long, visible_alias = "base")]
+        from: Option<String>,
         /// Switch the primary editor working tree (`repo_root` and `.git/HEAD`) to `<branch>` while keeping terminal sandboxes isolated.
         #[arg(short = 'e', long)]
         editor: bool,
@@ -1840,16 +1850,18 @@ fn run_cli() -> anyhow::Result<()> {
         Commands::Claim {
             intent,
             branch,
+            from,
             agent,
             symbols,
         } => {
             let coord = Coordinator::open(&cwd)?;
             let session_id = detect_session_id(agent.as_deref());
-            let meta = coord.claim_intent_and_symbols_with_branch(
+            let meta = coord.claim_intent_and_symbols_with_branch_and_base(
                 &session_id,
                 intent.as_deref(),
                 &symbols,
                 branch.as_deref(),
+                from.as_deref(),
             )?;
 
             if cli.json {
@@ -2570,9 +2582,11 @@ fn run_cli() -> anyhow::Result<()> {
         Commands::Hook {
             event,
             session,
-            path,
+            mut path,
+            paths,
             prompt,
         } => {
+            path.extend(paths);
             handle_cli_hook(&cwd, &event, session, path, prompt, cli.json)?;
         }
         Commands::Branch {
@@ -2723,14 +2737,20 @@ fn run_cli() -> anyhow::Result<()> {
                 }
 
                 if cli.json {
-                    let main_files = coord
+                    let trunk_cid_opt = coord
                         .git()
                         .resolve_ref(&format!("refs/heads/{}", cfg.trunk_branch))
                         .ok()
-                        .flatten()
+                        .flatten();
+                    let main_files = trunk_cid_opt
                         .and_then(|cid| coord.git().read_commit(&cid).ok())
                         .and_then(|c| coord.git().read_tree_to_map(&c.tree_id).ok())
                         .unwrap_or_default();
+                    let stride = if cfg.port_stride == 0 {
+                        100
+                    } else {
+                        cfg.port_stride
+                    };
 
                     let mut branch_details = Vec::new();
                     for br in &all_branches {
@@ -2750,20 +2770,45 @@ fn run_cli() -> anyhow::Result<()> {
                             .unwrap_or_default();
 
                         let mut modified_files = std::collections::BTreeSet::new();
-                        if let Some(cid) = &cid_opt {
-                            if let Ok(c) = coord.git().read_commit(cid) {
-                                if let Ok(br_files) = coord.git().read_tree_to_map(&c.tree_id) {
-                                    for (p, entry) in &br_files {
-                                        if main_files.get(p).map(|e| &e.blob_id)
-                                            != Some(&entry.blob_id)
-                                        {
-                                            modified_files.insert(p.clone());
-                                        }
-                                    }
+                        if *br != cfg.trunk_branch {
+                            if let Some(cid) = &cid_opt {
+                                if let Ok(c) = coord.git().read_commit(cid) {
+                                    let base_files = trunk_cid_opt
+                                        .and_then(|t_cid| {
+                                            std::process::Command::new("git")
+                                                .env_remove("GIT_DIR")
+                                                .env_remove("GIT_WORK_TREE")
+                                                .current_dir(coord.git().repo_root())
+                                                .args(["merge-base", t_cid.as_str(), cid.as_str()])
+                                                .output()
+                                                .ok()
+                                                .filter(|o| o.status.success())
+                                                .and_then(|o| {
+                                                    core::ObjectId::from_hex(
+                                                        String::from_utf8_lossy(&o.stdout).trim(),
+                                                    )
+                                                    .ok()
+                                                })
+                                        })
+                                        .filter(|mb_cid| mb_cid != cid)
+                                        .or_else(|| c.parents.first().copied())
+                                        .and_then(|b_cid| coord.git().read_commit(&b_cid).ok())
+                                        .and_then(|bc| coord.git().read_tree_to_map(&bc.tree_id).ok())
+                                        .unwrap_or_else(|| main_files.clone());
 
-                                    for p in main_files.keys() {
-                                        if !br_files.contains_key(p) {
-                                            modified_files.insert(p.clone());
+                                    if let Ok(br_files) = coord.git().read_tree_to_map(&c.tree_id) {
+                                        for (p, entry) in &br_files {
+                                            if base_files.get(p).map(|e| &e.blob_id)
+                                                != Some(&entry.blob_id)
+                                            {
+                                                modified_files.insert(p.clone());
+                                            }
+                                        }
+
+                                        for p in base_files.keys() {
+                                            if !br_files.contains_key(p) {
+                                                modified_files.insert(p.clone());
+                                            }
                                         }
                                     }
                                 }
@@ -2771,17 +2816,22 @@ fn run_cli() -> anyhow::Result<()> {
                         }
 
                         let mut sessions = Vec::new();
-                        let mut port = cfg.base_port;
                         for (aid, a) in &current.view.agents {
                             let a_br = a.target_branch.as_deref().unwrap_or(&editor_branch);
                             if a_br == br {
                                 sessions.push(aid.clone());
-                                port = cfg.base_port + a.slot.saturating_mul(cfg.port_stride);
                                 for p in a.own_blobs.keys() {
                                     modified_files.insert(p.clone());
                                 }
                             }
                         }
+
+                        let br_slot = coord.branch_slot(&current.view, br, &cfg.trunk_branch);
+                        let port = coord
+                            .active_leased_port_for_branch(br, &cfg.trunk_branch)
+                            .unwrap_or_else(|| {
+                                cfg.base_port.saturating_add(br_slot.saturating_mul(stride))
+                            });
 
                         let ws_dir = coord.branch_sandbox_dir(br);
                         branch_details.push(json!({
@@ -2882,14 +2932,27 @@ fn run_cli() -> anyhow::Result<()> {
         }
         Commands::Switch {
             branch,
+            start_point,
             create,
+            from,
             editor,
             agent,
         } => {
             let coord = Coordinator::open(&cwd)?;
             let session_id = detect_session_id(agent.as_deref());
-            if let Some(target_br) = create.or(branch) {
+            let (target_opt, base_opt) = match create {
+                Some(new_br) => (Some(new_br), from.or(branch).or(start_point)),
+                None => (branch, from.or(start_point)),
+            };
+            if let Some(target_br) = target_opt {
                 if editor {
+                    if let Some(base_ref) = base_opt.as_deref() {
+                        let _ = coord.switch_branch_with_base(
+                            &session_id,
+                            &target_br,
+                            Some(base_ref),
+                        )?;
+                    }
                     let switched = coord.switch_editor_branch(&target_br)?;
                     let should_bind_caller = session_id != "editor"
                         && (agent.is_some()
@@ -2919,7 +2982,11 @@ fn run_cli() -> anyhow::Result<()> {
                         );
                     }
                 } else {
-                    let meta = coord.switch_branch(&session_id, &target_br)?;
+                    let meta = coord.switch_branch_with_base(
+                        &session_id,
+                        &target_br,
+                        base_opt.as_deref(),
+                    )?;
 
                     if cli.json {
                         println!("{}", serde_json::to_string_pretty(&meta)?);
@@ -2966,14 +3033,20 @@ fn run_cli() -> anyhow::Result<()> {
                 }
 
                 if cli.json {
-                    let main_files = coord
+                    let trunk_cid_opt = coord
                         .git()
                         .resolve_ref(&format!("refs/heads/{}", cfg.trunk_branch))
                         .ok()
-                        .flatten()
+                        .flatten();
+                    let main_files = trunk_cid_opt
                         .and_then(|cid| coord.git().read_commit(&cid).ok())
                         .and_then(|c| coord.git().read_tree_to_map(&c.tree_id).ok())
                         .unwrap_or_default();
+                    let stride = if cfg.port_stride == 0 {
+                        100
+                    } else {
+                        cfg.port_stride
+                    };
 
                     let mut branch_details = Vec::new();
                     for br in &all_branches {
@@ -2993,20 +3066,45 @@ fn run_cli() -> anyhow::Result<()> {
                             .unwrap_or_default();
 
                         let mut modified_files = std::collections::BTreeSet::new();
-                        if let Some(cid) = &cid_opt {
-                            if let Ok(c) = coord.git().read_commit(cid) {
-                                if let Ok(br_files) = coord.git().read_tree_to_map(&c.tree_id) {
-                                    for (p, entry) in &br_files {
-                                        if main_files.get(p).map(|e| &e.blob_id)
-                                            != Some(&entry.blob_id)
-                                        {
-                                            modified_files.insert(p.clone());
-                                        }
-                                    }
+                        if *br != cfg.trunk_branch {
+                            if let Some(cid) = &cid_opt {
+                                if let Ok(c) = coord.git().read_commit(cid) {
+                                    let base_files = trunk_cid_opt
+                                        .and_then(|t_cid| {
+                                            std::process::Command::new("git")
+                                                .env_remove("GIT_DIR")
+                                                .env_remove("GIT_WORK_TREE")
+                                                .current_dir(coord.git().repo_root())
+                                                .args(["merge-base", t_cid.as_str(), cid.as_str()])
+                                                .output()
+                                                .ok()
+                                                .filter(|o| o.status.success())
+                                                .and_then(|o| {
+                                                    core::ObjectId::from_hex(
+                                                        String::from_utf8_lossy(&o.stdout).trim(),
+                                                    )
+                                                    .ok()
+                                                })
+                                        })
+                                        .filter(|mb_cid| mb_cid != cid)
+                                        .or_else(|| c.parents.first().copied())
+                                        .and_then(|b_cid| coord.git().read_commit(&b_cid).ok())
+                                        .and_then(|bc| coord.git().read_tree_to_map(&bc.tree_id).ok())
+                                        .unwrap_or_else(|| main_files.clone());
 
-                                    for p in main_files.keys() {
-                                        if !br_files.contains_key(p) {
-                                            modified_files.insert(p.clone());
+                                    if let Ok(br_files) = coord.git().read_tree_to_map(&c.tree_id) {
+                                        for (p, entry) in &br_files {
+                                            if base_files.get(p).map(|e| &e.blob_id)
+                                                != Some(&entry.blob_id)
+                                            {
+                                                modified_files.insert(p.clone());
+                                            }
+                                        }
+
+                                        for p in base_files.keys() {
+                                            if !br_files.contains_key(p) {
+                                                modified_files.insert(p.clone());
+                                            }
                                         }
                                     }
                                 }
@@ -3014,17 +3112,22 @@ fn run_cli() -> anyhow::Result<()> {
                         }
 
                         let mut sessions = Vec::new();
-                        let mut port = cfg.base_port;
                         for (aid, a) in &current.view.agents {
                             let a_br = a.target_branch.as_deref().unwrap_or(&editor_branch);
                             if a_br == br {
                                 sessions.push(aid.clone());
-                                port = cfg.base_port + a.slot.saturating_mul(cfg.port_stride);
                                 for p in a.own_blobs.keys() {
                                     modified_files.insert(p.clone());
                                 }
                             }
                         }
+
+                        let br_slot = coord.branch_slot(&current.view, br, &cfg.trunk_branch);
+                        let port = coord
+                            .active_leased_port_for_branch(br, &cfg.trunk_branch)
+                            .unwrap_or_else(|| {
+                                cfg.base_port.saturating_add(br_slot.saturating_mul(stride))
+                            });
 
                         let ws_dir = coord.branch_sandbox_dir(br);
                         branch_details.push(json!({
@@ -3202,7 +3305,17 @@ fn run_cli() -> anyhow::Result<()> {
                 }
             } else if zsh {
                 let zsh_plugin = r#"# Tessera branch prompt & tab-completion integration for Zsh (Powerlevel10k, Oh My Zsh, Starship, standard Zsh)
-export TES_SESSION_ID="term-$$"
+_tes_init_session() {
+  local cur_tty="${TTY:-}"
+  if [[ -z "$cur_tty" ]]; then
+    cur_tty="$(tty 2>/dev/null)"
+  fi
+  if [[ -z "$TES_SESSION_ID" || "$TES_SESSION_ID" != term-* || -z "$cur_tty" || "$cur_tty" == "not a tty" || "$_TES_SESSION_TTY" != "$cur_tty" ]]; then
+    export _TES_SESSION_TTY="$cur_tty"
+    export TES_SESSION_ID="term-$$"
+  fi
+}
+_tes_init_session
 setopt PROMPT_SUBST
 
 tes_prompt_info() {
@@ -3218,36 +3331,99 @@ prompt_tes() {
   fi
 }
 
+_tes_restore_repo_pwd() {
+  if [[ -n "$_TES_PREV_PWD" ]]; then
+    if [[ -d "$_TES_PREV_PWD" && ! -f "$_TES_PREV_PWD/.tessera/repo_root" ]]; then
+      builtin cd -q "$_TES_PREV_PWD"
+      unset _TES_PREV_PWD
+      return
+    fi
+    unset _TES_PREV_PWD
+  fi
+  local check_dir="$PWD"
+  local depth=0
+  while [[ -n "$check_dir" && "$check_dir" != "/" && $depth -lt 8 ]]; do
+    if [[ -d "$check_dir/.git" || ( "${check_dir:t}" == "tmp" && "${check_dir:h:t}" == ".tessera" ) ]]; then
+      return
+    fi
+    if [[ -f "$check_dir/.tessera/repo_root" && ! -L "$check_dir/.tessera/repo_root" ]]; then
+      local root_dir="$(<"$check_dir/.tessera/repo_root")"
+      if [[ -n "$root_dir" && -d "$root_dir/.git/tessera" ]]; then
+        local rel_sub="${PWD#$check_dir}"
+        if [[ -n "$rel_sub" && -d "${root_dir}${rel_sub}" ]]; then
+          builtin cd -q "${root_dir}${rel_sub}"
+        else
+          builtin cd -q "$root_dir"
+        fi
+        return
+      fi
+    fi
+    check_dir="${check_dir:h}"
+    (( depth++ ))
+  done
+}
+
 _tes_preexec() {
-  if [[ "$1" == tes\ * || "$1" == "tes" || "$1" == git\ * || "$1" == "git" || "$1" == cd\ * || "$1" == "cd" ]]; then
+  unset _TES_CHAINED_AFTER_TES
+  _tes_restore_repo_pwd
+  local norm_line="${1//&&/;}"
+  norm_line="${norm_line//\|\|/;}"
+  local saw_tes=0
+  local need_ws_after_tes=0
+  local need_ws_now=0
+  local line seg w
+  for line in "${(@f)norm_line}"; do
+    for seg in "${(@s:;:)line}"; do
+      seg="${seg#"${seg%%[![:space:]]*}"}"
+      [[ -z "$seg" ]] && continue
+      w="${seg%%[[:space:]]*}"
+      w="${w##*/}"
+      case "$w" in
+        tes)
+          saw_tes=1
+          need_ws_after_tes=0
+          ;;
+        git|cd|pushd|popd|pwd|dirs|agy|agy-*|antigravity|antigravity-*|code|code-insiders|codium|cursor|cursor-agent|windsurf|zed|kiro|kiro-cli|claude|claude-code|codex|opencode|aider|aider-chat|gemini|gemini-cli|copilot|amp|goose|crush|auggie|augment|droid|cline|roo|continue|openhands|plandex|mentat|q|subl|idea|webstorm|pycharm|goland|rustrover|clion|fleet|open|eval|source|.|export|unset|alias|unalias|which|type|clear|reset|exit|logout|jobs|fg|bg|disown|wait|kill|killall|pkill|ps|lsof|top|htop|_tes_*|tes_prompt_info*)
+          ;;
+        *)
+          if (( saw_tes )); then
+            need_ws_after_tes=1
+          else
+            need_ws_now=1
+          fi
+          ;;
+      esac
+    done
+  done
+  if (( need_ws_after_tes )); then
+    _TES_CHAINED_AFTER_TES=1
+    return
+  fi
+  if (( ! need_ws_now )); then
     return
   fi
   local phys_pwd="${PWD:A}"
-  if [[ -n "$TES_WORKSPACE" && -d "$TES_WORKSPACE" && -n "$TES_REPO_ROOT" && "$TES_WORKSPACE" != "$TES_REPO_ROOT" && -d "$TES_REPO_ROOT/.git/tessera" && "$phys_pwd" == "$TES_REPO_ROOT"* ]]; then
-    _TES_PREV_PWD="$PWD"
-    local rel_sub="${phys_pwd#$TES_REPO_ROOT}"
-    if [[ -d "${TES_WORKSPACE}${rel_sub}" ]]; then
-      builtin cd -q "${TES_WORKSPACE}${rel_sub}"
-    else
-      builtin cd -q "$TES_WORKSPACE"
+  if [[ -n "$TES_WORKSPACE" && -n "$TES_REPO_ROOT" && "$TES_WORKSPACE" != "$TES_REPO_ROOT" && -d "$TES_REPO_ROOT/.git/tessera" && "$phys_pwd" == "$TES_REPO_ROOT"* ]]; then
+    local env_out
+    if command -v tes >/dev/null 2>&1 && env_out="$(_TES_IN_PREEXEC=1 command tes env 2>/dev/null)" && [[ -n "$env_out" ]]; then
+      eval "$env_out"
+    fi
+    if [[ -n "$TES_WORKSPACE" && -d "$TES_WORKSPACE" && "$TES_WORKSPACE" != "$TES_REPO_ROOT" ]]; then
+      _TES_PREV_PWD="$PWD"
+      local rel_sub="${phys_pwd#$TES_REPO_ROOT}"
+      if [[ -d "${TES_WORKSPACE}${rel_sub}" ]]; then
+        builtin cd -q "${TES_WORKSPACE}${rel_sub}"
+      else
+        builtin cd -q "$TES_WORKSPACE"
+      fi
     fi
   fi
 }
 
 _tes_precmd() {
-  export TES_SESSION_ID="term-$$"
-  if [[ -n "$_TES_PREV_PWD" ]]; then
-    if [[ -d "$_TES_PREV_PWD" ]]; then
-      builtin cd -q "$_TES_PREV_PWD"
-    fi
-    unset _TES_PREV_PWD
-  elif [[ -n "$TES_WORKSPACE" && "$PWD" == "$TES_WORKSPACE"* && -f "$PWD/.tessera/repo_root" && ! -L "$PWD/.tessera/repo_root" ]]; then
-    local root_dir
-    root_dir="$(<"$PWD/.tessera/repo_root")"
-    if [[ -n "$root_dir" && -d "$root_dir/.git/tessera" ]]; then
-      builtin cd -q "$root_dir"
-    fi
-  fi
+  _tes_init_session
+  unset _TES_CHAINED_AFTER_TES
+  _tes_restore_repo_pwd
   local env_out
   if command -v tes >/dev/null 2>&1 && env_out="$(command tes env 2>/dev/null)" && [[ -n "$env_out" ]]; then
     eval "$env_out"
@@ -3265,11 +3441,26 @@ _tes_ensure_prompt() {
 }
 
 tes() {
-  export TES_SESSION_ID="term-$$"
+  _tes_init_session
+  local chained="$_TES_CHAINED_AFTER_TES"
+  _tes_restore_repo_pwd
   command tes "$@"
   local ret=$?
   if [[ "$1" != "env" ]]; then
     _tes_precmd
+    if [[ -n "$chained" ]]; then
+      _TES_CHAINED_AFTER_TES=1
+      local phys_pwd="${PWD:A}"
+      if [[ -n "$TES_WORKSPACE" && -d "$TES_WORKSPACE" && -n "$TES_REPO_ROOT" && "$TES_WORKSPACE" != "$TES_REPO_ROOT" && -d "$TES_REPO_ROOT/.git/tessera" && "$phys_pwd" == "$TES_REPO_ROOT"* ]]; then
+        _TES_PREV_PWD="$PWD"
+        local rel_sub="${phys_pwd#$TES_REPO_ROOT}"
+        if [[ -d "${TES_WORKSPACE}${rel_sub}" ]]; then
+          builtin cd -q "${TES_WORKSPACE}${rel_sub}"
+        else
+          builtin cd -q "$TES_WORKSPACE"
+        fi
+      fi
+    fi
   fi
   return $ret
 }
@@ -3324,24 +3515,67 @@ tes_prompt_info() {
   fi
 }
 
+_tes_restore_repo_pwd() {
+  if [ -n "$_TES_PREV_PWD" ]; then
+    if [ -d "$_TES_PREV_PWD" ] && [ ! -f "$_TES_PREV_PWD/.tessera/repo_root" ]; then
+      builtin cd "$_TES_PREV_PWD"
+      unset _TES_PREV_PWD
+      return
+    fi
+    unset _TES_PREV_PWD
+  fi
+  local check_dir="$PWD"
+  local depth=0
+  while [ -n "$check_dir" ] && [ "$check_dir" != "/" ] && [ "$depth" -lt 8 ]; do
+    if [ -d "$check_dir/.git" ] || { [ "${check_dir##*/}" = "tmp" ] && [ "${check_dir%/*}" != "${check_dir%/.tessera/tmp}" ]; }; then
+      return
+    fi
+    if [ -f "$check_dir/.tessera/repo_root" ] && [ ! -L "$check_dir/.tessera/repo_root" ]; then
+      local root_dir
+      root_dir="$(cat "$check_dir/.tessera/repo_root" 2>/dev/null)"
+      if [ -n "$root_dir" ] && [ -d "$root_dir/.git/tessera" ]; then
+        local rel_sub="${PWD#$check_dir}"
+        if [ -n "$rel_sub" ] && [ -d "${root_dir}${rel_sub}" ]; then
+          builtin cd "${root_dir}${rel_sub}"
+        else
+          builtin cd "$root_dir"
+        fi
+        return
+      fi
+    fi
+    check_dir="${check_dir%/*}"
+    depth=$((depth + 1))
+  done
+}
+
 _tes_preexec() {
   if [ -n "${COMP_LINE:-}" ]; then
     return
   fi
-  case "$1" in
-    tes\ *|tes|git\ *|git|cd\ *|cd|_tes_*|tes_prompt_info*) return ;;
+  _tes_restore_repo_pwd
+  local cmd_line="${1#"${1%%[![:space:]]*}"}"
+  local first_word="${cmd_line%%[[:space:]\;\&\|]*}"
+  first_word="${first_word##*/}"
+  case "$first_word" in
+    tes|git|cd|pushd|popd|pwd|dirs|agy|antigravity|antigravity-cli|code|code-insiders|codium|cursor|cursor-agent|windsurf|zed|kiro|kiro-cli|claude|claude-code|codex|opencode|aider|aider-chat|gemini|gemini-cli|copilot|amp|goose|crush|auggie|augment|droid|cline|roo|continue|openhands|plandex|mentat|q|subl|idea|webstorm|pycharm|goland|rustrover|clion|fleet|open|eval|source|.|export|unset|alias|unalias|which|type|clear|reset|exit|logout|jobs|fg|bg|disown|wait|kill|killall|pkill|ps|lsof|top|htop|_tes_*|tes_prompt_info*) return ;;
   esac
-  if [ -n "$TES_WORKSPACE" ] && [ -d "$TES_WORKSPACE" ] && [ -n "$TES_REPO_ROOT" ] && [ "$TES_WORKSPACE" != "$TES_REPO_ROOT" ] && [ -d "$TES_REPO_ROOT/.git/tessera" ]; then
+  if [ -n "$TES_WORKSPACE" ] && [ -n "$TES_REPO_ROOT" ] && [ "$TES_WORKSPACE" != "$TES_REPO_ROOT" ] && [ -d "$TES_REPO_ROOT/.git/tessera" ]; then
     local phys_pwd
     phys_pwd="$(builtin pwd -P 2>/dev/null || printf '%s' "$PWD")"
     case "$phys_pwd" in
       "$TES_REPO_ROOT"*)
-        _TES_PREV_PWD="$PWD"
-        local rel_sub="${phys_pwd#$TES_REPO_ROOT}"
-        if [ -d "${TES_WORKSPACE}${rel_sub}" ]; then
-          builtin cd "${TES_WORKSPACE}${rel_sub}"
-        else
-          builtin cd "$TES_WORKSPACE"
+        local env_out
+        if command -v tes >/dev/null 2>&1 && env_out="$(_TES_IN_PREEXEC=1 command tes env 2>/dev/null)" && [ -n "$env_out" ]; then
+          eval "$env_out"
+        fi
+        if [ -n "$TES_WORKSPACE" ] && [ -d "$TES_WORKSPACE" ] && [ "$TES_WORKSPACE" != "$TES_REPO_ROOT" ]; then
+          _TES_PREV_PWD="$PWD"
+          local rel_sub="${phys_pwd#$TES_REPO_ROOT}"
+          if [ -d "${TES_WORKSPACE}${rel_sub}" ]; then
+            builtin cd "${TES_WORKSPACE}${rel_sub}"
+          else
+            builtin cd "$TES_WORKSPACE"
+          fi
         fi
         ;;
     esac
@@ -3350,18 +3584,7 @@ _tes_preexec() {
 
 _tes_prompt_command() {
   export TES_SESSION_ID="term-$$"
-  if [ -n "$_TES_PREV_PWD" ]; then
-    if [ -d "$_TES_PREV_PWD" ]; then
-      builtin cd "$_TES_PREV_PWD"
-    fi
-    unset _TES_PREV_PWD
-  elif [ -n "$TES_WORKSPACE" ] && [[ "$PWD" == "$TES_WORKSPACE"* ]] && [ -f "$PWD/.tessera/repo_root" ] && [ ! -L "$PWD/.tessera/repo_root" ]; then
-    local root_dir
-    root_dir="$(cat "$PWD/.tessera/repo_root" 2>/dev/null)"
-    if [ -n "$root_dir" ] && [ -d "$root_dir/.git/tessera" ]; then
-      builtin cd "$root_dir"
-    fi
-  fi
+  _tes_restore_repo_pwd
   local env_out
   if command -v tes >/dev/null 2>&1 && env_out="$(command tes env 2>/dev/null)" && [ -n "$env_out" ]; then
     eval "$env_out"
@@ -3375,6 +3598,7 @@ _tes_prompt_command() {
 
 tes() {
   export TES_SESSION_ID="term-$$"
+  _tes_restore_repo_pwd
   command tes "$@"
   local ret=$?
   if [ "$1" != "env" ]; then
@@ -3402,18 +3626,59 @@ _tes_prompt_command
 set -gx TES_SESSION_ID "term-$fish_pid"
 set -gx TES_SHELL "fish"
 
+function _tes_restore_repo_pwd
+    if set -q _TES_PREV_PWD
+        if test -d "$_TES_PREV_PWD"; and not test -f "$_TES_PREV_PWD/.tessera/repo_root"
+            builtin cd "$_TES_PREV_PWD"
+            set -e _TES_PREV_PWD
+            return
+        end
+        set -e _TES_PREV_PWD
+    end
+    set -l check_dir "$PWD"
+    set -l depth 0
+    while test -n "$check_dir"; and test "$check_dir" != "/"; and test $depth -lt 8
+        if test -d "$check_dir/.git"; or string match -q "*/.tessera/tmp" -- "$check_dir"
+            return
+        end
+        if test -f "$check_dir/.tessera/repo_root"; and not test -L "$check_dir/.tessera/repo_root"
+            set -l root_dir (cat "$check_dir/.tessera/repo_root" 2>/dev/null)
+            if test -n "$root_dir"; and test -d "$root_dir/.git/tessera"
+                set -l rel_sub (string replace -- "$check_dir" "" "$PWD")
+                if test -n "$rel_sub"; and test -d "$root_dir$rel_sub"
+                    builtin cd "$root_dir$rel_sub"
+                else
+                    builtin cd "$root_dir"
+                end
+                return
+            end
+        end
+        set check_dir (string replace -r '/[^/]*$' '' -- "$check_dir")
+        set depth (math $depth + 1)
+    end
+end
+
 function _tes_preexec --on-event fish_preexec
-    if string match -qr '^(tes|git|cd)(\s|$)' -- "$argv[1]"
+    _tes_restore_repo_pwd
+    if string match -qr '^\s*([^\s;&|]*/)?(tes|git|cd|pushd|popd|pwd|dirs|agy|antigravity|antigravity-cli|code|code-insiders|codium|cursor|cursor-agent|windsurf|zed|kiro|kiro-cli|claude|claude-code|codex|opencode|aider|aider-chat|gemini|gemini-cli|copilot|amp|goose|crush|auggie|augment|droid|cline|roo|continue|openhands|plandex|mentat|q|subl|idea|webstorm|pycharm|goland|rustrover|clion|fleet|open|eval|source|export|set|unset|alias|which|type|clear|reset|exit|logout|jobs|fg|bg|disown|wait|kill|killall|pkill|ps|lsof|top|htop)(\s|$|;|&|\|)' -- "$argv[1]"
         return
     end
     set -l phys_pwd (pwd -P 2>/dev/null; or echo "$PWD")
-    if set -q TES_WORKSPACE; and test -d "$TES_WORKSPACE"; and set -q TES_REPO_ROOT; and test "$TES_WORKSPACE" != "$TES_REPO_ROOT"; and test -d "$TES_REPO_ROOT/.git/tessera"; and string match -q "$TES_REPO_ROOT*" -- "$phys_pwd"
-        set -g _TES_PREV_PWD "$PWD"
-        set -l rel_sub (string replace -- "$TES_REPO_ROOT" "" "$phys_pwd")
-        if test -d "$TES_WORKSPACE$rel_sub"
-            builtin cd "$TES_WORKSPACE$rel_sub"
-        else
-            builtin cd "$TES_WORKSPACE"
+    if set -q TES_WORKSPACE; and set -q TES_REPO_ROOT; and test "$TES_WORKSPACE" != "$TES_REPO_ROOT"; and test -d "$TES_REPO_ROOT/.git/tessera"; and string match -q "$TES_REPO_ROOT*" -- "$phys_pwd"
+        if command -sq tes
+            set -l env_out (env _TES_IN_PREEXEC=1 tes env 2>/dev/null)
+            if test -n "$env_out"
+                printf "%s\n" $env_out | source
+            end
+        end
+        if set -q TES_WORKSPACE; and test -d "$TES_WORKSPACE"; and test "$TES_WORKSPACE" != "$TES_REPO_ROOT"
+            set -g _TES_PREV_PWD "$PWD"
+            set -l rel_sub (string replace -- "$TES_REPO_ROOT" "" "$phys_pwd")
+            if test -d "$TES_WORKSPACE$rel_sub"
+                builtin cd "$TES_WORKSPACE$rel_sub"
+            else
+                builtin cd "$TES_WORKSPACE"
+            end
         end
     end
 end
@@ -3421,17 +3686,7 @@ end
 function _tes_sync_env --on-event fish_prompt --on-event fish_postexec
     set -gx TES_SESSION_ID "term-$fish_pid"
     set -gx TES_SHELL "fish"
-    if set -q _TES_PREV_PWD
-        if test -d "$_TES_PREV_PWD"
-            builtin cd "$_TES_PREV_PWD"
-        end
-        set -e _TES_PREV_PWD
-    else if set -q TES_WORKSPACE; and string match -q "$TES_WORKSPACE*" -- "$PWD"; and test -f "$PWD/.tessera/repo_root"; and not test -L "$PWD/.tessera/repo_root"
-        set -l root_dir (cat "$PWD/.tessera/repo_root" 2>/dev/null)
-        if test -n "$root_dir"; and test -d "$root_dir/.git/tessera"
-            builtin cd "$root_dir"
-        end
-    end
+    _tes_restore_repo_pwd
     if command -sq tes
         set -l env_out (command tes env 2>/dev/null)
         if test -n "$env_out"
@@ -3444,6 +3699,7 @@ end
 
 function tes --wraps tes
     set -gx TES_SESSION_ID "term-$fish_pid"
+    _tes_restore_repo_pwd
     command tes $argv
     set -l ret $status
     if test "$argv[1]" != "env"
@@ -3485,20 +3741,16 @@ export TES_SESSION_ID="term-$$"
 _tes_sh_sync() {
   export TES_SESSION_ID="term-$$"
   if [ -n "${_TES_PREV_PWD:-}" ]; then
-    if [ -d "$_TES_PREV_PWD" ]; then
+    if [ -d "$_TES_PREV_PWD" ] && [ ! -f "$_TES_PREV_PWD/.tessera/repo_root" ]; then
       cd "$_TES_PREV_PWD" || true
     fi
     unset _TES_PREV_PWD
-  elif [ -n "${TES_WORKSPACE:-}" ] && [ -f "$PWD/.tessera/repo_root" ] && [ ! -L "$PWD/.tessera/repo_root" ]; then
-    case "$PWD" in
-      "$TES_WORKSPACE"*)
-        _tes_root_dir="$(cat "$PWD/.tessera/repo_root" 2>/dev/null)"
-        if [ -n "$_tes_root_dir" ] && [ -d "$_tes_root_dir/.git/tessera" ]; then
-          cd "$_tes_root_dir" || true
-        fi
-        unset _tes_root_dir
-        ;;
-    esac
+  elif [ -f "$PWD/.tessera/repo_root" ] && [ ! -L "$PWD/.tessera/repo_root" ]; then
+    _tes_root_dir="$(cat "$PWD/.tessera/repo_root" 2>/dev/null)"
+    if [ -n "$_tes_root_dir" ] && [ -d "$_tes_root_dir/.git/tessera" ]; then
+      cd "$_tes_root_dir" || true
+    fi
+    unset _tes_root_dir
   fi
   if command -v tes >/dev/null 2>&1; then
     _tes_out="$(command tes env 2>/dev/null)"
@@ -3644,7 +3896,17 @@ _tes_sync
                 } else {
                     cfg.port_stride
                 };
-                let port = cfg.base_port.saturating_add(slot.saturating_mul(stride));
+                let effective_slot = if branch_name != cfg.trunk_branch {
+                    coord.branch_slot(&current.view, &branch_name, &cfg.trunk_branch)
+                } else {
+                    slot
+                };
+                let port = coord
+                    .active_leased_port_for_branch(&branch_name, &cfg.trunk_branch)
+                    .unwrap_or_else(|| {
+                        cfg.base_port
+                            .saturating_add(effective_slot.saturating_mul(stride))
+                    });
                 let port_str = port.to_string();
                 let port_isolation = cfg.is_port_isolation_enabled();
                 let shim_bin_dir = coord.sandboxes_root().join("bin");
@@ -3657,7 +3919,7 @@ _tes_sync
                 let port_vars = workspace::polyglot_port_env_vars(port);
                 let repo_root_str = coord.git().repo_root().display().to_string();
 
-                let ws_path_opt = if branch_name == default_branch {
+                let ws_path_opt = if branch_name == default_branch && branch_name == cfg.trunk_branch {
                     Some(repo_root_str.clone())
                 } else {
                     let sb_dir = coord.branch_sandbox_dir(&branch_name);
@@ -3685,6 +3947,9 @@ _tes_sync
                     if stamp_fresh && !has_active_branch_edits {
                         Some(sb_dir.display().to_string())
                     } else {
+                        if has_active_branch_edits {
+                            coord.reconcile_in_flight_sessions();
+                        }
                         coord
                             .prepare_branch_sandbox(&session_id, Some(&branch_name))
                             .ok()
@@ -3697,6 +3962,25 @@ _tes_sync
                     || std::env::var("TES_SHELL").is_ok_and(|s| s == "fish");
                 let is_tcsh = std::env::var("TES_SHELL").is_ok_and(|s| s == "tcsh" || s == "csh");
                 let is_elvish = std::env::var("TES_SHELL").is_ok_and(|s| s == "elvish");
+                let in_preexec = std::env::var_os("_TES_IN_PREEXEC").is_some();
+
+                let restore_dir_opt = (!in_preexec)
+                    .then(|| {
+                        coord.invocation_dir().map(|inv_dir| {
+                            let repo_root = coord.git().repo_root();
+
+                            if let Ok(rel) = cwd.strip_prefix(inv_dir) {
+                                let candidate = repo_root.join(rel);
+
+                                if candidate.is_dir() {
+                                    return candidate.display().to_string();
+                                }
+                            }
+
+                            repo_root.display().to_string()
+                        })
+                    })
+                    .flatten();
 
                 if cli.json {
                     println!(
@@ -3713,6 +3997,10 @@ _tes_sync
                         }))?
                     );
                 } else if is_fish {
+                    if let Some(ref restore_dir) = restore_dir_opt {
+                        println!("builtin cd {};", fish_single_quote(restore_dir));
+                    }
+
                     println!("set -gx TES_BRANCH {};", fish_single_quote(&branch_name));
                     println!("set -gx TES_PORT {};", fish_single_quote(&port_str));
 
@@ -3728,7 +4016,7 @@ _tes_sync
                             fish_single_quote(&shim_bin_str)
                         );
                         println!(
-                            "if not contains -- {} $PATH; set -gx PATH {} $PATH; end;",
+                            "if test \"$PATH[1]\" != {}; set -gx PATH {} $PATH; end;",
                             fish_single_quote(&shim_bin_str),
                             fish_single_quote(&shim_bin_str)
                         );
@@ -3830,6 +4118,10 @@ _tes_sync
                         println!("unset-env TES_WORKSPACE");
                     }
                 } else {
+                    if let Some(ref restore_dir) = restore_dir_opt {
+                        println!("cd {} 2>/dev/null || true", posix_single_quote(restore_dir));
+                    }
+
                     println!("export TES_BRANCH={}", posix_single_quote(&branch_name));
                     println!("export TES_PORT={}", posix_single_quote(&port_str));
 
@@ -3845,7 +4137,7 @@ _tes_sync
                             posix_single_quote(&shim_bin_str)
                         );
                         println!(
-                            r#"case ":${{PATH:-}}:" in *:"$TES_SHIM_BIN":*) ;; *) export PATH="$TES_SHIM_BIN${{PATH:+:$PATH}}" ;; esac"#
+                            r#"case "${{PATH:-}}:" in "$TES_SHIM_BIN":*) ;; *) export PATH="$TES_SHIM_BIN${{PATH:+:$PATH}}" ;; esac"#
                         );
                     } else {
                         let non_tes_port_keys: Vec<&str> = workspace::POLYGLOT_PORT_ENV_KEYS
@@ -3870,27 +4162,93 @@ _tes_sync
                         println!("unset TES_WORKSPACE");
                     }
 
-                    println!(
-                        r#"if [ -n "${{ZSH_VERSION:-}}" ]; then
+                    if !in_preexec {
+                        println!(
+                            r#"if [ -n "${{ZSH_VERSION:-}}" ]; then
   eval '
+  _tes_restore_repo_pwd() {{
+    if [[ -n "$_TES_PREV_PWD" ]]; then
+      if [[ -d "$_TES_PREV_PWD" && ! -f "$_TES_PREV_PWD/.tessera/repo_root" ]]; then
+        builtin cd -q "$_TES_PREV_PWD"
+        unset _TES_PREV_PWD
+        return
+      fi
+      unset _TES_PREV_PWD
+    fi
+    local check_dir="$PWD"
+    local depth=0
+    while [[ -n "$check_dir" && "$check_dir" != "/" && $depth -lt 8 ]]; do
+      if [[ -d "$check_dir/.git" || ( "${{check_dir:t}}" == "tmp" && "${{check_dir:h:t}}" == ".tessera" ) ]]; then
+        return
+      fi
+      if [[ -f "$check_dir/.tessera/repo_root" && ! -L "$check_dir/.tessera/repo_root" ]]; then
+        local root_dir="$(<"$check_dir/.tessera/repo_root")"
+        if [[ -n "$root_dir" && -d "$root_dir/.git/tessera" ]]; then
+          local rel_sub="${{PWD#$check_dir}}"
+          if [[ -n "$rel_sub" && -d "${{root_dir}}${{rel_sub}}" ]]; then builtin cd -q "${{root_dir}}${{rel_sub}}"; else builtin cd -q "$root_dir"; fi
+          return
+        fi
+      fi
+      check_dir="${{check_dir:h}}"
+      (( depth++ ))
+    done
+  }}
   _tes_preexec() {{
-    if [[ "$1" == tes\ * || "$1" == "tes" || "$1" == git\ * || "$1" == "git" || "$1" == cd\ * || "$1" == "cd" ]]; then return; fi
+    unset _TES_CHAINED_AFTER_TES
+    _tes_restore_repo_pwd
+    local norm_line="${{1//&&/;}}"
+    norm_line="${{norm_line//\|\|/;}}"
+    local saw_tes=0
+    local need_ws_after_tes=0
+    local need_ws_now=0
+    local line seg w
+    for line in "${{(@f)norm_line}}"; do
+      for seg in "${{(@s:;:)line}}"; do
+        seg="${{seg#"${{seg%%[![:space:]]*}}"}}"
+        [[ -z "$seg" ]] && continue
+        w="${{seg%%[[:space:]]*}}"
+        w="${{w##*/}}"
+        case "$w" in
+          tes)
+            saw_tes=1
+            need_ws_after_tes=0
+            ;;
+          git|cd|pushd|popd|pwd|dirs|agy|agy-*|antigravity|antigravity-*|code|code-insiders|codium|cursor|cursor-agent|windsurf|zed|kiro|kiro-cli|claude|claude-code|codex|opencode|aider|aider-chat|gemini|gemini-cli|copilot|amp|goose|crush|auggie|augment|droid|cline|roo|continue|openhands|plandex|mentat|q|subl|idea|webstorm|pycharm|goland|rustrover|clion|fleet|open|eval|source|.|export|unset|alias|unalias|which|type|clear|reset|exit|logout|jobs|fg|bg|disown|wait|kill|killall|pkill|ps|lsof|top|htop|_tes_*|tes_prompt_info*)
+            ;;
+          *)
+            if (( saw_tes )); then
+              need_ws_after_tes=1
+            else
+              need_ws_now=1
+            fi
+            ;;
+        esac
+      done
+    done
+    if (( need_ws_after_tes )); then
+      _TES_CHAINED_AFTER_TES=1
+      return
+    fi
+    if (( ! need_ws_now )); then
+      return
+    fi
     local phys_pwd="${{PWD:A}}"
-    if [[ -n "$TES_WORKSPACE" && -d "$TES_WORKSPACE" && -n "$TES_REPO_ROOT" && "$TES_WORKSPACE" != "$TES_REPO_ROOT" && -d "$TES_REPO_ROOT/.git/tessera" && "$phys_pwd" == "$TES_REPO_ROOT"* ]]; then
-      _TES_PREV_PWD="$PWD"
-      local rel_sub="${{phys_pwd#$TES_REPO_ROOT}}"
-      if [[ -d "${{TES_WORKSPACE}}${{rel_sub}}" ]]; then builtin cd -q "${{TES_WORKSPACE}}${{rel_sub}}"; else builtin cd -q "$TES_WORKSPACE"; fi
+    if [[ -n "$TES_WORKSPACE" && -n "$TES_REPO_ROOT" && "$TES_WORKSPACE" != "$TES_REPO_ROOT" && -d "$TES_REPO_ROOT/.git/tessera" && "$phys_pwd" == "$TES_REPO_ROOT"* ]]; then
+      local env_out
+      if command -v tes >/dev/null 2>&1 && env_out="$(_TES_IN_PREEXEC=1 command tes env 2>/dev/null)" && [[ -n "$env_out" ]]; then
+        eval "$env_out"
+      fi
+      if [[ -n "$TES_WORKSPACE" && -d "$TES_WORKSPACE" && "$TES_WORKSPACE" != "$TES_REPO_ROOT" ]]; then
+        _TES_PREV_PWD="$PWD"
+        local rel_sub="${{phys_pwd#$TES_REPO_ROOT}}"
+        if [[ -d "${{TES_WORKSPACE}}${{rel_sub}}" ]]; then builtin cd -q "${{TES_WORKSPACE}}${{rel_sub}}"; else builtin cd -q "$TES_WORKSPACE"; fi
+      fi
     fi
   }}
   _tes_precmd() {{
     export TES_SESSION_ID="term-$$"
-    if [[ -n "$_TES_PREV_PWD" ]]; then
-      if [[ -d "$_TES_PREV_PWD" ]]; then builtin cd -q "$_TES_PREV_PWD"; fi
-      unset _TES_PREV_PWD
-    elif [[ -n "$TES_WORKSPACE" && "$PWD" == "$TES_WORKSPACE"* && -f "$PWD/.tessera/repo_root" && ! -L "$PWD/.tessera/repo_root" ]]; then
-      local root_dir="$(<"$PWD/.tessera/repo_root")"
-      if [[ -n "$root_dir" && -d "$root_dir/.git/tessera" ]]; then builtin cd -q "$root_dir"; fi
-    fi
+    unset _TES_CHAINED_AFTER_TES
+    _tes_restore_repo_pwd
     local env_out
     if command -v tes >/dev/null 2>&1 && env_out="$(command tes env 2>/dev/null)" && [[ -n "$env_out" ]]; then
       eval "$env_out"
@@ -3898,12 +4256,61 @@ _tes_sync
       unset TES_BRANCH TES_PORT PORT TES_PORT_ISOLATION TES_SHIM_BIN TES_WORKSPACE TES_REPO_ROOT
     fi
   }}
-  if (( ! ${{preexec_functions[(I)_tes_preexec]}} )); then
-    preexec_functions=(_tes_preexec "${{preexec_functions[@]}}")
+  tes() {{
+    export TES_SESSION_ID="term-$$"
+    local chained="$_TES_CHAINED_AFTER_TES"
+    _tes_restore_repo_pwd
+    command tes "$@"
+    local ret=$?
+    if [[ "$1" != "env" ]]; then
+      _tes_precmd
+      if [[ -n "$chained" ]]; then
+        _TES_CHAINED_AFTER_TES=1
+        local phys_pwd="${{PWD:A}}"
+        if [[ -n "$TES_WORKSPACE" && -d "$TES_WORKSPACE" && -n "$TES_REPO_ROOT" && "$TES_WORKSPACE" != "$TES_REPO_ROOT" && -d "$TES_REPO_ROOT/.git/tessera" && "$phys_pwd" == "$TES_REPO_ROOT"* ]]; then
+          _TES_PREV_PWD="$PWD"
+          local rel_sub="${{phys_pwd#$TES_REPO_ROOT}}"
+          if [[ -d "${{TES_WORKSPACE}}${{rel_sub}}" ]]; then builtin cd -q "${{TES_WORKSPACE}}${{rel_sub}}"; else builtin cd -q "$TES_WORKSPACE"; fi
+        fi
+      fi
+    fi
+    return $ret
+  }}
+  preexec_functions=(_tes_preexec ${{preexec_functions:#_tes_preexec}})
+  if (( ${{funcstack[(I)tes]}} )); then
+    local hist_cmd="$(fc -ln -1 2>/dev/null)"
+    if [[ -n "$hist_cmd" ]]; then
+      local norm_hist="${{hist_cmd//&&/;}}"
+      norm_hist="${{norm_hist//\|\|/;}}"
+      local saw_t=0 need_after=0 hline hseg hw
+      for hline in "${{(@f)norm_hist}}"; do
+        for hseg in "${{(@s:;:)hline}}"; do
+          hseg="${{hseg#"${{hseg%%[![:space:]]*}}"}}"
+          [[ -z "$hseg" ]] && continue
+          hw="${{hseg%%[[:space:]]*}}"
+          hw="${{hw##*/}}"
+          case "$hw" in
+            tes) saw_t=1; need_after=0 ;;
+            git|cd|pushd|popd|pwd|dirs|agy|agy-*|antigravity|antigravity-*|code|code-insiders|codium|cursor|cursor-agent|windsurf|zed|kiro|kiro-cli|claude|claude-code|codex|opencode|aider|aider-chat|gemini|gemini-cli|copilot|amp|goose|crush|auggie|augment|droid|cline|roo|continue|openhands|plandex|mentat|q|subl|idea|webstorm|pycharm|goland|rustrover|clion|fleet|open|eval|source|.|export|unset|alias|unalias|which|type|clear|reset|exit|logout|jobs|fg|bg|disown|wait|kill|killall|pkill|ps|lsof|top|htop|_tes_*|tes_prompt_info*) ;;
+            *) (( saw_t )) && need_after=1 ;;
+          esac
+        done
+      done
+      if (( need_after )); then
+        _TES_CHAINED_AFTER_TES=1
+        local phys_pwd="${{PWD:A}}"
+        if [[ -n "$TES_WORKSPACE" && -d "$TES_WORKSPACE" && -n "$TES_REPO_ROOT" && "$TES_WORKSPACE" != "$TES_REPO_ROOT" && -d "$TES_REPO_ROOT/.git/tessera" && "$phys_pwd" == "$TES_REPO_ROOT"* ]]; then
+          _TES_PREV_PWD="$PWD"
+          local rel_sub="${{phys_pwd#$TES_REPO_ROOT}}"
+          if [[ -d "${{TES_WORKSPACE}}${{rel_sub}}" ]]; then builtin cd -q "${{TES_WORKSPACE}}${{rel_sub}}"; else builtin cd -q "$TES_WORKSPACE"; fi
+        fi
+      fi
+    fi
   fi
   '
 fi"#
-                    );
+                        );
+                    }
                 }
             } else if !cli.json {
                 let is_fish = std::env::var("FISH_VERSION").is_ok()
@@ -5345,7 +5752,7 @@ fn handle_cli_hook(
     cwd: &Path,
     event: &str,
     session_flag: Option<String>,
-    path_flag: Option<String>,
+    path_flags: Vec<String>,
     prompt_flag: Option<String>,
     json_out: bool,
 ) -> anyhow::Result<()> {
@@ -5353,7 +5760,11 @@ fn handle_cli_hook(
         return Ok(());
     };
 
-    let stdin_json = read_nonblocking_stdin_json();
+    let stdin_json = if !path_flags.is_empty() || prompt_flag.is_some() || event == "git-sync" {
+        None
+    } else {
+        read_nonblocking_stdin_json()
+    };
     let payload_session = stdin_json
         .as_ref()
         .and_then(|v| v.get("session_id"))
@@ -5376,8 +5787,8 @@ fn handle_cli_hook(
             }
         }
         "pre-tool" => {
-            let paths = if let Some(p) = path_flag {
-                vec![p]
+            let paths = if !path_flags.is_empty() {
+                path_flags
             } else {
                 extract_hook_file_paths(&stdin_json)
             };
@@ -5391,8 +5802,9 @@ fn handle_cli_hook(
             }
         }
         "post-tool" => {
-            let paths = if let Some(p) = path_flag {
-                vec![p]
+            let explicit_cli_path = !path_flags.is_empty();
+            let paths = if !path_flags.is_empty() {
+                path_flags
             } else {
                 extract_hook_file_paths(&stdin_json)
             };
@@ -5402,6 +5814,13 @@ fn handle_cli_hook(
                     println!("{}", serde_json::to_string_pretty(&outcome)?);
                 } else if let Some(notice) = outcome.context_notice {
                     println!("{notice}");
+                } else if explicit_cli_path {
+                    println!(
+                        "{} Reconciled '{}' for session '{}'",
+                        c_green("✓"),
+                        outcome.path,
+                        c_cyan(&outcome.session_id)
+                    );
                 }
             }
         }

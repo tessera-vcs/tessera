@@ -89,28 +89,39 @@ pub fn detect_session_id(explicit: Option<&str>) -> String {
     #[cfg(not(unix))]
     let ppid = i32::try_from(std::process::id()).unwrap_or(1);
 
-    let ancestor_harness = detect_ancestor_harness_process(ppid);
+    let has_harness_env = std::env::var_os("ANTIGRAVITY_AGENT").is_some()
+        || std::env::var_os("ANTIGRAVITY_CONVERSATION_ID").is_some()
+        || std::env::var_os("CLAUDECODE").is_some()
+        || std::env::var_os("CLAUDE_SESSION_ID").is_some()
+        || std::env::var_os("CODEX_THREAD_ID").is_some()
+        || std::env::var_os("CODEX_SESSION_ID").is_some()
+        || std::env::var_os("OPENAI_CODEX_SESSION_ID").is_some()
+        || std::env::var_os("CODEX_SANDBOX").is_some()
+        || std::env::var_os("CODEX_CI").is_some()
+        || std::env::var_os("OPENCODE_SESSION_ID").is_some()
+        || std::env::var_os("CURSOR_TRACE_ID").is_some()
+        || std::env::var_os("CURSOR_SESSION_ID").is_some()
+        || std::env::var_os("WINDSURF_SESSION_ID").is_some()
+        || std::env::var_os("CODEIUM_SESSION_ID").is_some()
+        || std::env::var_os("KIRO_SESSION_ID").is_some()
+        || std::env::var_os("COPILOT_SESSION_ID").is_some()
+        || std::env::var_os("GEMINI_CLI_SESSION_ID").is_some()
+        || std::env::var_os("GEMINI_SESSION_ID").is_some()
+        || std::env::var_os("AIDER_SESSION_ID").is_some()
+        || std::env::var_os("AMP_SESSION_ID").is_some()
+        || std::env::var_os("GOOSE_SESSION_ID").is_some()
+        || std::env::var_os("AUGMENT_SESSION_ID").is_some();
 
     if let Ok(val) = std::env::var("TES_SESSION_ID") {
         let trimmed = val.trim();
-        if !trimmed.is_empty() {
-            let is_inherited_term_in_agent = trimmed.starts_with("term-")
-                && (std::env::var_os("ANTIGRAVITY_AGENT").is_some()
-                    || std::env::var_os("CLAUDECODE").is_some()
-                    || std::env::var_os("CODEX_THREAD_ID").is_some()
-                    || std::env::var_os("CODEX_SESSION_ID").is_some()
-                    || std::env::var_os("OPENAI_CODEX_SESSION_ID").is_some()
-                    || std::env::var_os("CODEX_SANDBOX").is_some()
-                    || std::env::var_os("CODEX_CI").is_some()
-                    || std::env::var_os("OPENCODE_SESSION_ID").is_some()
-                    || std::env::var_os("CURSOR_TRACE_ID").is_some()
-                    || std::env::var_os("WINDSURF_SESSION_ID").is_some()
-                    || std::env::var_os("KIRO_SESSION_ID").is_some()
-                    || ancestor_harness.is_some());
-            if !is_inherited_term_in_agent {
-                let short = &trimmed[..32.min(trimmed.len())];
-                return sanitize_id(short);
-            }
+        if !trimmed.is_empty() && !trimmed.starts_with("term-") {
+            let short = &trimmed[..32.min(trimmed.len())];
+            return sanitize_id(short);
+        }
+
+        if !trimmed.is_empty() && !has_harness_env && trimmed == format!("term-{ppid}") {
+            let short = &trimmed[..32.min(trimmed.len())];
+            return sanitize_id(short);
         }
     }
 
@@ -127,6 +138,12 @@ pub fn detect_session_id(explicit: Option<&str>) -> String {
         ("CODEX_SESSION_ID", "codex-"),
         ("OPENAI_CODEX_SESSION_ID", "codex-"),
         ("COPILOT_SESSION_ID", "copilot-"),
+        ("GEMINI_CLI_SESSION_ID", "gemini-"),
+        ("GEMINI_SESSION_ID", "gemini-"),
+        ("AIDER_SESSION_ID", "aider-"),
+        ("AMP_SESSION_ID", "amp-"),
+        ("GOOSE_SESSION_ID", "goose-"),
+        ("AUGMENT_SESSION_ID", "augment-"),
     ] {
         if let Ok(val) = std::env::var(env_key) {
             let trimmed = val.trim();
@@ -137,13 +154,32 @@ pub fn detect_session_id(explicit: Option<&str>) -> String {
         }
     }
 
+    let ancestor_harness = detect_ancestor_harness_process(ppid);
+
+    if let Ok(val) = std::env::var("TES_SESSION_ID") {
+        let trimmed = val.trim();
+        if !trimmed.is_empty() && !has_harness_env && ancestor_harness.is_none() {
+            let short = &trimmed[..32.min(trimmed.len())];
+            return sanitize_id(short);
+        }
+    }
+
     if let Some((harness_prefix, harness_pid)) = ancestor_harness {
         return format!("{harness_prefix}-{harness_pid}");
     }
 
     let stable_pid = find_stable_session_ancestor_pid(ppid);
+
     if std::env::var_os("CODEX_SANDBOX").is_some() || std::env::var_os("CODEX_CI").is_some() {
         return format!("codex-{stable_pid}");
+    }
+
+    if std::env::var_os("CLAUDECODE").is_some() {
+        return format!("claude-{stable_pid}");
+    }
+
+    if std::env::var_os("ANTIGRAVITY_AGENT").is_some() {
+        return format!("antigravity-{stable_pid}");
     }
 
     for (env_key, prefix) in [
@@ -181,11 +217,78 @@ pub fn detect_session_id(explicit: Option<&str>) -> String {
     format!("session-{stable_pid}")
 }
 
+/// Maps a normalized binary or script basename to its canonical CLI agent harness identifier.
+fn classify_cli_harness_token(bin_name: &str) -> Option<&'static str> {
+    if bin_name == "codex" || bin_name.starts_with("codex-") {
+        return Some("codex");
+    }
+
+    match bin_name {
+        "claude" | "claude-code" => Some("claude"),
+        "opencode" => Some("opencode"),
+        "kiro-cli" => Some("kiro"),
+        "cursor-agent" => Some("cursor"),
+        "aider" | "aider-chat" => Some("aider"),
+        "gemini" | "gemini-cli" => Some("gemini"),
+        "copilot" => Some("copilot"),
+        "amp" => Some("amp"),
+        "goose" => Some("goose"),
+        "crush" => Some("crush"),
+        "auggie" | "augment" => Some("augment"),
+        "droid" => Some("droid"),
+        "cline" => Some("cline"),
+        "openhands" => Some("openhands"),
+        "plandex" => Some("plandex"),
+        _ => None,
+    }
+}
+
+/// Queries the full command line arguments for `pid` when inspecting script runtimes (`node`, `python`, `bun`).
+fn query_process_args(pid: i32) -> Option<String> {
+    if pid <= 1 {
+        return None;
+    }
+
+    #[cfg(unix)]
+    {
+        if let Ok(raw) = fs::read(format!("/proc/{pid}/cmdline")) {
+            if !raw.is_empty() {
+                let joined: String = raw
+                    .split(|&b| b == 0)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| String::from_utf8_lossy(s).into_owned())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+
+                if !joined.trim().is_empty() {
+                    return Some(joined);
+                }
+            }
+        }
+
+        if let Ok(out) = std::process::Command::new("ps")
+            .args(["-o", "args=", "-p", &pid.to_string()])
+            .output()
+        {
+            if out.status.success() {
+                let line = String::from_utf8_lossy(&out.stdout).trim().to_string();
+
+                if !line.is_empty() {
+                    return Some(line);
+                }
+            }
+        }
+    }
+
+    None
+}
+
 /// Walks up the process tree from `start_pid` to check if the current command was spawned by a
 /// CLI coding agent (`codex`, `claude`, `opencode`, `kiro-cli`, `aider`, `gemini`,
-/// `cursor-agent`), returning `(harness_name, pid)`.
+/// `cursor-agent`, `amp`, `goose`, `crush`, `auggie`, etc.), returning `(harness_name, pid)`.
 fn detect_ancestor_harness_process(start_pid: i32) -> Option<(&'static str, i32)> {
     let mut curr = start_pid;
+
     for _ in 0..6 {
         if curr <= 1 {
             break;
@@ -212,37 +315,40 @@ fn detect_ancestor_harness_process(start_pid: i32) -> Option<(&'static str, i32)
             break;
         }
 
-        if bin_name == "codex" || bin_name.starts_with("codex-") {
-            return Some(("codex", curr));
+        if let Some(harness) = classify_cli_harness_token(&bin_name) {
+            return Some((harness, curr));
         }
 
-        if bin_name == "claude" {
-            return Some(("claude", curr));
-        }
+        if matches!(bin_name.as_str(), "node" | "nodejs" | "bun" | "deno")
+            || bin_name.starts_with("python")
+        {
+            if let Some(args_line) = query_process_args(curr) {
+                for tok in args_line.split_whitespace().skip(1) {
+                    if tok.starts_with('-') {
+                        continue;
+                    }
 
-        if bin_name == "opencode" {
-            return Some(("opencode", curr));
-        }
+                    let script_base = tok
+                        .rsplit(['/', '\\'])
+                        .next()
+                        .unwrap_or(tok)
+                        .trim_end_matches(".js")
+                        .trim_end_matches(".mjs")
+                        .trim_end_matches(".cjs")
+                        .trim_end_matches(".py")
+                        .to_ascii_lowercase();
 
-        if bin_name == "kiro-cli" {
-            return Some(("kiro", curr));
-        }
-
-        if bin_name == "cursor-agent" {
-            return Some(("cursor", curr));
-        }
-
-        if bin_name == "aider" {
-            return Some(("aider", curr));
-        }
-
-        if bin_name == "gemini" {
-            return Some(("gemini", curr));
+                    if let Some(harness) = classify_cli_harness_token(&script_base) {
+                        return Some((harness, curr));
+                    }
+                }
+            }
         }
 
         if next_ppid <= 1 || next_ppid == curr {
             break;
         }
+
         curr = next_ppid;
     }
 
@@ -456,6 +562,26 @@ pub fn detect_session_waypoint(session_id: &str) -> SessionWaypoint {
         Some("codex")
     } else if session_id.starts_with("copilot-") {
         Some("copilot")
+    } else if session_id.starts_with("gemini-") {
+        Some("gemini")
+    } else if session_id.starts_with("aider-") {
+        Some("aider")
+    } else if session_id.starts_with("amp-") {
+        Some("amp")
+    } else if session_id.starts_with("goose-") {
+        Some("goose")
+    } else if session_id.starts_with("crush-") {
+        Some("crush")
+    } else if session_id.starts_with("augment-") {
+        Some("augment")
+    } else if session_id.starts_with("droid-") {
+        Some("droid")
+    } else if session_id.starts_with("cline-") {
+        Some("cline")
+    } else if session_id.starts_with("openhands-") {
+        Some("openhands")
+    } else if session_id.starts_with("plandex-") {
+        Some("plandex")
     } else {
         None
     };
@@ -476,6 +602,12 @@ pub fn detect_session_waypoint(session_id: &str) -> SessionWaypoint {
         ("CODEX_SESSION_ID", "codex"),
         ("OPENAI_CODEX_SESSION_ID", "codex"),
         ("COPILOT_SESSION_ID", "copilot"),
+        ("GEMINI_CLI_SESSION_ID", "gemini"),
+        ("GEMINI_SESSION_ID", "gemini"),
+        ("AIDER_SESSION_ID", "aider"),
+        ("AMP_SESSION_ID", "amp"),
+        ("GOOSE_SESSION_ID", "goose"),
+        ("AUGMENT_SESSION_ID", "augment"),
     ] {
         if prefix_harness.is_some_and(|ph| ph != harness_name) {
             continue;
@@ -555,7 +687,13 @@ pub fn detect_session_waypoint(session_id: &str) -> SessionWaypoint {
     #[cfg(not(unix))]
     let ppid = i32::try_from(std::process::id()).unwrap_or(1);
 
-    if harness.is_none() {
+    let explicit_term_pid = session_id
+        .strip_prefix("term-")
+        .or_else(|| session_id.strip_prefix("session-"))
+        .and_then(|s| s.parse::<i32>().ok())
+        .filter(|&pid| pid > 1 && is_pid_or_ancestor(pid, ppid));
+
+    if harness.is_none() && explicit_term_pid.is_none() {
         if let Some((prefix, _pid)) = detect_ancestor_harness_process(ppid) {
             let mapped = if prefix == "claude" {
                 "claude-code"
@@ -566,7 +704,7 @@ pub fn detect_session_waypoint(session_id: &str) -> SessionWaypoint {
         }
     }
 
-    let stable_pid = find_stable_session_ancestor_pid(ppid);
+    let stable_pid = explicit_term_pid.unwrap_or_else(|| find_stable_session_ancestor_pid(ppid));
     let shell_pid = u32::try_from(stable_pid).ok();
     let tty = query_process_tty(stable_pid);
     let ide_pid = detect_ancestor_ide_pid(stable_pid);
@@ -585,6 +723,36 @@ pub fn detect_session_waypoint(session_id: &str) -> SessionWaypoint {
         shell_pid,
         ide_pid,
     }
+}
+
+/// Returns `true` if `target_pid` equals `start_pid` or is an ancestor process of `start_pid`.
+fn is_pid_or_ancestor(target_pid: i32, start_pid: i32) -> bool {
+    if target_pid <= 1 || start_pid <= 1 {
+        return false;
+    }
+
+    if target_pid == start_pid {
+        return true;
+    }
+
+    let mut curr = start_pid;
+    for _ in 0..8 {
+        let Some((next_ppid, _)) = query_process_parent_and_name(curr) else {
+            break;
+        };
+
+        if next_ppid == target_pid {
+            return true;
+        }
+
+        if next_ppid <= 1 || next_ppid == curr {
+            break;
+        }
+
+        curr = next_ppid;
+    }
+
+    false
 }
 
 /// Queries the controlling TTY device path (e.g. `"/dev/ttys003"` or `"/dev/pts/2"`) for `pid`.
@@ -1342,11 +1510,11 @@ pub fn install_harness_integrations_for(
 
 This repository is version-controlled with **Tessera** (`.git/tessera`). Note: Tessera (`tes`) is strictly the source-control tool managing this repository. Never add Tessera/`tes` branding or copy into the user's application UI or code unless explicitly asked.
 **IMPORTANT: Do NOT run raw `git` commands (`git status`, `git diff`, `git log`, `git branch`, `git checkout`, `git switch`, `git stash`, `git reset`, `git add`, `git commit`, `git cherry-pick`). Always use `tes` CLI commands instead:**
-1. **Before editing files**: Run `tes claim [--branch <branch>] --intent "<your task goal>" <target-files...>` (automatically creates/switches your session to `<branch>` and records baselines; pass `--branch <branch>` explicitly to collaborate on a branch that already has uncommitted edits).
-2. **Immediately after editing each file**: Run `tes hook post-tool --path <file>` to auto-reconcile concurrent edits via 3-way AST & token merge. Never revert or delete lines added by concurrent peer sessions.
+1. **Before editing files**: Run `tes claim [--branch <branch>] [--from <base-branch>] --intent "<your task goal>" <target-files...>` (automatically creates/switches your session to `<branch>`, optionally branching off `<base-branch>`, and records baselines; pass `--branch <branch>` explicitly to collaborate on a branch that already has uncommitted edits). Batch `tes claim` with your initial `read_file` calls in the same turn to minimize round-trips.
+2. **After editing files**: Batch related `write_file` / `edit_file` calls in the same turn, then run `tes hook post-tool --path <edited-files...>` to auto-reconcile concurrent edits via 3-way AST & token merge. Never revert or delete lines added by concurrent peer sessions.
 3. **Running builds, tests, or dev servers on a branch**: Run `tes exec [-b <branch>] -- <command>` to execute in an isolated Copy-on-Write sandbox with cloned dependencies and isolated `TES_PORT` / `DATABASE_URL` (plus full `PORT` and dev-server port isolation when `port_isolation = true`).
 4. **Branch, Stash, Restore & History**: Use `tes status`, `tes diff`, `tes log`, `tes branch [-d|-D|-m]`, `tes stash [push|pop|apply|list|drop]`, `tes restore`, `tes cherry-pick`, `tes pull`, and `tes push`.
-5. **When finished**: Run `tes commit [-m "<commit message>" | --amend]` (or `tes merge -m "<commit message>"`) once to commit your session's isolated changes onto its branch.
+5. **When finished**: Run `tes commit [-m "<commit message>" | --amend]` (or chain `tes hook post-tool --path <edited-files...> && tes commit -m "<commit message>"` in a single command) to commit your session's isolated changes onto its branch.
 <!-- tessera:end -->
 "#;
 
@@ -1360,15 +1528,16 @@ Multiple AI agents may be editing this codebase concurrently in separate chat ta
 - **NEVER run raw `git` commands** (`git status`, `git diff`, `git log`, `git branch`, `git checkout`, `git switch`, `git stash`, `git reset`, `git add`, `git commit`, `git cherry-pick`). Tessera manages branches and virtual working trees in `.git/tessera` without altering `.git/HEAD` for other concurrent agents. Always use `tes status`, `tes diff`, `tes log`, `tes branch`, `tes switch`, `tes stash`, `tes restore`, `tes cherry-pick`, `tes pull`, `tes push`, `tes commit`, and `tes merge`.
 - **Never Revert Concurrent Peer Edits**: When multiple agents edit the same file on the same branch, `tes hook post-tool` automatically 3-way AST-merges their edits on disk. `tes status` and `tes diff` show only your session's own changes (`Staged / Session Changes`) and list concurrent `Peer Session Changes` separately. Never delete or revert a peer agent's code simply because you did not author it.
 - **Use `tes` CLI commands in terminal tool calls** rather than duplicating with MCP calls so your per-tab session ID (`ANTIGRAVITY_CONVERSATION_ID`) is automatically isolated.
+- **Batch Tool Calls for Fast Execution**: Minimize sequential LLM turns by calling `tes claim` alongside your initial `read_file` calls in Turn 1, batching your `write_file` / `edit_file` calls together in Turn 2, and chaining `tes hook post-tool --path <edited-files...> && tes commit -m "<commit message>"` in a single command in Turn 3 whenever no intermediate build check is needed.
 
 ## Mandatory Autonomous Workflow for Every Coding Task
 1. **Before Editing Files**:
-   - Claim your task intent, target branch, and target files via CLI:
-     `tes claim [--branch <branch>] --intent "<concise summary of your task>" <target-file-paths...>`
-   - (`tes claim --branch <branch>` automatically creates and binds your session to `<branch>`; no separate `tes switch` call is needed. If a claimed file already has uncommitted changes from the user or a peer and you omit `--branch`, Tessera auto-isolates your session onto `agent/<session_id>`; pass `--branch <branch>` explicitly when same-branch collaboration is intended.)
-2. **Immediately After Editing Each File**:
-   - Reconcile your edits with any concurrent agent changes via CLI:
-     `tes hook post-tool --path <edited-file>`
+   - Claim your task intent, target branch, and target files via CLI (in parallel with your initial `read_file` calls):
+     `tes claim [--branch <branch>] [--from <base-branch>] --intent "<concise summary of your task>" <target-file-paths...>`
+   - (`tes claim --branch <branch> [--from <base-branch>]` automatically creates and binds your session to `<branch>`, optionally forking from `<base-branch>`. If a claimed file already has uncommitted changes from the user or a peer and you omit `--branch`, Tessera auto-isolates your session onto `agent/<session_id>`; pass `--branch <branch>` explicitly when same-branch collaboration is intended.)
+2. **After Editing Files**:
+   - Reconcile your edited files with any concurrent agent changes via CLI (passing all edited paths at once):
+     `tes hook post-tool --path <edited-file-1> <edited-file-2>...`
    - Tessera automatically 3-way AST-merges non-overlapping changes on disk while preserving per-branch session isolation.
 3. **Running Builds, Tests, or Servers on a Branch**:
    - Use `tes exec [-b <branch>] -- <command>` to run builds, tests, or dev servers in an isolated Copy-on-Write branch sandbox with cloned dependencies (`node_modules`, `target`, `.venv`, `vendor`, etc.) and isolated `TES_PORT` / `DATABASE_URL` (plus full `PORT` and dev-server port shims when `tes config set port_isolation true` is enabled).
@@ -1379,7 +1548,7 @@ Multiple AI agents may be editing this codebase concurrently in separate chat ta
    - Delete or rename branches via `tes branch -d <branch>`, `tes branch -D <branch>`, or `tes branch -m <old> <new>`.
    - Stash, cherry-pick, or restore changes via `tes stash [push|pop|apply|list|drop]`, `tes cherry-pick <commit>`, or `tes restore [<rev>] [<paths...>]`.
 6. **When Your Coding Task Is Complete**:
-   - Commit your session's isolated changes cleanly onto its branch via CLI:
+   - Commit your session's isolated changes cleanly onto its branch via CLI (can be chained directly after `tes hook post-tool --path <files...> && tes commit -m "..."`):
      `tes commit -m "<clean conventional commit message>"` (or `tes commit --amend -m "..."` / `tes merge -m "<clean conventional commit message>"`)
    - To AST-merge multiple branches into a target branch, run:
      `tes merge <branch1> <branch2> --into <target-branch> -m "<commit message>"`
@@ -1838,7 +2007,9 @@ pub fn handle_pre_tool_hook(
     let cur_op_opt = coord.oplog().load_current_reconciled().ok();
 
     // If `source_path` is in `repo_root` and currently holds an uncommitted blob from a foreign
-    // branch session, restore `session_id`'s own branch version to `repo_root` before reading.
+    // branch session (or `session_id` is on a branch whose base commit differs from `HEAD` while
+    // no other active session owns or awaits `disk_blob`), restore `session_id`'s own branch
+    // version to `repo_root` before reading.
     if source_path == full_path && full_path.is_file() {
         if let (Ok(disk_bytes), Some(cur_op)) = (fs::read(&full_path), cur_op_opt.as_ref()) {
             if let Ok(disk_blob) = coord.git().write_blob(&disk_bytes) {
@@ -1851,7 +2022,28 @@ pub fn handle_pre_tool_hook(
                         && other.effective_branch(&default_branch) != my_eff_branch
                         && other.own_blobs.get(&normalized_path) == Some(&disk_blob)
                 });
-                if owned_by_foreign_branch && my_expected != Some(&disk_blob) {
+                let head_cid_opt = coord.git().resolve_head_commit().ok().flatten();
+                let foreign_peer_awaiting_disk = cur_op.view.agents.values().any(|other| {
+                    let is_passive = (other.agent_id.starts_with("term-")
+                        || other.agent_id.starts_with("session-")
+                        || other.agent_id == "editor")
+                        && other.intent_inferred
+                        && other.claimed_symbols.is_empty()
+                        && !other.has_own_changes();
+                    !is_passive
+                        && other.agent_id != session_id
+                        && other.effective_branch(&default_branch) != my_eff_branch
+                        && (other.own_blobs.get(&normalized_path) == Some(&disk_blob)
+                            || (!other.owns_path(&normalized_path)
+                                && other.read_blobs.get(&normalized_path) == Some(&disk_blob)))
+                });
+                let diverged_branch_base = my_eff_branch != default_branch
+                    && head_cid_opt.is_some_and(|hcid| hcid != meta.base_commit)
+                    && !foreign_peer_awaiting_disk;
+
+                if (owned_by_foreign_branch || diverged_branch_base)
+                    && my_expected != Some(&disk_blob)
+                {
                     if let Some(exp_blob) = my_expected {
                         if let Ok(exp_bytes) = coord.git().read_blob(exp_blob) {
                             let _ = atomic_write_file(&full_path, &exp_bytes);
@@ -2249,8 +2441,9 @@ pub fn handle_post_tool_hook(
         is_active_peer(other_id, other_agent)
             && !is_same_branch_peer(other_id, other_agent)
             && other_agent.own_blobs.get(&normalized_path) == Some(&disk_after_blob)
-    }) || (my_eff_branch != default_branch
-        && Some(&disk_after_blob) == base_blob.as_ref());
+    }) || foreign_blobs.contains(&disk_after_blob)
+        || (my_eff_branch != default_branch
+            && Some(&disk_after_blob) == base_blob.as_ref());
     if disk_is_foreign_peer_own_blob || crate::has_git_conflict_markers(&disk_after_str) {
         if let Some(existing_own) = my_agent.own_blobs.get(&normalized_path) {
             if *existing_own != disk_after_blob {
@@ -2263,6 +2456,69 @@ pub fn handle_post_tool_hook(
                             untangled_cross_branch = true;
                         }
                     }
+                }
+            }
+        } else if disk_is_foreign_peer_own_blob {
+            if let Some(obs_list) = current_op.view.observed_blobs.get(&normalized_path) {
+                let mut best_rescued: Option<(isize, usize, ObjectId, String)> = None;
+                for obs_blob in obs_list.iter().rev() {
+                    let owned_by_other = current_op
+                        .view
+                        .agents
+                        .values()
+                        .any(|a| a.own_blobs.get(&normalized_path) == Some(obs_blob));
+                    if *obs_blob != disk_after_blob
+                        && Some(obs_blob) != base_blob.as_ref()
+                        && Some(obs_blob) != base_tree_blob.as_ref()
+                        && !foreign_blobs.contains(obs_blob)
+                        && !owned_by_other
+                    {
+                        if let Ok(obs_bytes) = coord.git().read_blob(obs_blob) {
+                            let obs_str = String::from_utf8_lossy(&obs_bytes).into_owned();
+                            if !crate::has_git_conflict_markers(&obs_str) {
+                                let my_score = score_blob_for_agent(
+                                    &base_str,
+                                    &obs_str,
+                                    &my_agent.intent,
+                                    Some(my_eff_branch),
+                                );
+                                let max_other_score = current_op
+                                    .view
+                                    .agents
+                                    .iter()
+                                    .filter(|(other_id, other_agent)| {
+                                        is_active_peer(other_id, other_agent)
+                                            && !is_same_branch_peer(other_id, other_agent)
+                                            && !other_agent.owns_path(&normalized_path)
+                                    })
+                                    .map(|(_, other_agent)| {
+                                        score_blob_for_agent(
+                                            &base_str,
+                                            &obs_str,
+                                            &other_agent.intent,
+                                            Some(other_agent.effective_branch(&default_branch)),
+                                        )
+                                    })
+                                    .max()
+                                    .unwrap_or(0);
+                                let net_score =
+                                    (my_score as isize) - (max_other_score as isize);
+
+                                if best_rescued.as_ref().is_none_or(|(best_net, best_raw, _, _)| {
+                                    (net_score, my_score) > (*best_net, *best_raw)
+                                }) {
+                                    best_rescued =
+                                        Some((net_score, my_score, *obs_blob, obs_str));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if let Some((_, _, rescued_blob, rescued_str)) = best_rescued {
+                    effective_my_blob = rescued_blob;
+                    current_my_str = rescued_str;
+                    untangled_cross_branch = true;
                 }
             }
         }
@@ -2326,7 +2582,9 @@ pub fn handle_post_tool_hook(
         std::collections::BTreeMap::new();
     if effective_my_blob != disk_after_blob {
         assigned_own_blobs.insert(session_id.to_string(), effective_my_blob);
-    } else if any_active_peer_missing_own_blob {
+    }
+
+    if any_active_peer_missing_own_blob {
         let mut attribution_blobs: Vec<ObjectId> = Vec::new();
         if let Some(obs_list) = current_op.view.observed_blobs.get(&normalized_path) {
             for obs_blob in obs_list {
@@ -2340,16 +2598,23 @@ pub fn handle_post_tool_hook(
             }
         }
 
-        if Some(&effective_my_blob) != base_blob.as_ref()
-            && Some(&effective_my_blob) != base_tree_blob.as_ref()
-            && !attribution_blobs.contains(&effective_my_blob)
-        {
-            attribution_blobs.push(effective_my_blob);
+        for extra_blob in [effective_my_blob, disk_after_blob] {
+            if Some(&extra_blob) != base_blob.as_ref()
+                && Some(&extra_blob) != base_tree_blob.as_ref()
+                && !foreign_blobs.contains(&extra_blob)
+                && !attribution_blobs.contains(&extra_blob)
+            {
+                attribution_blobs.push(extra_blob);
+            }
         }
 
         if attribution_blobs.len() >= 2 {
             for (aid, agent_meta) in &current_op.view.agents {
                 if aid != session_id && !is_active_peer(aid, agent_meta) {
+                    continue;
+                }
+
+                if aid == session_id && assigned_own_blobs.contains_key(session_id) {
                     continue;
                 }
 
@@ -2359,6 +2624,13 @@ pub fn handle_post_tool_hook(
 
                 let mut best_blob: Option<(usize, ObjectId)> = None;
                 for cand_blob in &attribution_blobs {
+                    if effective_my_blob != disk_after_blob
+                        && *cand_blob == effective_my_blob
+                        && aid != session_id
+                    {
+                        continue;
+                    }
+
                     if let Ok(cand_bytes) = coord.git().read_blob(cand_blob) {
                         let cand_str = String::from_utf8_lossy(&cand_bytes);
                         let score = score_blob_for_agent(
@@ -2622,6 +2894,31 @@ pub fn handle_post_tool_hook(
     let mut conflict_to_save: Option<ConflictRecord> = None;
     let mut merged_peer_blobs: Vec<ObjectId> = Vec::new();
 
+    let waiting_peer_baseline_blob: Option<ObjectId> = if my_eff_branch != default_branch {
+        current_op
+            .view
+            .agents
+            .iter()
+            .filter(|(other_id, other)| {
+                is_active_peer(other_id, other)
+                    && !is_same_branch_peer(other_id, other)
+                    && (other.targets_head_branch(&default_branch)
+                        || (!other.owns_path(&normalized_path)
+                            && !assigned_own_blobs.contains_key(*other_id)))
+            })
+            .find_map(|(_, other)| {
+                other
+                    .own_blobs
+                    .get(&normalized_path)
+                    .or_else(|| other.read_blobs.get(&normalized_path))
+                    .copied()
+                    .or(base_blob)
+            })
+    } else {
+        None
+    };
+    let preserve_head_baseline_for_peer = waiting_peer_baseline_blob.is_some();
+
     if candidate_blobs.len() >= 2 {
         let (first_id, first_intent, first_blob_id) = &candidate_blobs[0];
         let first_bytes = coord.git().read_blob(first_blob_id)?;
@@ -2696,9 +2993,15 @@ pub fn handle_post_tool_hook(
                     && other.targets_head_branch(&default_branch)
                     && other.owns_path(&normalized_path)
             });
-        if !default_branch_peer_owns_path {
+        if !default_branch_peer_owns_path && !preserve_head_baseline_for_peer {
             atomic_write_file(&full_path, acc_str.as_bytes())?;
             crate::set_worktree_executable(&full_path, executable);
+        } else if let Some(b_id) = waiting_peer_baseline_blob {
+            if disk_after_blob != b_id && !crate::has_git_conflict_markers(&disk_after_str) {
+                if let Ok(peer_base_bytes) = coord.git().read_blob(&b_id) {
+                    let _ = atomic_write_file(&full_path, &peer_base_bytes);
+                }
+            }
         }
 
         final_disk_bytes = acc_str.into_bytes();
@@ -2708,6 +3011,12 @@ pub fn handle_post_tool_hook(
                 "[Tessera Auto-Merge]: Cleanly AST-merged concurrent edits to '{}'.",
                 normalized_path
             ));
+        }
+    } else if let Some(b_id) = waiting_peer_baseline_blob {
+        if disk_after_blob != b_id && !crate::has_git_conflict_markers(&disk_after_str) {
+            if let Ok(peer_base_bytes) = coord.git().read_blob(&b_id) {
+                let _ = atomic_write_file(&full_path, &peer_base_bytes);
+            }
         }
     } else if my_own_blob != disk_after_blob && !crate::has_git_conflict_markers(&disk_after_str) {
         let default_branch_peer_owns_path = edited_in_branch_sandbox
@@ -2873,8 +3182,37 @@ pub fn handle_post_tool_hook(
         format!("post-tool reconcile {normalized_path}"),
         true,
         |view| {
+            let mut next_obs = Vec::new();
+            let candidate_obs = view
+                .observed_blobs
+                .get(&normalized_path)
+                .into_iter()
+                .flatten()
+                .copied()
+                .chain(std::iter::once(disk_after_blob));
+            for b in candidate_obs {
+                let is_owned = assigned_own_blobs.values().any(|ob| *ob == b)
+                    || view
+                        .agents
+                        .values()
+                        .any(|a| a.own_blobs.get(&normalized_path) == Some(&b));
+                if !is_owned
+                    && Some(&b) != base_blob.as_ref()
+                    && Some(&b) != base_tree_blob.as_ref()
+                    && b != final_blob
+                    && b != my_own_blob
+                    && !next_obs.contains(&b)
+                {
+                    next_obs.push(b);
+                }
+            }
+
+            if !next_obs.contains(&final_blob) {
+                next_obs.push(final_blob);
+            }
+
             view.observed_blobs
-                .insert(normalized_path.clone(), vec![final_blob]);
+                .insert(normalized_path.clone(), next_obs);
 
             for (aid, own_b) in &assigned_own_blobs {
                 if let Some(agent) = view.agents.get_mut(aid) {
@@ -2995,6 +3333,16 @@ pub fn handle_post_tool_hook(
                     executable,
                 }),
             );
+
+            if let Some(peer_meta) = current_op.view.agents.get(aid) {
+                let peer_branch = peer_meta.effective_branch(&default_branch);
+                let peer_ws = coord.branch_sandbox_dir(peer_branch);
+                if peer_ws.is_dir() {
+                    if let Ok(peer_bytes) = coord.git().read_blob(own_b) {
+                        crate::write_worktree_rel(&peer_ws, &normalized_path, &peer_bytes, executable);
+                    }
+                }
+            }
         }
     }
 
@@ -3003,7 +3351,12 @@ pub fn handle_post_tool_hook(
     let eff_branch = my_eff_branch.to_string();
     let branch_ws = coord.branch_sandbox_dir(&eff_branch);
     if branch_ws.is_dir() {
-        crate::write_worktree_rel(&branch_ws, &normalized_path, &my_own_bytes, executable);
+        let ws_bytes = if eff_branch == default_branch {
+            &final_disk_bytes
+        } else {
+            &my_own_bytes
+        };
+        crate::write_worktree_rel(&branch_ws, &normalized_path, ws_bytes, executable);
     }
 
     // If invoked from inside another sandbox (such as `branches/main`), keep that sandbox file synchronized too.
@@ -3638,6 +3991,11 @@ pub fn run_auto_watch_daemon(coord: &Coordinator) -> CoreResult<()> {
             break;
         }
 
+        let default_branch = coord
+            .git()
+            .current_branch_name()
+            .unwrap_or_else(|_| "main".to_string());
+
         let mut watched_paths = std::collections::BTreeSet::new();
         for agent in current.view.agents.values() {
             for p in agent.read_blobs.keys() {
@@ -3733,6 +4091,64 @@ pub fn run_auto_watch_daemon(coord: &Coordinator) -> CoreResult<()> {
                         Ok(())
                     },
                 );
+            }
+
+            let active_on_path: Vec<&core::AgentMetadata> = current
+                .view
+                .agents
+                .values()
+                .filter(|a| {
+                    let is_passive = (a.agent_id.starts_with("term-")
+                        || a.agent_id.starts_with("session-")
+                        || a.agent_id == "editor")
+                        && a.intent_inferred
+                        && a.claimed_symbols.is_empty()
+                        && !a.has_own_changes();
+                    !is_passive
+                        && (a.owns_path(&clean_rel)
+                            || a.read_blobs.contains_key(&clean_rel)
+                            || a.claimed_symbols.iter().any(|s| {
+                                s.split("::").next().unwrap_or(s.as_str()).trim() == clean_rel
+                            }))
+                })
+                .collect();
+
+            let distinct_branches: std::collections::BTreeSet<&str> = active_on_path
+                .iter()
+                .map(|a| a.effective_branch(&default_branch))
+                .collect();
+
+            if distinct_branches.len() >= 2
+                && !active_on_path
+                    .iter()
+                    .any(|a| a.targets_head_branch(&default_branch))
+            {
+                let baseline_opt = active_on_path
+                    .iter()
+                    .filter(|a| !a.owns_path(&clean_rel))
+                    .find_map(|a| a.read_blobs.get(&clean_rel).copied());
+
+                if let Some(base_b) = baseline_opt {
+                    if base_b != blob_id {
+                        if let Ok(base_bytes) = coord.git().read_blob(&base_b) {
+                            if atomic_write_file(&full_path, &base_bytes).is_ok() {
+                                if let Ok(restored_meta) = fs::symlink_metadata(&full_path) {
+                                    let r_size = restored_meta.len();
+                                    let (r_secs, r_nanos) = restored_meta
+                                        .modified()
+                                        .ok()
+                                        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                                        .map(|d| (d.as_secs(), d.subsec_nanos()))
+                                        .unwrap_or((0, 0));
+                                    last_stat.insert(
+                                        clean_rel.clone(),
+                                        (r_size, r_secs, r_nanos, base_b),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -4646,6 +5062,233 @@ mod tests {
         assert_eq!(
             fs::read_to_string(tmp.path().join("README.md")).expect("README.md on main"),
             "# Main Updated\n"
+        );
+    }
+
+    #[test]
+    fn peer_non_head_commit_preserves_watcher_observed_in_flight_edit() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let app_vue = tmp.path().join("src/App.vue");
+        fs::create_dir_all(app_vue.parent().expect("parent")).expect("mkdir src");
+        fs::write(
+            &app_vue,
+            "<script setup lang=\"ts\">\nimport HelloWorld from './components/HelloWorld.vue'\n</script>\n<template>\n  <HelloWorld />\n</template>\n",
+        )
+        .expect("write initial App.vue");
+
+        let (coord, _) = Coordinator::init_repo(tmp.path()).expect("init_repo");
+        coord
+            .claim_intent_and_symbols_with_branch(
+                "agent-init",
+                Some("Initial App.vue"),
+                &["src/App.vue".to_string()],
+                Some("main"),
+            )
+            .expect("claim main");
+        handle_post_tool_hook(&coord, "agent-init", "src/App.vue").expect("post-tool init");
+        coord
+            .merge_agents(&["agent-init".to_string()], Some("main"), None, false)
+            .expect("commit main");
+
+        coord
+            .claim_intent_and_symbols_with_branch(
+                "agent-pomodoro",
+                Some("Build Pomodoro Focus Timer dashboard in src/App.vue"),
+                &["src/App.vue".to_string()],
+                Some("feat/pomodoro-timer"),
+            )
+            .expect("claim pomodoro");
+        handle_pre_tool_hook(&coord, "agent-pomodoro", "src/App.vue").expect("pre-tool pomodoro");
+
+        coord
+            .claim_intent_and_symbols_with_branch(
+                "agent-habit",
+                Some("Build Daily Habit & Streak Tracker in src/App.vue"),
+                &["src/App.vue".to_string()],
+                Some("feat/habit-tracker"),
+            )
+            .expect("claim habit");
+        handle_pre_tool_hook(&coord, "agent-habit", "src/App.vue").expect("pre-tool habit");
+
+        let pomodoro_code = "<script setup lang=\"ts\">\nconst mode = 'pomodoro'\n</script>\n<template>\n  <div>Pomodoro Focus Timer</div>\n</template>\n";
+        fs::write(&app_vue, pomodoro_code).expect("write pomodoro");
+        handle_post_tool_hook(&coord, "agent-pomodoro", "src/App.vue").expect("post-tool pomodoro");
+        assert_eq!(
+            fs::read_to_string(&app_vue).expect("read app_vue after first post-tool"),
+            "<script setup lang=\"ts\">\nimport HelloWorld from './components/HelloWorld.vue'\n</script>\n<template>\n  <HelloWorld />\n</template>\n",
+            "post-tool must restore HEAD baseline to repo_root while a cross-branch peer is still awaiting its first edit"
+        );
+
+        // Simulate `tes exec` restoring `main` to `repo_root/src/App.vue`, followed by `agent-habit`
+        // writing its Habit Tracker on disk and the background watcher recording it in `observed_blobs`
+        // right before `agent-pomodoro` runs `tes commit`!
+        let habit_code = "<script setup lang=\"ts\">\nconst tracker = 'habit'\n</script>\n<template>\n  <div>Daily Habit & Streak Tracker</div>\n</template>\n";
+        fs::write(&app_vue, habit_code).expect("write habit");
+        let habit_blob = coord
+            .git()
+            .write_blob(habit_code.as_bytes())
+            .expect("write habit blob");
+        coord
+            .oplog()
+            .record_tx(
+                "watcher",
+                "observe intermediate blob for src/App.vue",
+                true,
+                |view| {
+                    view.observed_blobs
+                        .entry("src/App.vue".to_string())
+                        .or_default()
+                        .push(habit_blob);
+                    Ok(())
+                },
+            )
+            .expect("record watcher observed_blob");
+
+        // Now `agent-pomodoro` commits onto `feat/pomodoro-timer` before `agent-habit` runs `post-tool`.
+        coord
+            .merge_agents(
+                &["agent-pomodoro".to_string()],
+                Some("feat/pomodoro-timer"),
+                None,
+                false,
+            )
+            .expect("commit feat/pomodoro-timer");
+
+        // `agent-habit` now runs `tes hook post-tool` and commits onto `feat/habit-tracker`.
+        handle_post_tool_hook(&coord, "agent-habit", "src/App.vue").expect("post-tool habit");
+        let report = coord
+            .merge_agents(
+                &["agent-habit".to_string()],
+                Some("feat/habit-tracker"),
+                None,
+                false,
+            )
+            .expect("commit feat/habit-tracker");
+        let committed_tree = coord
+            .git()
+            .read_commit(&report.merged_commit_id)
+            .expect("read habit commit")
+            .tree_id;
+        let entry = coord
+            .git()
+            .read_tree_entry_at_path(&committed_tree, "src/App.vue")
+            .expect("read entry")
+            .expect("App.vue exists");
+        let committed_bytes = coord.git().read_blob(&entry.blob_id).expect("read blob");
+        assert_eq!(String::from_utf8_lossy(&committed_bytes), habit_code);
+    }
+
+    #[test]
+    fn branching_off_feature_branch_via_from_or_switch_stages_parent_baseline_and_rejects_invalid_base() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let app_vue = tmp.path().join("src/App.vue");
+        fs::create_dir_all(app_vue.parent().expect("parent")).expect("mkdir src");
+        let main_vue = "<script setup lang=\"ts\">\nimport HelloWorld from './components/HelloWorld.vue'\n</script>\n<template>\n  <HelloWorld />\n</template>\n";
+        fs::write(&app_vue, main_vue).expect("write initial App.vue");
+
+        let (coord, _) = Coordinator::init_repo(tmp.path()).expect("init_repo");
+        coord
+            .claim_intent_and_symbols_with_branch(
+                "agent-init",
+                Some("Initial App.vue"),
+                &["src/App.vue".to_string()],
+                Some("main"),
+            )
+            .expect("claim main");
+        handle_post_tool_hook(&coord, "agent-init", "src/App.vue").expect("post-tool init");
+        coord
+            .merge_agents(&["agent-init".to_string()], Some("main"), None, false)
+            .expect("commit main");
+
+        let habit_vue = "<script setup lang=\"ts\">\nconst habits = ['Read', 'Run']\n</script>\n<template>\n  <section id=\"habits\">Daily Habits</section>\n</template>\n";
+        coord
+            .claim_intent_and_symbols_with_branch(
+                "agent-habit",
+                Some("Create habit tracker on feat/habit-tracker"),
+                &["src/App.vue".to_string()],
+                Some("feat/habit-tracker"),
+            )
+            .expect("claim feat/habit-tracker");
+        fs::write(&app_vue, habit_vue).expect("write habit_vue");
+        handle_post_tool_hook(&coord, "agent-habit", "src/App.vue").expect("post-tool habit");
+        let habit_commit = coord
+            .merge_agents(
+                &["agent-habit".to_string()],
+                Some("feat/habit-tracker"),
+                None,
+                false,
+            )
+            .expect("commit feat/habit-tracker");
+
+        assert_eq!(
+            fs::read_to_string(&app_vue).expect("read main App.vue"),
+            main_vue,
+            "repo_root must remain on main after feat/habit-tracker commits"
+        );
+
+        assert!(
+            coord
+                .switch_branch_with_base(
+                    "agent-sec",
+                    "feat/evil",
+                    Some("--upload-pack=evil")
+                )
+                .is_err()
+        );
+        assert!(
+            coord
+                .switch_branch_with_base("agent-sec", "feat/evil", Some("../evil"))
+                .is_err()
+        );
+        assert!(
+            coord
+                .switch_branch_with_base(
+                    "agent-sec",
+                    "feat/missing",
+                    Some("feat/does-not-exist")
+                )
+                .is_err()
+        );
+        assert!(
+            coord
+                .claim_intent_and_symbols_with_branch_and_base(
+                    "agent-sec",
+                    Some("Invalid base"),
+                    &["src/App.vue".to_string()],
+                    Some("feat/missing"),
+                    Some("feat/does-not-exist"),
+                )
+                .is_err()
+        );
+
+        let analytics_meta = coord
+            .claim_intent_and_symbols_with_branch_and_base(
+                "agent-analytics",
+                Some("Add analytics chart onto feat/habit-tracker"),
+                &["src/App.vue".to_string()],
+                Some("feat/habit-analytics"),
+                Some("feat/habit-tracker"),
+            )
+            .expect("claim feat/habit-analytics from feat/habit-tracker");
+        assert_eq!(
+            analytics_meta.base_commit, habit_commit.merged_commit_id,
+            "--from feat/habit-tracker must fork feat/habit-analytics from feat/habit-tracker's commit"
+        );
+        assert_eq!(
+            fs::read_to_string(&app_vue).expect("read staged App.vue"),
+            habit_vue,
+            "claiming src/App.vue on feat/habit-analytics must stage feat/habit-tracker's App.vue in repo_root"
+        );
+
+        coord
+            .switch_branch("agent-two-step", "feat/habit-tracker")
+            .expect("switch to feat/habit-tracker");
+        let export_meta = coord
+            .switch_branch("agent-two-step", "feat/habit-export")
+            .expect("switch to new child branch feat/habit-export");
+        assert_eq!(
+            export_meta.base_commit, habit_commit.merged_commit_id,
+            "switching to a new branch from a session on feat/habit-tracker must fork from feat/habit-tracker"
         );
     }
 }

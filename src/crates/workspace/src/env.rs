@@ -166,6 +166,8 @@ pub fn ensure_polyglot_port_shims(bin_dir: &Path) {
             return;
         }
 
+        let _ = fs::write(bin_dir.join(".tes-shim-dir"), b"1\n");
+
         let unified_script = r#"#!/bin/sh
 _tes_self_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 _tes_bin_name=$(basename -- "$0")
@@ -179,7 +181,7 @@ done
 _tes_old_ifs="$IFS"
 IFS=":"
 for _tes_dir in $_tes_search_path; do
-  if [ -n "$_tes_dir" ] && [ "$_tes_dir" != "$_tes_self_dir" ] && [ -x "$_tes_dir/$_tes_bin_name" ] && [ ! -d "$_tes_dir/$_tes_bin_name" ]; then
+  if [ -n "$_tes_dir" ] && [ "$_tes_dir" != "$_tes_self_dir" ] && [ ! -f "$_tes_dir/.tes-shim-dir" ] && [ -x "$_tes_dir/$_tes_bin_name" ] && [ ! -d "$_tes_dir/$_tes_bin_name" ]; then
     _tes_real="$_tes_dir/$_tes_bin_name"
     break
   fi
@@ -217,6 +219,9 @@ _tes_is_port_busy() {
     if [ -n "$_tes_holder_pid" ] && [ "$_tes_holder_pid" != "$$" ] && kill -0 "$_tes_holder_pid" 2>/dev/null; then
       return 0
     fi
+  fi
+  if [ -n "${TES_SKIP_TCP_PROBE:-}" ]; then
+    return 1
   fi
   if command -v lsof >/dev/null 2>&1; then
     if lsof -nP -iTCP:"$_tes_chk_port" -sTCP:LISTEN >/dev/null 2>&1; then
@@ -257,6 +262,8 @@ _tes_acquire_port() {
     if ! _tes_is_port_busy "$_tes_try"; then
       mkdir -p "$_tes_self_dir/.leases/$_tes_try" 2>/dev/null || true
       printf '%s\n' "$$" > "$_tes_self_dir/.leases/$_tes_try/pid" 2>/dev/null || true
+      printf '%s\n' "${TES_BRANCH:-}" > "$_tes_self_dir/.leases/$_tes_try/branch" 2>/dev/null || true
+      printf '%s\n' "${TES_WORKSPACE:-$PWD}" > "$_tes_self_dir/.leases/$_tes_try/workspace" 2>/dev/null || true
       TES_PORT="$_tes_try"
       export PORT="$_tes_try" TES_PORT="$_tes_try" HTTP_PORT="$_tes_try" APP_PORT="$_tes_try" WEB_PORT="$_tes_try" DEV_SERVER_PORT="$_tes_try" BUN_PORT="$_tes_try" VITE_PORT="$_tes_try" NITRO_PORT="$_tes_try" NUXT_PORT="$_tes_try" ASTRO_PORT="$_tes_try" SB_PORT="$_tes_try" STORYBOOK_PORT="$_tes_try" SERVER_PORT="$_tes_try" FLASK_RUN_PORT="$_tes_try" UVICORN_PORT="$_tes_try" DJANGO_RUNSERVER_PORT="$_tes_try" RAILS_PORT="$_tes_try" ROCKET_PORT="$_tes_try" GO_PORT="$_tes_try" ASPNETCORE_HTTP_PORTS="$_tes_try" ASPNETCORE_URLS="http://localhost:$_tes_try" DOTNET_URLS="http://localhost:$_tes_try" QUARKUS_HTTP_PORT="$_tes_try" MICRONAUT_SERVER_PORT="$_tes_try" KTOR_DEPLOYMENT_PORT="$_tes_try" PHX_PORT="$_tes_try"
       return 0

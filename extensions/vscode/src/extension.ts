@@ -221,57 +221,78 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.window.registerTreeDataProvider("conflicts", conflictsProvider)
   );
 
+  let isRefreshing = false;
+  let refreshQueued = false;
+
   /**
    * Fetches the latest repository state snapshot and refreshes all views, decorations, and webviews.
+   * Coalesces concurrent refresh triggers so at most one snapshot batch runs at a time.
    */
   const refreshAll = async (): Promise<void> => {
-    if (!client.isInitialized()) {
-      latestSnapshot = undefined;
-      revealedConflicts.clear();
-      branchesProvider.setSnapshot(undefined);
-      sessionsProvider.setSnapshot(undefined);
-      conflictsProvider.setSnapshot(undefined);
-      decorationController.setSnapshot(undefined);
-      statusBar.hide();
+    if (isRefreshing) {
+      refreshQueued = true;
       return;
     }
 
+    isRefreshing = true;
+
     try {
-      const snapshot = await client.fetchSnapshot();
-      latestSnapshot = snapshot;
+      do {
+        refreshQueued = false;
 
-      branchesProvider.setSnapshot(snapshot);
-      sessionsProvider.setSnapshot(snapshot);
-      conflictsProvider.setSnapshot(snapshot);
-      decorationController.setSnapshot(snapshot);
-      statusBar.update(snapshot);
-      VisualGraphPanel.updateIfVisible(snapshot);
-      ConflictStudioPanel.updateIfVisible(snapshot);
-
-      const currentConflictIds = new Set(snapshot.conflicts.map((c) => c.id));
-
-      for (const id of revealedConflicts) {
-        if (!currentConflictIds.has(id)) {
-          revealedConflicts.delete(id);
+        if (!client.isInitialized()) {
+          latestSnapshot = undefined;
+          revealedConflicts.clear();
+          branchesProvider.setSnapshot(undefined);
+          sessionsProvider.setSnapshot(undefined);
+          conflictsProvider.setSnapshot(undefined);
+          decorationController.setSnapshot(undefined);
+          statusBar.hide();
+          return;
         }
-      }
 
-      for (const c of snapshot.conflicts) {
-        if (!revealedConflicts.has(c.id)) {
-          revealedConflicts.add(c.id);
-          void openConflictedFileInEditor(c.path);
+        try {
+          const snapshot = await client.fetchSnapshot();
+          latestSnapshot = snapshot;
+
+          branchesProvider.setSnapshot(snapshot);
+          sessionsProvider.setSnapshot(snapshot);
+          conflictsProvider.setSnapshot(snapshot);
+          decorationController.setSnapshot(snapshot);
+          statusBar.update(snapshot);
+          VisualGraphPanel.updateIfVisible(snapshot);
+          ConflictStudioPanel.updateIfVisible(snapshot);
+
+          const currentConflictIds = new Set(
+            snapshot.conflicts.map((c) => c.id)
+          );
+
+          for (const id of revealedConflicts) {
+            if (!currentConflictIds.has(id)) {
+              revealedConflicts.delete(id);
+            }
+          }
+
+          for (const c of snapshot.conflicts) {
+            if (!revealedConflicts.has(c.id)) {
+              revealedConflicts.add(c.id);
+              void openConflictedFileInEditor(c.path);
+            }
+          }
+        } catch {
+          if (!client.isInitialized()) {
+            latestSnapshot = undefined;
+            revealedConflicts.clear();
+            branchesProvider.setSnapshot(undefined);
+            sessionsProvider.setSnapshot(undefined);
+            conflictsProvider.setSnapshot(undefined);
+            decorationController.setSnapshot(undefined);
+            statusBar.hide();
+          }
         }
-      }
-    } catch {
-      if (!client.isInitialized()) {
-        latestSnapshot = undefined;
-        revealedConflicts.clear();
-        branchesProvider.setSnapshot(undefined);
-        sessionsProvider.setSnapshot(undefined);
-        conflictsProvider.setSnapshot(undefined);
-        decorationController.setSnapshot(undefined);
-        statusBar.hide();
-      }
+      } while (refreshQueued);
+    } finally {
+      isRefreshing = false;
     }
   };
 
