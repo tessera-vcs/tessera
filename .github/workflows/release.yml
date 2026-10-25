@@ -297,6 +297,7 @@ jobs:
       - name: Generate CHANGELOG.md
         uses: orhun/git-cliff-action@v4
         with:
+          config: cliff.toml
           args: --verbose --tag "${{ needs.prepare.outputs.tag }}" --output CHANGELOG.md
 
       - name: Commit and push CHANGELOG.md

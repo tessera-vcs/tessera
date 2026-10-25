@@ -1,6 +1,8 @@
+# Changelog
+
 ## [0.0.2] - 2026-10-25
 
-### 🚀 Features
+### Features
 
 - *(merge)* Support indentation, keyword-end, and section structural blocks
 - *(workspace)* Preserve and sync gitignored files and monorepo symlinks
@@ -8,7 +10,7 @@
 - *(branch)* Support branching off specific parent branches in switch and claim
 - *(agent,cli,workspace)* Persistent per-branch slots, active port lease detection, TTY session scoping, and multi-path post-tool batching
 
-### 🐛 Bug Fixes
+### Bug Fixes
 
 - *(workspace)* Preserve file and remote database URLs during slot isolation
 - *(core)* Strip existing timestamp suffix when preserving author on commit amend
@@ -18,26 +20,27 @@
 - *(cli)* Prevent oplog reconciliation storm and sandbox PWD stranding
 - Eliminate IDE refresh subprocess spawns and tighten documentation copy
 
-### 📚 Documentation
+### Documentation
 
 - Clarify core problem statement and remove external tool comparisons
 - Remove unreleased NetBSD references from docs and install.sh
 
-### ⚙️ Miscellaneous Tasks
+### Miscellaneous
 
 - *(github)* Add pull request template
 - *(release)* Bump CLI binary version to 0.0.2
 - *(ci)* Trigger docs deployment only on manual workflow_dispatch
+
 ## [0.0.1] - 2026-10-24
 
-### 🚀 Features
+### Features
 
 - Initial commit
 - *(install)* Show download progress bar and verify installers in release CI
 - *(install)* Adopt stepped installer UI with inline download progress
 - *(agent)* Resolve remote-tracking refs when pulling or switching branches
 
-### 🐛 Bug Fixes
+### Bug Fixes
 
 - *(ci)* Replace npm ci with npm i
 - *(workspace)* Gate prune_unsafe_symlinks_in_dir with macos cfg
@@ -51,19 +54,19 @@
 - *(workspace)* Support multi-wildcard and recursive globs in .gitignore matching
 - *(agent)* Avoid creating duplicate AGENTS.md and .mcp.json during init
 
-### 📚 Documentation
+### Documentation
 
 - Add uninstall guide, release download links, and CLI examples
 - Add contributor guide and update init reference
 - Clarify extension support for VS Code and VS Code-based editors
 
-### 🧪 Testing
+### Testing
 
 - *(cli)* Resolve native sandbox path and gate POSIX chmod assertions on Windows
 - *(cli)* Gate bin.sh chmod assertion in stash roundtrip test on Windows
 - *(cli)* Sample best of 3 runs for tes env latency check in debug builds
 
-### ⚙️ Miscellaneous Tasks
+### Miscellaneous
 
 - *(actions)* Consolidate e2e jobs into rust-matrix and reuse debug binary
 - *(release)* Set initial version to 0.0.1 and verify passed CI before release
@@ -73,4 +76,3 @@
 - Track npm lockfiles and auto-generate CHANGELOG.md during release
 - *(repo)* Add .editorconfig, .gitattributes, and autonomous agent rules
 - *(actions)* Filter CI jobs by modified paths
-- *(release)* Update CHANGELOG.md for v0.0.1 [skip ci]
