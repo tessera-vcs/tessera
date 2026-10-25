@@ -166,6 +166,8 @@ pub fn ensure_polyglot_port_shims(bin_dir: &Path) {
             return;
         }
 
+        let _ = fs::write(bin_dir.join(".tes-shim-dir"), b"1\n");
+
         let unified_script = r#"#!/bin/sh
 _tes_self_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 _tes_bin_name=$(basename -- "$0")
@@ -179,7 +181,7 @@ done
 _tes_old_ifs="$IFS"
 IFS=":"
 for _tes_dir in $_tes_search_path; do
-  if [ -n "$_tes_dir" ] && [ "$_tes_dir" != "$_tes_self_dir" ] && [ -x "$_tes_dir/$_tes_bin_name" ] && [ ! -d "$_tes_dir/$_tes_bin_name" ]; then
+  if [ -n "$_tes_dir" ] && [ "$_tes_dir" != "$_tes_self_dir" ] && [ ! -f "$_tes_dir/.tes-shim-dir" ] && [ -x "$_tes_dir/$_tes_bin_name" ] && [ ! -d "$_tes_dir/$_tes_bin_name" ]; then
     _tes_real="$_tes_dir/$_tes_bin_name"
     break
   fi

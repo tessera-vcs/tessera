@@ -3245,22 +3245,64 @@ prompt_tes() {
   fi
 }
 
+_tes_restore_repo_pwd() {
+  if [[ -n "$_TES_PREV_PWD" ]]; then
+    if [[ -d "$_TES_PREV_PWD" && ! -f "$_TES_PREV_PWD/.tessera/repo_root" ]]; then
+      builtin cd -q "$_TES_PREV_PWD"
+      unset _TES_PREV_PWD
+      return
+    fi
+    unset _TES_PREV_PWD
+  fi
+  local check_dir="$PWD"
+  local depth=0
+  while [[ -n "$check_dir" && "$check_dir" != "/" && $depth -lt 8 ]]; do
+    if [[ -f "$check_dir/.tessera/repo_root" && ! -L "$check_dir/.tessera/repo_root" ]]; then
+      local root_dir="$(<"$check_dir/.tessera/repo_root")"
+      if [[ -n "$root_dir" && -d "$root_dir/.git/tessera" ]]; then
+        local rel_sub="${PWD#$check_dir}"
+        if [[ -n "$rel_sub" && -d "${root_dir}${rel_sub}" ]]; then
+          builtin cd -q "${root_dir}${rel_sub}"
+        else
+          builtin cd -q "$root_dir"
+        fi
+        return
+      fi
+    fi
+    check_dir="${check_dir:h}"
+    (( depth++ ))
+  done
+}
+
 _tes_preexec() {
   unset _TES_CHAINED_AFTER_TES
-  if [[ "$1" == tes\ * || "$1" == "tes" || "$1" == git\ * || "$1" == "git" || "$1" == cd\ * || "$1" == "cd" ]]; then
-    if [[ "$1" == (tes\ *)*((\&\&|\;|\|\|))* ]]; then
-      _TES_CHAINED_AFTER_TES=1
-    fi
+  _tes_restore_repo_pwd
+  if [[ "$1" == (tes\ *)*((\&\&|\;|\|\|))* ]]; then
+    _TES_CHAINED_AFTER_TES=1
     return
   fi
+  local cmd_line="${1#"${1%%[![:space:]]*}"}"
+  local first_word="${cmd_line%%[[:space:]\;\&\|]*}"
+  first_word="${first_word##*/}"
+  case "$first_word" in
+    tes|git|cd|pushd|popd|pwd|dirs|agy|antigravity|antigravity-cli|code|code-insiders|codium|cursor|cursor-agent|windsurf|zed|kiro|kiro-cli|claude|claude-code|codex|opencode|aider|aider-chat|gemini|gemini-cli|copilot|amp|goose|crush|auggie|augment|droid|cline|roo|continue|openhands|plandex|mentat|q|subl|idea|webstorm|pycharm|goland|rustrover|clion|fleet|open|eval|source|.|export|unset|alias|unalias|which|type|clear|reset|exit|logout|jobs|fg|bg|disown|wait|kill|killall|pkill|ps|lsof|top|htop|_tes_*|tes_prompt_info*)
+      return
+      ;;
+  esac
   local phys_pwd="${PWD:A}"
-  if [[ -n "$TES_WORKSPACE" && -d "$TES_WORKSPACE" && -n "$TES_REPO_ROOT" && "$TES_WORKSPACE" != "$TES_REPO_ROOT" && -d "$TES_REPO_ROOT/.git/tessera" && "$phys_pwd" == "$TES_REPO_ROOT"* ]]; then
-    _TES_PREV_PWD="$PWD"
-    local rel_sub="${phys_pwd#$TES_REPO_ROOT}"
-    if [[ -d "${TES_WORKSPACE}${rel_sub}" ]]; then
-      builtin cd -q "${TES_WORKSPACE}${rel_sub}"
-    else
-      builtin cd -q "$TES_WORKSPACE"
+  if [[ -n "$TES_WORKSPACE" && -n "$TES_REPO_ROOT" && "$TES_WORKSPACE" != "$TES_REPO_ROOT" && -d "$TES_REPO_ROOT/.git/tessera" && "$phys_pwd" == "$TES_REPO_ROOT"* ]]; then
+    local env_out
+    if command -v tes >/dev/null 2>&1 && env_out="$(_TES_IN_PREEXEC=1 command tes env 2>/dev/null)" && [[ -n "$env_out" ]]; then
+      eval "$env_out"
+    fi
+    if [[ -n "$TES_WORKSPACE" && -d "$TES_WORKSPACE" && "$TES_WORKSPACE" != "$TES_REPO_ROOT" ]]; then
+      _TES_PREV_PWD="$PWD"
+      local rel_sub="${phys_pwd#$TES_REPO_ROOT}"
+      if [[ -d "${TES_WORKSPACE}${rel_sub}" ]]; then
+        builtin cd -q "${TES_WORKSPACE}${rel_sub}"
+      else
+        builtin cd -q "$TES_WORKSPACE"
+      fi
     fi
   fi
 }
@@ -3268,18 +3310,7 @@ _tes_preexec() {
 _tes_precmd() {
   export TES_SESSION_ID="term-$$"
   unset _TES_CHAINED_AFTER_TES
-  if [[ -n "$_TES_PREV_PWD" ]]; then
-    if [[ -d "$_TES_PREV_PWD" ]]; then
-      builtin cd -q "$_TES_PREV_PWD"
-    fi
-    unset _TES_PREV_PWD
-  elif [[ -n "$TES_WORKSPACE" && "$PWD" == "$TES_WORKSPACE"* && -f "$PWD/.tessera/repo_root" && ! -L "$PWD/.tessera/repo_root" ]]; then
-    local root_dir
-    root_dir="$(<"$PWD/.tessera/repo_root")"
-    if [[ -n "$root_dir" && -d "$root_dir/.git/tessera" ]]; then
-      builtin cd -q "$root_dir"
-    fi
-  fi
+  _tes_restore_repo_pwd
   local env_out
   if command -v tes >/dev/null 2>&1 && env_out="$(command tes env 2>/dev/null)" && [[ -n "$env_out" ]]; then
     eval "$env_out"
@@ -3299,10 +3330,7 @@ _tes_ensure_prompt() {
 tes() {
   export TES_SESSION_ID="term-$$"
   local chained="$_TES_CHAINED_AFTER_TES"
-  if [[ -n "$_TES_PREV_PWD" && -d "$_TES_PREV_PWD" ]]; then
-    builtin cd -q "$_TES_PREV_PWD"
-    unset _TES_PREV_PWD
-  fi
+  _tes_restore_repo_pwd
   command tes "$@"
   local ret=$?
   if [[ "$1" != "env" ]]; then
@@ -3374,24 +3402,64 @@ tes_prompt_info() {
   fi
 }
 
+_tes_restore_repo_pwd() {
+  if [ -n "$_TES_PREV_PWD" ]; then
+    if [ -d "$_TES_PREV_PWD" ] && [ ! -f "$_TES_PREV_PWD/.tessera/repo_root" ]; then
+      builtin cd "$_TES_PREV_PWD"
+      unset _TES_PREV_PWD
+      return
+    fi
+    unset _TES_PREV_PWD
+  fi
+  local check_dir="$PWD"
+  local depth=0
+  while [ -n "$check_dir" ] && [ "$check_dir" != "/" ] && [ "$depth" -lt 8 ]; do
+    if [ -f "$check_dir/.tessera/repo_root" ] && [ ! -L "$check_dir/.tessera/repo_root" ]; then
+      local root_dir
+      root_dir="$(cat "$check_dir/.tessera/repo_root" 2>/dev/null)"
+      if [ -n "$root_dir" ] && [ -d "$root_dir/.git/tessera" ]; then
+        local rel_sub="${PWD#$check_dir}"
+        if [ -n "$rel_sub" ] && [ -d "${root_dir}${rel_sub}" ]; then
+          builtin cd "${root_dir}${rel_sub}"
+        else
+          builtin cd "$root_dir"
+        fi
+        return
+      fi
+    fi
+    check_dir="${check_dir%/*}"
+    depth=$((depth + 1))
+  done
+}
+
 _tes_preexec() {
   if [ -n "${COMP_LINE:-}" ]; then
     return
   fi
-  case "$1" in
-    tes\ *|tes|git\ *|git|cd\ *|cd|_tes_*|tes_prompt_info*) return ;;
+  _tes_restore_repo_pwd
+  local cmd_line="${1#"${1%%[![:space:]]*}"}"
+  local first_word="${cmd_line%%[[:space:]\;\&\|]*}"
+  first_word="${first_word##*/}"
+  case "$first_word" in
+    tes|git|cd|pushd|popd|pwd|dirs|agy|antigravity|antigravity-cli|code|code-insiders|codium|cursor|cursor-agent|windsurf|zed|kiro|kiro-cli|claude|claude-code|codex|opencode|aider|aider-chat|gemini|gemini-cli|copilot|amp|goose|crush|auggie|augment|droid|cline|roo|continue|openhands|plandex|mentat|q|subl|idea|webstorm|pycharm|goland|rustrover|clion|fleet|open|eval|source|.|export|unset|alias|unalias|which|type|clear|reset|exit|logout|jobs|fg|bg|disown|wait|kill|killall|pkill|ps|lsof|top|htop|_tes_*|tes_prompt_info*) return ;;
   esac
-  if [ -n "$TES_WORKSPACE" ] && [ -d "$TES_WORKSPACE" ] && [ -n "$TES_REPO_ROOT" ] && [ "$TES_WORKSPACE" != "$TES_REPO_ROOT" ] && [ -d "$TES_REPO_ROOT/.git/tessera" ]; then
+  if [ -n "$TES_WORKSPACE" ] && [ -n "$TES_REPO_ROOT" ] && [ "$TES_WORKSPACE" != "$TES_REPO_ROOT" ] && [ -d "$TES_REPO_ROOT/.git/tessera" ]; then
     local phys_pwd
     phys_pwd="$(builtin pwd -P 2>/dev/null || printf '%s' "$PWD")"
     case "$phys_pwd" in
       "$TES_REPO_ROOT"*)
-        _TES_PREV_PWD="$PWD"
-        local rel_sub="${phys_pwd#$TES_REPO_ROOT}"
-        if [ -d "${TES_WORKSPACE}${rel_sub}" ]; then
-          builtin cd "${TES_WORKSPACE}${rel_sub}"
-        else
-          builtin cd "$TES_WORKSPACE"
+        local env_out
+        if command -v tes >/dev/null 2>&1 && env_out="$(_TES_IN_PREEXEC=1 command tes env 2>/dev/null)" && [ -n "$env_out" ]; then
+          eval "$env_out"
+        fi
+        if [ -n "$TES_WORKSPACE" ] && [ -d "$TES_WORKSPACE" ] && [ "$TES_WORKSPACE" != "$TES_REPO_ROOT" ]; then
+          _TES_PREV_PWD="$PWD"
+          local rel_sub="${phys_pwd#$TES_REPO_ROOT}"
+          if [ -d "${TES_WORKSPACE}${rel_sub}" ]; then
+            builtin cd "${TES_WORKSPACE}${rel_sub}"
+          else
+            builtin cd "$TES_WORKSPACE"
+          fi
         fi
         ;;
     esac
@@ -3400,18 +3468,7 @@ _tes_preexec() {
 
 _tes_prompt_command() {
   export TES_SESSION_ID="term-$$"
-  if [ -n "$_TES_PREV_PWD" ]; then
-    if [ -d "$_TES_PREV_PWD" ]; then
-      builtin cd "$_TES_PREV_PWD"
-    fi
-    unset _TES_PREV_PWD
-  elif [ -n "$TES_WORKSPACE" ] && [[ "$PWD" == "$TES_WORKSPACE"* ]] && [ -f "$PWD/.tessera/repo_root" ] && [ ! -L "$PWD/.tessera/repo_root" ]; then
-    local root_dir
-    root_dir="$(cat "$PWD/.tessera/repo_root" 2>/dev/null)"
-    if [ -n "$root_dir" ] && [ -d "$root_dir/.git/tessera" ]; then
-      builtin cd "$root_dir"
-    fi
-  fi
+  _tes_restore_repo_pwd
   local env_out
   if command -v tes >/dev/null 2>&1 && env_out="$(command tes env 2>/dev/null)" && [ -n "$env_out" ]; then
     eval "$env_out"
@@ -3425,6 +3482,7 @@ _tes_prompt_command() {
 
 tes() {
   export TES_SESSION_ID="term-$$"
+  _tes_restore_repo_pwd
   command tes "$@"
   local ret=$?
   if [ "$1" != "env" ]; then
@@ -3452,18 +3510,56 @@ _tes_prompt_command
 set -gx TES_SESSION_ID "term-$fish_pid"
 set -gx TES_SHELL "fish"
 
+function _tes_restore_repo_pwd
+    if set -q _TES_PREV_PWD
+        if test -d "$_TES_PREV_PWD"; and not test -f "$_TES_PREV_PWD/.tessera/repo_root"
+            builtin cd "$_TES_PREV_PWD"
+            set -e _TES_PREV_PWD
+            return
+        end
+        set -e _TES_PREV_PWD
+    end
+    set -l check_dir "$PWD"
+    set -l depth 0
+    while test -n "$check_dir"; and test "$check_dir" != "/"; and test $depth -lt 8
+        if test -f "$check_dir/.tessera/repo_root"; and not test -L "$check_dir/.tessera/repo_root"
+            set -l root_dir (cat "$check_dir/.tessera/repo_root" 2>/dev/null)
+            if test -n "$root_dir"; and test -d "$root_dir/.git/tessera"
+                set -l rel_sub (string replace -- "$check_dir" "" "$PWD")
+                if test -n "$rel_sub"; and test -d "$root_dir$rel_sub"
+                    builtin cd "$root_dir$rel_sub"
+                else
+                    builtin cd "$root_dir"
+                end
+                return
+            end
+        end
+        set check_dir (string replace -r '/[^/]*$' '' -- "$check_dir")
+        set depth (math $depth + 1)
+    end
+end
+
 function _tes_preexec --on-event fish_preexec
-    if string match -qr '^(tes|git|cd)(\s|$)' -- "$argv[1]"
+    _tes_restore_repo_pwd
+    if string match -qr '^\s*([^\s;&|]*/)?(tes|git|cd|pushd|popd|pwd|dirs|agy|antigravity|antigravity-cli|code|code-insiders|codium|cursor|cursor-agent|windsurf|zed|kiro|kiro-cli|claude|claude-code|codex|opencode|aider|aider-chat|gemini|gemini-cli|copilot|amp|goose|crush|auggie|augment|droid|cline|roo|continue|openhands|plandex|mentat|q|subl|idea|webstorm|pycharm|goland|rustrover|clion|fleet|open|eval|source|export|set|unset|alias|which|type|clear|reset|exit|logout|jobs|fg|bg|disown|wait|kill|killall|pkill|ps|lsof|top|htop)(\s|$|;|&|\|)' -- "$argv[1]"
         return
     end
     set -l phys_pwd (pwd -P 2>/dev/null; or echo "$PWD")
-    if set -q TES_WORKSPACE; and test -d "$TES_WORKSPACE"; and set -q TES_REPO_ROOT; and test "$TES_WORKSPACE" != "$TES_REPO_ROOT"; and test -d "$TES_REPO_ROOT/.git/tessera"; and string match -q "$TES_REPO_ROOT*" -- "$phys_pwd"
-        set -g _TES_PREV_PWD "$PWD"
-        set -l rel_sub (string replace -- "$TES_REPO_ROOT" "" "$phys_pwd")
-        if test -d "$TES_WORKSPACE$rel_sub"
-            builtin cd "$TES_WORKSPACE$rel_sub"
-        else
-            builtin cd "$TES_WORKSPACE"
+    if set -q TES_WORKSPACE; and set -q TES_REPO_ROOT; and test "$TES_WORKSPACE" != "$TES_REPO_ROOT"; and test -d "$TES_REPO_ROOT/.git/tessera"; and string match -q "$TES_REPO_ROOT*" -- "$phys_pwd"
+        if command -sq tes
+            set -l env_out (env _TES_IN_PREEXEC=1 tes env 2>/dev/null)
+            if test -n "$env_out"
+                printf "%s\n" $env_out | source
+            end
+        end
+        if set -q TES_WORKSPACE; and test -d "$TES_WORKSPACE"; and test "$TES_WORKSPACE" != "$TES_REPO_ROOT"
+            set -g _TES_PREV_PWD "$PWD"
+            set -l rel_sub (string replace -- "$TES_REPO_ROOT" "" "$phys_pwd")
+            if test -d "$TES_WORKSPACE$rel_sub"
+                builtin cd "$TES_WORKSPACE$rel_sub"
+            else
+                builtin cd "$TES_WORKSPACE"
+            end
         end
     end
 end
@@ -3471,17 +3567,7 @@ end
 function _tes_sync_env --on-event fish_prompt --on-event fish_postexec
     set -gx TES_SESSION_ID "term-$fish_pid"
     set -gx TES_SHELL "fish"
-    if set -q _TES_PREV_PWD
-        if test -d "$_TES_PREV_PWD"
-            builtin cd "$_TES_PREV_PWD"
-        end
-        set -e _TES_PREV_PWD
-    else if set -q TES_WORKSPACE; and string match -q "$TES_WORKSPACE*" -- "$PWD"; and test -f "$PWD/.tessera/repo_root"; and not test -L "$PWD/.tessera/repo_root"
-        set -l root_dir (cat "$PWD/.tessera/repo_root" 2>/dev/null)
-        if test -n "$root_dir"; and test -d "$root_dir/.git/tessera"
-            builtin cd "$root_dir"
-        end
-    end
+    _tes_restore_repo_pwd
     if command -sq tes
         set -l env_out (command tes env 2>/dev/null)
         if test -n "$env_out"
@@ -3494,6 +3580,7 @@ end
 
 function tes --wraps tes
     set -gx TES_SESSION_ID "term-$fish_pid"
+    _tes_restore_repo_pwd
     command tes $argv
     set -l ret $status
     if test "$argv[1]" != "env"
@@ -3535,20 +3622,16 @@ export TES_SESSION_ID="term-$$"
 _tes_sh_sync() {
   export TES_SESSION_ID="term-$$"
   if [ -n "${_TES_PREV_PWD:-}" ]; then
-    if [ -d "$_TES_PREV_PWD" ]; then
+    if [ -d "$_TES_PREV_PWD" ] && [ ! -f "$_TES_PREV_PWD/.tessera/repo_root" ]; then
       cd "$_TES_PREV_PWD" || true
     fi
     unset _TES_PREV_PWD
-  elif [ -n "${TES_WORKSPACE:-}" ] && [ -f "$PWD/.tessera/repo_root" ] && [ ! -L "$PWD/.tessera/repo_root" ]; then
-    case "$PWD" in
-      "$TES_WORKSPACE"*)
-        _tes_root_dir="$(cat "$PWD/.tessera/repo_root" 2>/dev/null)"
-        if [ -n "$_tes_root_dir" ] && [ -d "$_tes_root_dir/.git/tessera" ]; then
-          cd "$_tes_root_dir" || true
-        fi
-        unset _tes_root_dir
-        ;;
-    esac
+  elif [ -f "$PWD/.tessera/repo_root" ] && [ ! -L "$PWD/.tessera/repo_root" ]; then
+    _tes_root_dir="$(cat "$PWD/.tessera/repo_root" 2>/dev/null)"
+    if [ -n "$_tes_root_dir" ] && [ -d "$_tes_root_dir/.git/tessera" ]; then
+      cd "$_tes_root_dir" || true
+    fi
+    unset _tes_root_dir
   fi
   if command -v tes >/dev/null 2>&1; then
     _tes_out="$(command tes env 2>/dev/null)"
@@ -3750,6 +3833,25 @@ _tes_sync
                     || std::env::var("TES_SHELL").is_ok_and(|s| s == "fish");
                 let is_tcsh = std::env::var("TES_SHELL").is_ok_and(|s| s == "tcsh" || s == "csh");
                 let is_elvish = std::env::var("TES_SHELL").is_ok_and(|s| s == "elvish");
+                let in_preexec = std::env::var_os("_TES_IN_PREEXEC").is_some();
+
+                let restore_dir_opt = (!in_preexec)
+                    .then(|| {
+                        coord.invocation_dir().map(|inv_dir| {
+                            let repo_root = coord.git().repo_root();
+
+                            if let Ok(rel) = cwd.strip_prefix(inv_dir) {
+                                let candidate = repo_root.join(rel);
+
+                                if candidate.is_dir() {
+                                    return candidate.display().to_string();
+                                }
+                            }
+
+                            repo_root.display().to_string()
+                        })
+                    })
+                    .flatten();
 
                 if cli.json {
                     println!(
@@ -3766,6 +3868,10 @@ _tes_sync
                         }))?
                     );
                 } else if is_fish {
+                    if let Some(ref restore_dir) = restore_dir_opt {
+                        println!("builtin cd {};", fish_single_quote(restore_dir));
+                    }
+
                     println!("set -gx TES_BRANCH {};", fish_single_quote(&branch_name));
                     println!("set -gx TES_PORT {};", fish_single_quote(&port_str));
 
@@ -3883,6 +3989,10 @@ _tes_sync
                         println!("unset-env TES_WORKSPACE");
                     }
                 } else {
+                    if let Some(ref restore_dir) = restore_dir_opt {
+                        println!("cd {} 2>/dev/null || true", posix_single_quote(restore_dir));
+                    }
+
                     println!("export TES_BRANCH={}", posix_single_quote(&branch_name));
                     println!("export TES_PORT={}", posix_single_quote(&port_str));
 
@@ -3923,32 +4033,64 @@ _tes_sync
                         println!("unset TES_WORKSPACE");
                     }
 
-                    println!(
-                        r#"if [ -n "${{ZSH_VERSION:-}}" ]; then
+                    if !in_preexec {
+                        println!(
+                            r#"if [ -n "${{ZSH_VERSION:-}}" ]; then
   eval '
+  _tes_restore_repo_pwd() {{
+    if [[ -n "$_TES_PREV_PWD" ]]; then
+      if [[ -d "$_TES_PREV_PWD" && ! -f "$_TES_PREV_PWD/.tessera/repo_root" ]]; then
+        builtin cd -q "$_TES_PREV_PWD"
+        unset _TES_PREV_PWD
+        return
+      fi
+      unset _TES_PREV_PWD
+    fi
+    local check_dir="$PWD"
+    local depth=0
+    while [[ -n "$check_dir" && "$check_dir" != "/" && $depth -lt 8 ]]; do
+      if [[ -f "$check_dir/.tessera/repo_root" && ! -L "$check_dir/.tessera/repo_root" ]]; then
+        local root_dir="$(<"$check_dir/.tessera/repo_root")"
+        if [[ -n "$root_dir" && -d "$root_dir/.git/tessera" ]]; then
+          local rel_sub="${{PWD#$check_dir}}"
+          if [[ -n "$rel_sub" && -d "${{root_dir}}${{rel_sub}}" ]]; then builtin cd -q "${{root_dir}}${{rel_sub}}"; else builtin cd -q "$root_dir"; fi
+          return
+        fi
+      fi
+      check_dir="${{check_dir:h}}"
+      (( depth++ ))
+    done
+  }}
   _tes_preexec() {{
     unset _TES_CHAINED_AFTER_TES
-    if [[ "$1" == tes\ * || "$1" == "tes" || "$1" == git\ * || "$1" == "git" || "$1" == cd\ * || "$1" == "cd" ]]; then
-      if [[ "$1" == (tes\ *)*((\&\&|\;|\|\|))* ]]; then _TES_CHAINED_AFTER_TES=1; fi
+    _tes_restore_repo_pwd
+    if [[ "$1" == (tes\ *)*((\&\&|\;|\|\|))* ]]; then
+      _TES_CHAINED_AFTER_TES=1
       return
     fi
+    local cmd_line="${{1#"${{1%%[![:space:]]*}}"}}"
+    local first_word="${{cmd_line%%[[:space:]\;\&\|]*}}"
+    first_word="${{first_word##*/}}"
+    case "$first_word" in
+      tes|git|cd|pushd|popd|pwd|dirs|agy|antigravity|antigravity-cli|code|code-insiders|codium|cursor|cursor-agent|windsurf|zed|kiro|kiro-cli|claude|claude-code|codex|opencode|aider|aider-chat|gemini|gemini-cli|copilot|amp|goose|crush|auggie|augment|droid|cline|roo|continue|openhands|plandex|mentat|q|subl|idea|webstorm|pycharm|goland|rustrover|clion|fleet|open|eval|source|.|export|unset|alias|unalias|which|type|clear|reset|exit|logout|jobs|fg|bg|disown|wait|kill|killall|pkill|ps|lsof|top|htop|_tes_*|tes_prompt_info*) return ;;
+    esac
     local phys_pwd="${{PWD:A}}"
-    if [[ -n "$TES_WORKSPACE" && -d "$TES_WORKSPACE" && -n "$TES_REPO_ROOT" && "$TES_WORKSPACE" != "$TES_REPO_ROOT" && -d "$TES_REPO_ROOT/.git/tessera" && "$phys_pwd" == "$TES_REPO_ROOT"* ]]; then
-      _TES_PREV_PWD="$PWD"
-      local rel_sub="${{phys_pwd#$TES_REPO_ROOT}}"
-      if [[ -d "${{TES_WORKSPACE}}${{rel_sub}}" ]]; then builtin cd -q "${{TES_WORKSPACE}}${{rel_sub}}"; else builtin cd -q "$TES_WORKSPACE"; fi
+    if [[ -n "$TES_WORKSPACE" && -n "$TES_REPO_ROOT" && "$TES_WORKSPACE" != "$TES_REPO_ROOT" && -d "$TES_REPO_ROOT/.git/tessera" && "$phys_pwd" == "$TES_REPO_ROOT"* ]]; then
+      local env_out
+      if command -v tes >/dev/null 2>&1 && env_out="$(_TES_IN_PREEXEC=1 command tes env 2>/dev/null)" && [[ -n "$env_out" ]]; then
+        eval "$env_out"
+      fi
+      if [[ -n "$TES_WORKSPACE" && -d "$TES_WORKSPACE" && "$TES_WORKSPACE" != "$TES_REPO_ROOT" ]]; then
+        _TES_PREV_PWD="$PWD"
+        local rel_sub="${{phys_pwd#$TES_REPO_ROOT}}"
+        if [[ -d "${{TES_WORKSPACE}}${{rel_sub}}" ]]; then builtin cd -q "${{TES_WORKSPACE}}${{rel_sub}}"; else builtin cd -q "$TES_WORKSPACE"; fi
+      fi
     fi
   }}
   _tes_precmd() {{
     export TES_SESSION_ID="term-$$"
     unset _TES_CHAINED_AFTER_TES
-    if [[ -n "$_TES_PREV_PWD" ]]; then
-      if [[ -d "$_TES_PREV_PWD" ]]; then builtin cd -q "$_TES_PREV_PWD"; fi
-      unset _TES_PREV_PWD
-    elif [[ -n "$TES_WORKSPACE" && "$PWD" == "$TES_WORKSPACE"* && -f "$PWD/.tessera/repo_root" && ! -L "$PWD/.tessera/repo_root" ]]; then
-      local root_dir="$(<"$PWD/.tessera/repo_root")"
-      if [[ -n "$root_dir" && -d "$root_dir/.git/tessera" ]]; then builtin cd -q "$root_dir"; fi
-    fi
+    _tes_restore_repo_pwd
     local env_out
     if command -v tes >/dev/null 2>&1 && env_out="$(command tes env 2>/dev/null)" && [[ -n "$env_out" ]]; then
       eval "$env_out"
@@ -3959,10 +4101,7 @@ _tes_sync
   tes() {{
     export TES_SESSION_ID="term-$$"
     local chained="$_TES_CHAINED_AFTER_TES"
-    if [[ -n "$_TES_PREV_PWD" && -d "$_TES_PREV_PWD" ]]; then
-      builtin cd -q "$_TES_PREV_PWD"
-      unset _TES_PREV_PWD
-    fi
+    _tes_restore_repo_pwd
     command tes "$@"
     local ret=$?
     if [[ "$1" != "env" ]]; then
@@ -3979,12 +4118,11 @@ _tes_sync
     fi
     return $ret
   }}
-  if (( ! ${{preexec_functions[(I)_tes_preexec]}} )); then
-    preexec_functions=(_tes_preexec "${{preexec_functions[@]}}")
-  fi
+  preexec_functions=(_tes_preexec ${{preexec_functions:#_tes_preexec}})
   '
 fi"#
-                    );
+                        );
+                    }
                 }
             } else if !cli.json {
                 let is_fish = std::env::var("FISH_VERSION").is_ok()

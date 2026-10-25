@@ -89,28 +89,39 @@ pub fn detect_session_id(explicit: Option<&str>) -> String {
     #[cfg(not(unix))]
     let ppid = i32::try_from(std::process::id()).unwrap_or(1);
 
-    let ancestor_harness = detect_ancestor_harness_process(ppid);
+    let has_harness_env = std::env::var_os("ANTIGRAVITY_AGENT").is_some()
+        || std::env::var_os("ANTIGRAVITY_CONVERSATION_ID").is_some()
+        || std::env::var_os("CLAUDECODE").is_some()
+        || std::env::var_os("CLAUDE_SESSION_ID").is_some()
+        || std::env::var_os("CODEX_THREAD_ID").is_some()
+        || std::env::var_os("CODEX_SESSION_ID").is_some()
+        || std::env::var_os("OPENAI_CODEX_SESSION_ID").is_some()
+        || std::env::var_os("CODEX_SANDBOX").is_some()
+        || std::env::var_os("CODEX_CI").is_some()
+        || std::env::var_os("OPENCODE_SESSION_ID").is_some()
+        || std::env::var_os("CURSOR_TRACE_ID").is_some()
+        || std::env::var_os("CURSOR_SESSION_ID").is_some()
+        || std::env::var_os("WINDSURF_SESSION_ID").is_some()
+        || std::env::var_os("CODEIUM_SESSION_ID").is_some()
+        || std::env::var_os("KIRO_SESSION_ID").is_some()
+        || std::env::var_os("COPILOT_SESSION_ID").is_some()
+        || std::env::var_os("GEMINI_CLI_SESSION_ID").is_some()
+        || std::env::var_os("GEMINI_SESSION_ID").is_some()
+        || std::env::var_os("AIDER_SESSION_ID").is_some()
+        || std::env::var_os("AMP_SESSION_ID").is_some()
+        || std::env::var_os("GOOSE_SESSION_ID").is_some()
+        || std::env::var_os("AUGMENT_SESSION_ID").is_some();
 
     if let Ok(val) = std::env::var("TES_SESSION_ID") {
         let trimmed = val.trim();
-        if !trimmed.is_empty() {
-            let is_inherited_term_in_agent = trimmed.starts_with("term-")
-                && (std::env::var_os("ANTIGRAVITY_AGENT").is_some()
-                    || std::env::var_os("CLAUDECODE").is_some()
-                    || std::env::var_os("CODEX_THREAD_ID").is_some()
-                    || std::env::var_os("CODEX_SESSION_ID").is_some()
-                    || std::env::var_os("OPENAI_CODEX_SESSION_ID").is_some()
-                    || std::env::var_os("CODEX_SANDBOX").is_some()
-                    || std::env::var_os("CODEX_CI").is_some()
-                    || std::env::var_os("OPENCODE_SESSION_ID").is_some()
-                    || std::env::var_os("CURSOR_TRACE_ID").is_some()
-                    || std::env::var_os("WINDSURF_SESSION_ID").is_some()
-                    || std::env::var_os("KIRO_SESSION_ID").is_some()
-                    || ancestor_harness.is_some());
-            if !is_inherited_term_in_agent {
-                let short = &trimmed[..32.min(trimmed.len())];
-                return sanitize_id(short);
-            }
+        if !trimmed.is_empty() && !trimmed.starts_with("term-") {
+            let short = &trimmed[..32.min(trimmed.len())];
+            return sanitize_id(short);
+        }
+
+        if !trimmed.is_empty() && !has_harness_env && trimmed == format!("term-{ppid}") {
+            let short = &trimmed[..32.min(trimmed.len())];
+            return sanitize_id(short);
         }
     }
 
@@ -127,6 +138,12 @@ pub fn detect_session_id(explicit: Option<&str>) -> String {
         ("CODEX_SESSION_ID", "codex-"),
         ("OPENAI_CODEX_SESSION_ID", "codex-"),
         ("COPILOT_SESSION_ID", "copilot-"),
+        ("GEMINI_CLI_SESSION_ID", "gemini-"),
+        ("GEMINI_SESSION_ID", "gemini-"),
+        ("AIDER_SESSION_ID", "aider-"),
+        ("AMP_SESSION_ID", "amp-"),
+        ("GOOSE_SESSION_ID", "goose-"),
+        ("AUGMENT_SESSION_ID", "augment-"),
     ] {
         if let Ok(val) = std::env::var(env_key) {
             let trimmed = val.trim();
@@ -137,13 +154,32 @@ pub fn detect_session_id(explicit: Option<&str>) -> String {
         }
     }
 
+    let ancestor_harness = detect_ancestor_harness_process(ppid);
+
+    if let Ok(val) = std::env::var("TES_SESSION_ID") {
+        let trimmed = val.trim();
+        if !trimmed.is_empty() && !has_harness_env && ancestor_harness.is_none() {
+            let short = &trimmed[..32.min(trimmed.len())];
+            return sanitize_id(short);
+        }
+    }
+
     if let Some((harness_prefix, harness_pid)) = ancestor_harness {
         return format!("{harness_prefix}-{harness_pid}");
     }
 
     let stable_pid = find_stable_session_ancestor_pid(ppid);
+
     if std::env::var_os("CODEX_SANDBOX").is_some() || std::env::var_os("CODEX_CI").is_some() {
         return format!("codex-{stable_pid}");
+    }
+
+    if std::env::var_os("CLAUDECODE").is_some() {
+        return format!("claude-{stable_pid}");
+    }
+
+    if std::env::var_os("ANTIGRAVITY_AGENT").is_some() {
+        return format!("antigravity-{stable_pid}");
     }
 
     for (env_key, prefix) in [
@@ -181,11 +217,78 @@ pub fn detect_session_id(explicit: Option<&str>) -> String {
     format!("session-{stable_pid}")
 }
 
+/// Maps a normalized binary or script basename to its canonical CLI agent harness identifier.
+fn classify_cli_harness_token(bin_name: &str) -> Option<&'static str> {
+    if bin_name == "codex" || bin_name.starts_with("codex-") {
+        return Some("codex");
+    }
+
+    match bin_name {
+        "claude" | "claude-code" => Some("claude"),
+        "opencode" => Some("opencode"),
+        "kiro-cli" => Some("kiro"),
+        "cursor-agent" => Some("cursor"),
+        "aider" | "aider-chat" => Some("aider"),
+        "gemini" | "gemini-cli" => Some("gemini"),
+        "copilot" => Some("copilot"),
+        "amp" => Some("amp"),
+        "goose" => Some("goose"),
+        "crush" => Some("crush"),
+        "auggie" | "augment" => Some("augment"),
+        "droid" => Some("droid"),
+        "cline" => Some("cline"),
+        "openhands" => Some("openhands"),
+        "plandex" => Some("plandex"),
+        _ => None,
+    }
+}
+
+/// Queries the full command line arguments for `pid` when inspecting script runtimes (`node`, `python`, `bun`).
+fn query_process_args(pid: i32) -> Option<String> {
+    if pid <= 1 {
+        return None;
+    }
+
+    #[cfg(unix)]
+    {
+        if let Ok(raw) = fs::read(format!("/proc/{pid}/cmdline")) {
+            if !raw.is_empty() {
+                let joined: String = raw
+                    .split(|&b| b == 0)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| String::from_utf8_lossy(s).into_owned())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+
+                if !joined.trim().is_empty() {
+                    return Some(joined);
+                }
+            }
+        }
+
+        if let Ok(out) = std::process::Command::new("ps")
+            .args(["-o", "args=", "-p", &pid.to_string()])
+            .output()
+        {
+            if out.status.success() {
+                let line = String::from_utf8_lossy(&out.stdout).trim().to_string();
+
+                if !line.is_empty() {
+                    return Some(line);
+                }
+            }
+        }
+    }
+
+    None
+}
+
 /// Walks up the process tree from `start_pid` to check if the current command was spawned by a
 /// CLI coding agent (`codex`, `claude`, `opencode`, `kiro-cli`, `aider`, `gemini`,
-/// `cursor-agent`), returning `(harness_name, pid)`.
+/// `cursor-agent`, `amp`, `goose`, `crush`, `auggie`, etc.), returning `(harness_name, pid)`.
 fn detect_ancestor_harness_process(start_pid: i32) -> Option<(&'static str, i32)> {
     let mut curr = start_pid;
+
     for _ in 0..6 {
         if curr <= 1 {
             break;
@@ -212,37 +315,40 @@ fn detect_ancestor_harness_process(start_pid: i32) -> Option<(&'static str, i32)
             break;
         }
 
-        if bin_name == "codex" || bin_name.starts_with("codex-") {
-            return Some(("codex", curr));
+        if let Some(harness) = classify_cli_harness_token(&bin_name) {
+            return Some((harness, curr));
         }
 
-        if bin_name == "claude" {
-            return Some(("claude", curr));
-        }
+        if matches!(bin_name.as_str(), "node" | "nodejs" | "bun" | "deno")
+            || bin_name.starts_with("python")
+        {
+            if let Some(args_line) = query_process_args(curr) {
+                for tok in args_line.split_whitespace().skip(1) {
+                    if tok.starts_with('-') {
+                        continue;
+                    }
 
-        if bin_name == "opencode" {
-            return Some(("opencode", curr));
-        }
+                    let script_base = tok
+                        .rsplit(['/', '\\'])
+                        .next()
+                        .unwrap_or(tok)
+                        .trim_end_matches(".js")
+                        .trim_end_matches(".mjs")
+                        .trim_end_matches(".cjs")
+                        .trim_end_matches(".py")
+                        .to_ascii_lowercase();
 
-        if bin_name == "kiro-cli" {
-            return Some(("kiro", curr));
-        }
-
-        if bin_name == "cursor-agent" {
-            return Some(("cursor", curr));
-        }
-
-        if bin_name == "aider" {
-            return Some(("aider", curr));
-        }
-
-        if bin_name == "gemini" {
-            return Some(("gemini", curr));
+                    if let Some(harness) = classify_cli_harness_token(&script_base) {
+                        return Some((harness, curr));
+                    }
+                }
+            }
         }
 
         if next_ppid <= 1 || next_ppid == curr {
             break;
         }
+
         curr = next_ppid;
     }
 
@@ -456,6 +562,26 @@ pub fn detect_session_waypoint(session_id: &str) -> SessionWaypoint {
         Some("codex")
     } else if session_id.starts_with("copilot-") {
         Some("copilot")
+    } else if session_id.starts_with("gemini-") {
+        Some("gemini")
+    } else if session_id.starts_with("aider-") {
+        Some("aider")
+    } else if session_id.starts_with("amp-") {
+        Some("amp")
+    } else if session_id.starts_with("goose-") {
+        Some("goose")
+    } else if session_id.starts_with("crush-") {
+        Some("crush")
+    } else if session_id.starts_with("augment-") {
+        Some("augment")
+    } else if session_id.starts_with("droid-") {
+        Some("droid")
+    } else if session_id.starts_with("cline-") {
+        Some("cline")
+    } else if session_id.starts_with("openhands-") {
+        Some("openhands")
+    } else if session_id.starts_with("plandex-") {
+        Some("plandex")
     } else {
         None
     };
@@ -476,6 +602,12 @@ pub fn detect_session_waypoint(session_id: &str) -> SessionWaypoint {
         ("CODEX_SESSION_ID", "codex"),
         ("OPENAI_CODEX_SESSION_ID", "codex"),
         ("COPILOT_SESSION_ID", "copilot"),
+        ("GEMINI_CLI_SESSION_ID", "gemini"),
+        ("GEMINI_SESSION_ID", "gemini"),
+        ("AIDER_SESSION_ID", "aider"),
+        ("AMP_SESSION_ID", "amp"),
+        ("GOOSE_SESSION_ID", "goose"),
+        ("AUGMENT_SESSION_ID", "augment"),
     ] {
         if prefix_harness.is_some_and(|ph| ph != harness_name) {
             continue;
@@ -555,7 +687,13 @@ pub fn detect_session_waypoint(session_id: &str) -> SessionWaypoint {
     #[cfg(not(unix))]
     let ppid = i32::try_from(std::process::id()).unwrap_or(1);
 
-    if harness.is_none() {
+    let explicit_term_pid = session_id
+        .strip_prefix("term-")
+        .or_else(|| session_id.strip_prefix("session-"))
+        .and_then(|s| s.parse::<i32>().ok())
+        .filter(|&pid| pid > 1 && pid == ppid);
+
+    if harness.is_none() && explicit_term_pid.is_none() {
         if let Some((prefix, _pid)) = detect_ancestor_harness_process(ppid) {
             let mapped = if prefix == "claude" {
                 "claude-code"
@@ -566,7 +704,7 @@ pub fn detect_session_waypoint(session_id: &str) -> SessionWaypoint {
         }
     }
 
-    let stable_pid = find_stable_session_ancestor_pid(ppid);
+    let stable_pid = explicit_term_pid.unwrap_or_else(|| find_stable_session_ancestor_pid(ppid));
     let shell_pid = u32::try_from(stable_pid).ok();
     let tty = query_process_tty(stable_pid);
     let ide_pid = detect_ancestor_ide_pid(stable_pid);

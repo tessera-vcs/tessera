@@ -625,6 +625,55 @@ impl OpLogStore {
         }
 
         if heads.len() == 1 {
+            if let Ok(op) = self.read_operation(&heads[0]) {
+                return Ok(op);
+            }
+        }
+
+        let _lock = self.acquire_oplog_lock();
+        self.load_current_reconciled_unlocked()
+    }
+
+    /// Path to the advisory transaction and reconciliation lock file (`.git/tessera/oplog.lock`).
+    #[must_use]
+    pub fn oplog_lock_path(&self) -> PathBuf {
+        self.store_dir.join("oplog.lock")
+    }
+
+    /// Acquires an exclusive cross-process advisory lock on `.git/tessera/oplog.lock` for the
+    /// lifetime of the returned [`fs::File`] handle.
+    fn acquire_oplog_lock(&self) -> Option<fs::File> {
+        let lock_path = self.oplog_lock_path();
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(lock_path)
+            .ok()?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            // SAFETY: `file.as_raw_fd()` is a valid open file descriptor owned by `file` for the
+            // duration of this call, and `libc::LOCK_EX` is a standard POSIX advisory flock call.
+            let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        }
+
+        Some(file)
+    }
+
+    /// Reconciles multiple `op_heads` assuming the caller already holds [`Self::acquire_oplog_lock`].
+    fn load_current_reconciled_unlocked(&self) -> CoreResult<Operation> {
+        let heads = self.list_op_heads()?;
+
+        if heads.is_empty() {
+            return Err(CoreError::RepoNotFound(
+                self.store_dir.display().to_string(),
+            ));
+        }
+
+        if heads.len() == 1 {
             return self.read_operation(&heads[0]);
         }
 
@@ -633,9 +682,11 @@ impl OpLogStore {
 
         for next_head_id in &heads[1..] {
             let next_op = self.read_operation(next_head_id)?;
+
             let base_view = self
                 .find_common_parent_view(&first_op, &next_op)
-                .unwrap_or_default();
+                .unwrap_or_else(|| Self::synthesize_fallback_base_view(&first_op, &next_op));
+
             acc_view = View::merge_views(&base_view, &acc_view, &next_op.view);
         }
 
@@ -649,8 +700,82 @@ impl OpLogStore {
             true,
             acc_view,
         )?;
+
         self.write_operation(&reconciled_op)?;
         Ok(reconciled_op)
+    }
+
+    /// Synthesizes a conservative common-ancestor [`View`] when two concurrent operations are
+    /// separated by more than the bounded BFS window, preventing deleted sessions or branches
+    /// from being resurrected during 3-way [`View::merge_views`].
+    fn synthesize_fallback_base_view(left: &Operation, right: &Operation) -> View {
+        let mut base = View::default();
+
+        for (branch, l_oid) in &left.view.branches {
+            if right.view.branches.get(branch) == Some(l_oid) {
+                base.branches.insert(branch.clone(), *l_oid);
+            }
+        }
+
+        for (agent_id, r_agent) in &right.view.agents {
+            if !left.view.agents.contains_key(agent_id)
+                && r_agent.updated_at_ms <= left.timestamp_ms
+            {
+                base.agents.insert(agent_id.clone(), r_agent.clone());
+            }
+        }
+
+        for (agent_id, l_agent) in &left.view.agents {
+            if (!right.view.agents.contains_key(agent_id)
+                && l_agent.updated_at_ms <= right.timestamp_ms)
+                || right.view.agents.get(agent_id) == Some(l_agent)
+            {
+                base.agents.insert(agent_id.clone(), l_agent.clone());
+            }
+        }
+
+        for (path, l_cid) in &left.view.conflicts {
+            if right.view.conflicts.get(path) == Some(l_cid) {
+                base.conflicts.insert(path.clone(), l_cid.clone());
+            }
+        }
+
+        base
+    }
+
+    /// Compares two [`View`] states ignoring `updated_at_ms` timestamp jitter on unchanged agents.
+    fn views_semantically_equal(left: &View, right: &View) -> bool {
+        if left == right {
+            return true;
+        }
+
+        if left.branches != right.branches
+            || left.changes != right.changes
+            || left.conflicts != right.conflicts
+            || left.observed_blobs != right.observed_blobs
+            || left.stashes != right.stashes
+            || left.next_agent_slot != right.next_agent_slot
+            || left.agents.len() != right.agents.len()
+        {
+            return false;
+        }
+
+        for (agent_id, l_agent) in &left.agents {
+            let Some(r_agent) = right.agents.get(agent_id) else {
+                return false;
+            };
+
+            let mut l_norm = l_agent.clone();
+            let mut r_norm = r_agent.clone();
+            l_norm.updated_at_ms = 0;
+            r_norm.updated_at_ms = 0;
+
+            if l_norm != r_norm {
+                return false;
+            }
+        }
+
+        true
     }
 
     /// Performs a bounded bidirectional BFS over operation parents to locate the most recent
@@ -666,7 +791,7 @@ impl OpLogStore {
         right_ancestors.insert(right.id.clone());
         right_queue.push_back(right.id.clone());
 
-        for _ in 0..64 {
+        for _ in 0..512 {
             if left_queue.is_empty() && right_queue.is_empty() {
                 break;
             }
@@ -734,9 +859,14 @@ impl OpLogStore {
     where
         F: FnOnce(&mut View) -> CoreResult<()>,
     {
-        let current = self.load_current_reconciled()?;
+        let _lock = self.acquire_oplog_lock();
+        let current = self.load_current_reconciled_unlocked()?;
         let mut next_view = current.view.clone();
         f(&mut next_view)?;
+
+        if is_ephemeral && Self::views_semantically_equal(&current.view, &next_view) {
+            return Ok(current);
+        }
 
         let next_op = Operation::new(
             vec![current.id],
@@ -745,6 +875,7 @@ impl OpLogStore {
             is_ephemeral,
             next_view,
         )?;
+
         self.write_operation(&next_op)?;
         Ok(next_op)
     }
@@ -1007,6 +1138,89 @@ LD_PRELOAD = "/tmp/evil.so"
         let cfg_revoked = store.load_config().expect("load revoked config");
         assert!(cfg_revoked.verify_command.is_none());
         assert!(cfg_revoked.pager.is_none());
+    }
+
+    #[test]
+    fn ephemeral_noop_record_tx_skips_redundant_oplog_writes_and_fallback_base_prunes_dead_sessions(
+    ) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = OpLogStore::new(tmp.path());
+        store.init(View::default()).expect("init store");
+
+        let dummy_oid =
+            ObjectId::from_hex("1111111111111111111111111111111111111111").expect("oid");
+
+        let op1 = store
+            .record_tx("term-100", "register session", true, |view| {
+                view.agents.insert(
+                    "term-100".to_string(),
+                    AgentMetadata {
+                        agent_id: "term-100".to_string(),
+                        slot: 1,
+                        change_id: ChangeId::from_seed("term-100"),
+                        base_commit: dummy_oid,
+                        head_commit: dummy_oid,
+                        head_tree: dummy_oid,
+                        intent: "Active session term-100".to_string(),
+                        intent_inferred: true,
+                        claimed_symbols: BTreeSet::new(),
+                        scopes: Vec::new(),
+                        workspace_path: None,
+                        read_blobs: BTreeMap::new(),
+                        own_blobs: BTreeMap::new(),
+                        deleted_paths: BTreeSet::new(),
+                        foreign_baseline: BTreeSet::new(),
+                        integrated_peer_blobs: BTreeMap::new(),
+                        target_branch: Some("main".to_string()),
+                        checkpoints: BTreeMap::new(),
+                        waypoint: None,
+                        updated_at_ms: 500,
+                    },
+                );
+
+                view.next_agent_slot = 2;
+                Ok(())
+            })
+            .expect("record op1");
+
+        let op2 = store
+            .record_tx("term-100", "ensure session noop", true, |view| {
+                if let Some(agent) = view.agents.get_mut("term-100") {
+                    agent.updated_at_ms = 999;
+                }
+
+                Ok(())
+            })
+            .expect("record noop op2");
+
+        assert_eq!(op1.id, op2.id);
+
+        let mut pruned_view = op1.view.clone();
+        pruned_view.agents.remove("term-100");
+
+        let left_op = Operation {
+            id: OpId("2222222222222222222222222222222222222222".to_string()),
+            parents: Vec::new(),
+            timestamp_ms: 1000,
+            agent_id: "gc".to_string(),
+            description: "prune dead shell sessions".to_string(),
+            is_ephemeral: true,
+            view: pruned_view,
+        };
+
+        let right_op = Operation {
+            id: OpId("3333333333333333333333333333333333333333".to_string()),
+            parents: Vec::new(),
+            timestamp_ms: 900,
+            agent_id: "watcher".to_string(),
+            description: "concurrent op with stale session".to_string(),
+            is_ephemeral: true,
+            view: op1.view.clone(),
+        };
+
+        let fallback_base = OpLogStore::synthesize_fallback_base_view(&left_op, &right_op);
+        let merged = View::merge_views(&fallback_base, &left_op.view, &right_op.view);
+        assert!(!merged.agents.contains_key("term-100"));
     }
 }
 

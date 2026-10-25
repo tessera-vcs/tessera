@@ -543,9 +543,75 @@ impl Coordinator {
             .ok_or_else(|| CoreError::NotFound("HEAD commit".to_string()))?;
         let commit_obj = self.git.read_commit(&head_commit)?;
         let head_branch = self.git.current_branch_name().unwrap_or_default();
-        let foreign_baseline = if is_ai_session_id(session_id) {
-            match self.oplog.load_current_reconciled() {
-                Ok(cur) if !cur.view.agents.contains_key(session_id) => {
+        let current_op = self.oplog.load_current_reconciled().ok();
+
+        let is_ai_agent = !session_id.starts_with("term-")
+            && !session_id.starts_with("session-")
+            && !session_id.starts_with("mcp-")
+            && session_id != "editor";
+
+        let is_term_session =
+            session_id.starts_with("term-") || session_id.starts_with("session-");
+
+        if let Some(ref cur) = current_op {
+            if let Some(existing) = cur.view.agents.get(session_id) {
+                let used_by_others: BTreeSet<u16> = cur
+                    .view
+                    .agents
+                    .iter()
+                    .filter(|(id, _)| *id != session_id)
+                    .map(|(_, a)| a.slot)
+                    .collect();
+
+                let max_compact_slot = (used_by_others.len() as u16).saturating_add(1).max(1);
+                let slot_ok = existing.slot > 0
+                    && !used_by_others.contains(&existing.slot)
+                    && (existing.workspace_path.is_some() || existing.slot <= max_compact_slot);
+
+                let has_placeholder = is_ai_agent
+                    && existing.targets_head_branch(&head_branch)
+                    && existing.intent_inferred
+                    && !existing.has_own_changes()
+                    && cur.view.agents.iter().any(|(id, a)| {
+                        id.starts_with("mcp-")
+                            || ((id.starts_with("term-") || id.starts_with("session-"))
+                                && !a.intent_inferred
+                                && !a.has_own_changes()
+                                && (a.target_branch.is_some() || !a.claimed_symbols.is_empty()))
+                    });
+
+                let branch_ok = existing.target_branch.is_some() || !is_term_session;
+
+                let commit_ok = !(existing.targets_head_branch(&head_branch)
+                    && !existing.has_own_changes()
+                    && existing.claimed_symbols.is_empty()
+                    && existing.read_blobs.is_empty()
+                    && existing.head_commit == existing.base_commit
+                    && existing.base_commit != head_commit);
+
+                let intent_ok = explicit_intent.is_none_or(|s| {
+                    let trimmed = s.trim();
+                    trimmed.is_empty()
+                        || (!existing.intent_inferred && existing.intent == trimmed)
+                });
+
+                let waypoint_ok = session_id == "editor" || existing.waypoint.is_some();
+
+                if slot_ok
+                    && !has_placeholder
+                    && branch_ok
+                    && commit_ok
+                    && intent_ok
+                    && waypoint_ok
+                {
+                    return Ok(existing.clone());
+                }
+            }
+        }
+
+        let foreign_baseline = if is_ai_agent {
+            match current_op.as_ref() {
+                Some(cur) if !cur.view.agents.contains_key(session_id) => {
                     self.unowned_worktree_changes(&cur.view, &commit_obj.tree_id)
                 }
                 _ => BTreeSet::new(),
@@ -555,22 +621,19 @@ impl Coordinator {
         };
 
         let mut out_agent: Option<AgentMetadata> = None;
+
         self.oplog.record_tx(
             session_id,
             format!("ensure session {session_id}"),
             true,
             |view| {
-                let is_ai_agent = !session_id.starts_with("term-")
-                    && !session_id.starts_with("session-")
-                    && !session_id.starts_with("mcp-")
-                    && session_id != "editor";
-
                 let adopted_placeholder = if is_ai_agent {
                     let existing_needs_adoption = view.agents.get(session_id).is_none_or(|a| {
                         a.targets_head_branch(&head_branch)
                             && a.intent_inferred
                             && !a.has_own_changes()
                     });
+
                     if existing_needs_adoption {
                         let placeholder_id = view
                             .agents
@@ -584,6 +647,7 @@ impl Coordinator {
                             })
                             .max_by_key(|(_, a)| a.updated_at_ms)
                             .map(|(id, _)| id.clone());
+
                         placeholder_id.and_then(|pid| view.agents.remove(&pid))
                     } else {
                         None
@@ -592,27 +656,65 @@ impl Coordinator {
                     None
                 };
 
-                let is_term_session =
-                    session_id.starts_with("term-") || session_id.starts_with("session-");
                 let initial_branch = if is_term_session {
                     self.git.current_branch_name().ok()
                 } else {
                     None
                 };
-                let detected_waypoint =
-                    (session_id != "editor").then(|| detect_session_waypoint(session_id));
+
+                let inherited_term_branch = if is_ai_agent {
+                    let env_root_matches = std::env::var("TES_REPO_ROOT").ok().is_some_and(|r| {
+                        let env_path = Path::new(r.trim());
+                        env_path == self.git.repo_root()
+                            || (env_path.canonicalize().ok()
+                                == self.git.repo_root().canonicalize().ok()
+                                && env_path.canonicalize().is_ok())
+                    });
+
+                    if env_root_matches {
+                        std::env::var("TES_BRANCH")
+                            .ok()
+                            .map(|b| b.trim().to_string())
+                            .filter(|b| !b.is_empty() && validate_ref_name(b).is_ok())
+                            .or_else(|| {
+                                std::env::var("TES_SESSION_ID")
+                                    .ok()
+                                    .map(|s| s.trim().to_string())
+                                    .filter(|s| s.starts_with("term-") || s.starts_with("session-"))
+                                    .and_then(|s| {
+                                        view.agents.get(&s).and_then(|a| a.target_branch.clone())
+                                    })
+                            })
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                let needs_waypoint = session_id != "editor"
+                    && view
+                        .agents
+                        .get(session_id)
+                        .and_then(|a| a.waypoint.as_ref())
+                        .is_none();
+
+                let detected_waypoint = needs_waypoint.then(|| detect_session_waypoint(session_id));
+
                 let used_by_others: BTreeSet<u16> = view
                     .agents
                     .iter()
                     .filter(|(id, _)| *id != session_id)
                     .map(|(_, a)| a.slot)
                     .collect();
+
                 let lowest_free_slot = (1u16..=u16::MAX)
                     .find(|s| !used_by_others.contains(s))
                     .unwrap_or(1);
 
                 if let Some(existing) = view.agents.get_mut(session_id) {
                     let max_compact_slot = (used_by_others.len() as u16).saturating_add(1).max(1);
+
                     if existing.workspace_path.is_none()
                         && (existing.slot == 0
                             || used_by_others.contains(&existing.slot)
@@ -629,6 +731,7 @@ impl Coordinator {
 
                         if existing.targets_head_branch(&head_branch) {
                             existing.target_branch = adopted.target_branch;
+
                             if !existing.has_own_changes() {
                                 existing.base_commit = adopted.base_commit;
                                 existing.head_commit = adopted.head_commit;
@@ -637,6 +740,7 @@ impl Coordinator {
                         }
 
                         existing.claimed_symbols.extend(adopted.claimed_symbols);
+
                         for (k, v) in adopted.read_blobs {
                             existing.read_blobs.entry(k).or_insert(v);
                         }
@@ -667,15 +771,16 @@ impl Coordinator {
                         }
                     }
 
-                    if session_id != "editor"
-                        && (existing.waypoint.is_none() || detect_session_id(None) == session_id)
-                    {
-                        existing.waypoint = detected_waypoint.clone();
+                    if existing.waypoint.is_none() {
+                        if let Some(wp) = detected_waypoint.clone() {
+                            existing.waypoint = Some(wp);
+                        }
                     }
 
                     existing.updated_at_ms = now_millis();
                     let active_slot = existing.slot;
                     out_agent = Some(existing.clone());
+
                     view.next_agent_slot = used_by_others
                         .iter()
                         .copied()
@@ -683,10 +788,12 @@ impl Coordinator {
                         .unwrap_or(0)
                         .max(active_slot)
                         .saturating_add(1);
+
                     return Ok(());
                 }
 
                 let slot = lowest_free_slot;
+
                 view.next_agent_slot = used_by_others
                     .iter()
                     .copied()
@@ -694,8 +801,10 @@ impl Coordinator {
                     .unwrap_or(0)
                     .max(slot)
                     .saturating_add(1);
+
                 let change_id =
                     ChangeId::from_seed(&format!("{session_id}-{}", head_commit.as_str()));
+
                 let (mut intent, mut intent_inferred) = match explicit_intent {
                     Some(s) if !s.trim().is_empty() => (s.trim().to_string(), false),
                     _ => (format!("Active session {session_id}"), true),
@@ -714,14 +823,32 @@ impl Coordinator {
                         intent = adopted.intent;
                         intent_inferred = false;
                     }
+
                     base_commit = adopted.base_commit;
                     head_commit_val = adopted.head_commit;
                     head_tree = adopted.head_tree;
                     claimed_symbols = adopted.claimed_symbols;
                     read_blobs = adopted.read_blobs;
                     target_branch = adopted.target_branch;
+
                     if waypoint.is_none() {
                         waypoint = adopted.waypoint;
+                    }
+                } else if let Some(env_b) = inherited_term_branch {
+                    let resolved_cid = self
+                        .git
+                        .resolve_ref(&format!("refs/heads/{env_b}"))
+                        .ok()
+                        .flatten()
+                        .or_else(|| view.branches.get(&env_b).copied());
+
+                    if let Some(b_cid) = resolved_cid {
+                        if let Ok(b_commit) = self.git.read_commit(&b_cid) {
+                            target_branch = Some(env_b);
+                            base_commit = b_cid;
+                            head_commit_val = b_cid;
+                            head_tree = b_commit.tree_id;
+                        }
                     }
                 }
 
@@ -747,9 +874,11 @@ impl Coordinator {
                     waypoint,
                     updated_at_ms: now_millis(),
                 };
+
                 view.changes.insert(change_id, head_commit_val);
                 view.agents.insert(session_id.to_string(), meta.clone());
                 out_agent = Some(meta);
+
                 Ok(())
             },
         )?;
