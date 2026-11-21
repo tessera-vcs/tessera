@@ -3051,3 +3051,77 @@ exit 0\n",
         libc::close(master_fd);
     }
 }
+
+#[test]
+fn workspaces_root_env_override_isolates_sandboxes_and_rejects_relative_paths() {
+    let repo = Repo::new(&[("lib.rs", "pub fn x() -> i32 { 1 }\n", false)]);
+    let custom_base = tempfile::tempdir().expect("custom_base tempdir");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_tes"))
+        .current_dir(&repo.root)
+        .env("TES_SESSION_ID", "env-override-agent")
+        .env("TES_WORKSPACES_ROOT", custom_base.path())
+        .args(["doctor", "--json"])
+        .output()
+        .expect("run tes doctor with TES_WORKSPACES_ROOT");
+    assert!(
+        out.status.success(),
+        "tes doctor failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let doc: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("doctor json with override");
+    let probe_root = PathBuf::from(
+        doc["checks"]
+            .as_array()
+            .expect("checks array")
+            .iter()
+            .find(|c| c["id"] == "cow_strategy")
+            .and_then(|c| c["details"]["probe_root"].as_str())
+            .expect("probe_root"),
+    );
+
+    assert!(
+        probe_root.starts_with(custom_base.path())
+            || probe_root
+                .canonicalize()
+                .ok()
+                .zip(custom_base.path().canonicalize().ok())
+                .is_some_and(|(a, b)| a.starts_with(b)),
+        "TES_WORKSPACES_ROOT must place sandboxes inside custom base: {}",
+        probe_root.display()
+    );
+    assert!(
+        custom_base.path().join("CACHEDIR.TAG").is_file(),
+        "custom workspaces root must receive CACHEDIR.TAG"
+    );
+    assert!(
+        probe_root.join(".repo_root").is_file(),
+        "sandbox slug must write .repo_root marker"
+    );
+
+    // Relative TES_WORKSPACES_ROOT must be ignored safely.
+    let rel_out = Command::new(env!("CARGO_BIN_EXE_tes"))
+        .current_dir(&repo.root)
+        .env("TES_SESSION_ID", "env-override-agent")
+        .env("TES_WORKSPACES_ROOT", "relative/unsafe/path")
+        .args(["doctor", "--json"])
+        .output()
+        .expect("run tes doctor with relative TES_WORKSPACES_ROOT");
+    assert!(rel_out.status.success());
+
+    let rel_doc: serde_json::Value =
+        serde_json::from_slice(&rel_out.stdout).expect("doctor json with relative override");
+    let rel_probe = rel_doc["checks"]
+        .as_array()
+        .expect("checks array")
+        .iter()
+        .find(|c| c["id"] == "cow_strategy")
+        .and_then(|c| c["details"]["probe_root"].as_str())
+        .expect("rel_probe");
+    assert!(
+        !rel_probe.contains("relative/unsafe/path"),
+        "relative TES_WORKSPACES_ROOT must be ignored: {rel_probe}"
+    );
+}

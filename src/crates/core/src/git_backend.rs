@@ -355,68 +355,7 @@ fn is_authorized_sandbox_parent(slug_path: &Path, target_root: &Path) -> bool {
         }
     }
 
-    let mut allowed_bases: Vec<PathBuf> = Vec::new();
-
-    if let Some(parent) = target_root.parent() {
-        allowed_bases.push(parent.join("tessera-workspaces"));
-    }
-
-    if let Ok(canon_root) = target_root.canonicalize() {
-        if let Some(parent) = canon_root.parent() {
-            allowed_bases.push(parent.join("tessera-workspaces"));
-        }
-    }
-
-    if cfg!(target_os = "macos") {
-        if let Ok(home) = std::env::var("HOME") {
-            allowed_bases.push(
-                PathBuf::from(home)
-                    .join("Library")
-                    .join("Caches")
-                    .join("tessera")
-                    .join("workspaces"),
-            );
-        }
-    } else if cfg!(windows) {
-        if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
-            if !local_app_data.trim().is_empty() {
-                allowed_bases.push(
-                    PathBuf::from(local_app_data)
-                        .join("tessera")
-                        .join("workspaces"),
-                );
-            }
-        }
-
-        allowed_bases.push(std::env::temp_dir().join("tessera-workspaces"));
-    } else {
-        // SAFETY: `libc::geteuid()` is a pure POSIX syscall with no arguments or memory dereferences.
-        #[cfg(unix)]
-        let uid = unsafe { libc::geteuid() };
-        #[cfg(not(unix))]
-        let uid = 0u32;
-
-        if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
-            if !xdg.trim().is_empty() {
-                allowed_bases.push(PathBuf::from(xdg).join("tessera").join("workspaces"));
-            }
-        }
-
-        if let Ok(home) = std::env::var("HOME") {
-            if !home.trim().is_empty() {
-                allowed_bases.push(
-                    PathBuf::from(home)
-                        .join(".cache")
-                        .join("tessera")
-                        .join("workspaces"),
-                );
-            }
-        }
-
-        allowed_bases.push(PathBuf::from("/var/tmp").join(format!("tessera-workspaces-{uid}")));
-        allowed_bases.push(std::env::temp_dir().join(format!("tessera-workspaces-{uid}")));
-    }
-
+    let allowed_bases = crate::sandbox_paths::authorized_sandbox_bases(target_root);
     let canon_base = base_dir.canonicalize().ok();
 
     allowed_bases.iter().any(|allowed| {

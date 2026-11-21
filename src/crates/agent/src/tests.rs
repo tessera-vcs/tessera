@@ -3371,3 +3371,52 @@ fn gc_prunes_orphaned_sandboxes_sidecars_and_dead_leases_while_preserving_active
     assert!(live_lease.is_dir(), "live lease must be preserved");
     assert!(main_ws.is_dir(), "known branch sandbox must be preserved");
 }
+
+#[test]
+fn temp_repo_sandboxes_stay_contained_with_cache_hygiene_and_repo_marker() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    fs::write(tmp.path().join("README.md"), "# temp repo\n").expect("write readme");
+
+    let (coord, _) = Coordinator::init_repo(tmp.path()).expect("init_repo");
+    let (_, branch_ws, _) = coord
+        .prepare_branch_sandbox("agent-hygiene", Some("main"))
+        .expect("prepare_branch_sandbox");
+    let sb_root = coord.sandboxes_root();
+    let base_dir = sb_root.parent().expect("sandboxes_root parent");
+
+    assert!(
+        core::sandbox_paths::path_is_within(&sb_root, tmp.path()),
+        "tempdir repo sandbox must stay contained inside the tempdir, got: {}",
+        sb_root.display()
+    );
+    assert!(
+        branch_ws.is_dir(),
+        "prepared branch sandbox must exist at {}",
+        branch_ws.display()
+    );
+    assert!(
+        base_dir.join("CACHEDIR.TAG").is_file(),
+        "workspaces base must contain CACHEDIR.TAG"
+    );
+
+    #[cfg(target_os = "macos")]
+    assert!(
+        base_dir.join(".metadata_never_index").is_file(),
+        "macOS workspaces base must contain .metadata_never_index"
+    );
+
+    let repo_marker = fs::read_to_string(sb_root.join(".repo_root")).expect(".repo_root marker");
+    assert_eq!(
+        std::path::PathBuf::from(repo_marker.trim())
+            .canonicalize()
+            .expect("canon marker"),
+        tmp.path().canonicalize().expect("canon tmp"),
+        ".repo_root marker must point to the repository root"
+    );
+    assert_eq!(
+        core::is_valid_sandbox_repo_root(&branch_ws, Some(tmp.path()))
+            .map(|p| { p.canonicalize().unwrap_or(p) }),
+        Some(tmp.path().canonicalize().expect("canon tmp")),
+        "contained tempdir branch sandbox must validate via is_valid_sandbox_repo_root"
+    );
+}

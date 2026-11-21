@@ -401,100 +401,22 @@ impl Coordinator {
 
     /// Returns the external Copy-on-Write sandbox root directory for this repository.
     ///
-    /// Placed outside `.git/` and without hidden dot-directory segments on macOS
-    /// (`~/Library/Caches/tessera/workspaces/<repo>-<hash>`) and Linux
-    /// (`/var/tmp/tessera-workspaces-<uid>/<repo>-<hash>`) on the same filesystem device (`st_dev`)
+    /// Resolves candidate workspace bases via [`core::candidate_workspaces_bases`] (honoring
+    /// `TES_WORKSPACES_ROOT`, containing ephemeral temp-dir test repositories inside the temp
+    /// hierarchy, and using standard OS cache directories on the same filesystem device `st_dev`
     /// so tools like Vite, Next.js, and ESLint never block file serving due to `**/.git/**` rules
-    /// while APFS `clonefile(2)` and Linux `FICLONE` remain zero-copy.
+    /// while APFS `clonefile(2)` and Linux `FICLONE` remain zero-copy).
+    ///
+    /// Also writes cache hygiene markers (`CACHEDIR.TAG`, macOS `.metadata_never_index`, and Time
+    /// Machine exclusion xattr) on the base directory and records `<slug>/.repo_root`.
     pub fn sandboxes_root(&self) -> PathBuf {
         let repo_root = self.git.repo_root();
-        let repo_name = repo_root
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("repo")
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                    c
-                } else {
-                    '-'
-                }
-            })
-            .collect::<String>();
-        let full_hash = blake3::hash(repo_root.display().to_string().as_bytes()).to_hex();
-        let slug = format!("{repo_name}-{}", &full_hash[..32]);
+        let slug = core::compute_repo_slug(repo_root);
+        let bases = core::candidate_workspaces_bases(repo_root);
 
         // SAFETY: `libc::geteuid()` is a pure POSIX syscall with no arguments or memory dereferences.
         #[cfg(unix)]
         let uid = unsafe { libc::geteuid() };
-        #[cfg(not(unix))]
-        let uid = 0u32;
-
-        let mut candidates = Vec::new();
-
-        if cfg!(target_os = "macos") {
-            if let Ok(home) = std::env::var("HOME") {
-                candidates.push(
-                    PathBuf::from(home)
-                        .join("Library")
-                        .join("Caches")
-                        .join("tessera")
-                        .join("workspaces")
-                        .join(&slug),
-                );
-            }
-        } else if cfg!(windows) {
-            if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
-                if !local_app_data.trim().is_empty() {
-                    candidates.push(
-                        PathBuf::from(local_app_data)
-                            .join("tessera")
-                            .join("workspaces")
-                            .join(&slug),
-                    );
-                }
-            }
-
-            candidates.push(std::env::temp_dir().join("tessera-workspaces").join(&slug));
-        } else {
-            if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
-                if !xdg.trim().is_empty() {
-                    candidates.push(
-                        PathBuf::from(xdg)
-                            .join("tessera")
-                            .join("workspaces")
-                            .join(&slug),
-                    );
-                }
-            }
-
-            if let Ok(home) = std::env::var("HOME") {
-                if !home.trim().is_empty() {
-                    candidates.push(
-                        PathBuf::from(home)
-                            .join(".cache")
-                            .join("tessera")
-                            .join("workspaces")
-                            .join(&slug),
-                    );
-                }
-            }
-
-            candidates.push(
-                PathBuf::from("/var/tmp")
-                    .join(format!("tessera-workspaces-{uid}"))
-                    .join(&slug),
-            );
-            candidates.push(
-                std::env::temp_dir()
-                    .join(format!("tessera-workspaces-{uid}"))
-                    .join(&slug),
-            );
-        }
-
-        if let Some(parent) = repo_root.parent() {
-            candidates.push(parent.join("tessera-workspaces").join(&slug));
-        }
 
         #[cfg(unix)]
         let repo_dev = fs::metadata(repo_root).ok().map(|m| {
@@ -502,7 +424,9 @@ impl Coordinator {
             m.dev()
         });
 
-        for cand in candidates {
+        for base in bases {
+            let cand = base.join(&slug);
+
             if fs::create_dir_all(&cand).is_ok() {
                 #[cfg(unix)]
                 {
@@ -540,12 +464,21 @@ impl Coordinator {
                     let _ = fs::set_permissions(&cand, fs::Permissions::from_mode(0o700));
 
                     if let Some(r_dev) = repo_dev {
-                        if r_dev == c_meta.dev() {
-                            return cand;
+                        if r_dev != c_meta.dev() {
+                            continue;
                         }
-
-                        continue;
                     }
+                }
+
+                core::ensure_cache_dir_hygiene(&base);
+
+                let repo_marker = cand.join(".repo_root");
+
+                if !repo_marker.is_file() {
+                    let _ = core::atomic_write_file_relaxed(
+                        &repo_marker,
+                        repo_root.display().to_string().as_bytes(),
+                    );
                 }
 
                 return cand;

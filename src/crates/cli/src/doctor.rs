@@ -3,10 +3,10 @@
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use agent::Coordinator;
-use core::{GitBackend, OpLogStore};
+use core::{GitBackend, OpLogStore, authorized_sandbox_bases, sandbox_paths};
 use serde_json::{Value, json};
 use workspace::{CowStrategy, clone_path_cow};
 
@@ -91,6 +91,127 @@ fn is_pid_alive(pid: i32) -> bool {
     }
 }
 
+/// Parses `core.worktree` from a Git `config` file, if explicitly configured.
+fn parse_core_worktree_from_config(raw: &str) -> Option<String> {
+    let mut in_core = false;
+    let mut result: Option<String> = None;
+
+    for line in raw.lines() {
+        let trimmed = line.trim();
+
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with(';') {
+            continue;
+        }
+
+        if let Some(rest) = trimmed.strip_prefix('[') {
+            let section = rest.split(']').next().unwrap_or("").trim();
+            in_core = section.eq_ignore_ascii_case("core");
+            continue;
+        }
+
+        if !in_core {
+            continue;
+        }
+
+        let Some((key, val)) = trimmed.split_once('=') else {
+            continue;
+        };
+
+        if !key.trim().eq_ignore_ascii_case("worktree") {
+            continue;
+        }
+
+        let cleaned = strip_git_config_value(val);
+
+        if !cleaned.is_empty() {
+            result = Some(cleaned);
+        }
+    }
+
+    result
+}
+
+/// Strips surrounding quotes and trailing inline `#`/`;` comments from a Git config value.
+fn strip_git_config_value(raw: &str) -> String {
+    let trimmed = raw.trim();
+
+    if let Some(after_open) = trimmed.strip_prefix('"') {
+        let mut out = String::new();
+        let mut chars = after_open.chars();
+
+        while let Some(ch) = chars.next() {
+            if ch == '\\' {
+                if let Some(next) = chars.next() {
+                    match next {
+                        '\\' => out.push('\\'),
+                        '"' => out.push('"'),
+                        other => {
+                            out.push('\\');
+                            out.push(other);
+                        }
+                    }
+                }
+            } else if ch == '"' {
+                return out;
+            } else {
+                out.push(ch);
+            }
+        }
+
+        return out;
+    }
+
+    for (idx, ch) in trimmed.char_indices() {
+        if ch == '#' || ch == ';' {
+            return trimmed[..idx].trim_end().to_string();
+        }
+    }
+
+    trimmed.to_string()
+}
+
+/// Reads any configured `core.worktree` from `<git_dir>/config` or `<common_git_dir>/config` and
+/// resolves relative values against the containing Git directory.
+fn read_git_core_worktree(git_dir: &Path, common_git_dir: &Path) -> Option<(String, PathBuf)> {
+    let candidates = if git_dir == common_git_dir {
+        vec![git_dir]
+    } else {
+        vec![git_dir, common_git_dir]
+    };
+
+    for dir in candidates {
+        let cfg_path = dir.join("config");
+
+        if let Ok(raw) = fs::read_to_string(&cfg_path) {
+            if let Some(val) = parse_core_worktree_from_config(&raw) {
+                let path = PathBuf::from(&val);
+                let resolved = if path.is_absolute() {
+                    path
+                } else {
+                    dir.join(&path)
+                };
+
+                return Some((val, resolved));
+            }
+        }
+    }
+
+    None
+}
+
+/// Returns `true` if `worktree_path` points inside a Tessera sandbox base or `.tessera/workspaces`.
+fn is_worktree_inside_sandbox(worktree_path: &Path, repo_root: &Path) -> bool {
+    let in_repo_ws = repo_root.join(".tessera").join("workspaces");
+
+    if sandbox_paths::path_is_within(worktree_path, &in_repo_ws) {
+        return true;
+    }
+
+    authorized_sandbox_bases(repo_root)
+        .iter()
+        .any(|base| sandbox_paths::path_is_within(worktree_path, base))
+}
+
 /// Probes Copy-on-Write cloning behavior on the filesystem hosting `probe_root`.
 fn probe_cow_strategy(probe_root: &Path) -> Result<CowStrategy, String> {
     let probe_dir = probe_root.join(format!(".doctor-cow-probe-{}", std::process::id()));
@@ -131,17 +252,40 @@ pub fn collect_doctor_report(cwd: &Path) -> Value {
                 .flatten()
                 .map(|id| id.as_str().to_string());
 
-            let (status, summary) = if detached {
-                (
+            let core_worktree = read_git_core_worktree(&git_dir, &common_git_dir);
+            let core_worktree_remediation = core_worktree.as_ref().map(|_| {
+                format!(
+                    "git --git-dir {} config --unset core.worktree",
+                    git_dir.display()
+                )
+            });
+
+            let (status, summary) = match &core_worktree {
+                Some((raw, resolved)) if !resolved.is_dir() => (
+                    "fail",
+                    format!(
+                        "Stale core.worktree '{}' does not exist and breaks native git commands (run `{}`)",
+                        raw,
+                        core_worktree_remediation.as_deref().unwrap_or("")
+                    ),
+                ),
+                Some((raw, resolved)) if is_worktree_inside_sandbox(resolved, &repo_root) => (
+                    "warn",
+                    format!(
+                        "core.worktree '{}' points inside a Tessera sandbox (run `{}`)",
+                        raw,
+                        core_worktree_remediation.as_deref().unwrap_or("")
+                    ),
+                ),
+                _ if detached => (
                     "warn",
                     format!(
                         "Git repository detected at {} (detached HEAD{})",
                         repo_root.display(),
                         if is_worktree { ", linked worktree" } else { "" }
                     ),
-                )
-            } else {
-                (
+                ),
+                _ => (
                     "pass",
                     format!(
                         "Git repository detected at {} (branch: {}{})",
@@ -149,7 +293,7 @@ pub fn collect_doctor_report(cwd: &Path) -> Value {
                         branch.as_deref().unwrap_or("unborn"),
                         if is_worktree { ", linked worktree" } else { "" }
                     ),
-                )
+                ),
             };
 
             checks.push(DoctorCheck {
@@ -165,6 +309,8 @@ pub fn collect_doctor_report(cwd: &Path) -> Value {
                     "detached_head": detached,
                     "branch": branch,
                     "head_commit": head_commit,
+                    "core_worktree": core_worktree.as_ref().map(|(raw, _)| raw.as_str()),
+                    "core_worktree_remediation": core_worktree_remediation,
                 }),
             });
 
@@ -748,5 +894,83 @@ mod tests {
                 "summary columns must align for 29-char check names (colored={colored}):\n{rendered}"
             );
         }
+    }
+
+    #[test]
+    fn doctor_detects_missing_and_sandbox_core_worktree() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (coord, _) = Coordinator::init_repo(tmp.path()).expect("init_repo");
+        let config_path = coord.git().common_git_dir().join("config");
+        let missing_path = tmp.path().join("deleted-sandbox-dir");
+
+        fs::write(
+            &config_path,
+            format!(
+                "[core]\n\tbare = false\n\tworktree = {}\n",
+                missing_path.display()
+            ),
+        )
+        .expect("write missing core.worktree");
+
+        let report_missing = collect_doctor_report(tmp.path());
+        let git_check_missing = report_missing["checks"]
+            .as_array()
+            .expect("checks array")
+            .iter()
+            .find(|c| c["id"] == "git_repository")
+            .expect("git_repository check");
+        assert_eq!(git_check_missing["status"], "fail", "{git_check_missing}");
+        assert!(
+            git_check_missing["summary"]
+                .as_str()
+                .unwrap_or("")
+                .contains("config --unset core.worktree"),
+            "missing core.worktree summary must include remediation: {git_check_missing}"
+        );
+
+        let sandbox_branch = coord.sandboxes_root().join("branches").join("feat-x");
+        fs::create_dir_all(&sandbox_branch).expect("mkdir sandbox_branch");
+        let escaped_sandbox = sandbox_branch.display().to_string().replace('\\', "\\\\");
+        fs::write(
+            &config_path,
+            format!("[core]\n\tbare = false\n\tworktree = \"{escaped_sandbox}\"\n"),
+        )
+        .expect("write sandbox core.worktree");
+
+        let report_sandbox = collect_doctor_report(tmp.path());
+        let git_check_sandbox = report_sandbox["checks"]
+            .as_array()
+            .expect("checks array")
+            .iter()
+            .find(|c| c["id"] == "git_repository")
+            .expect("git_repository check");
+        assert_eq!(git_check_sandbox["status"], "warn", "{git_check_sandbox}");
+        assert!(
+            git_check_sandbox["summary"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Tessera sandbox"),
+            "sandbox core.worktree summary must warn: {git_check_sandbox}"
+        );
+
+        // Verify Windows escaped and forward-slash `core.worktree` values parse cleanly.
+        assert_eq!(
+            parse_core_worktree_from_config(
+                "[core]\n\tworktree = \"C:\\\\Users\\\\dev\\\\repo\\\\branches\\\\feat-x\"\n"
+            ),
+            Some("C:\\Users\\dev\\repo\\branches\\feat-x".to_string())
+        );
+        assert_eq!(
+            parse_core_worktree_from_config(
+                "[core]\n\tworktree = \"C:\\Users\\dev\\repo\\branches\\feat-x\"\n"
+            ),
+            Some("C:\\Users\\dev\\repo\\branches\\feat-x".to_string())
+        );
+        assert_eq!(
+            parse_core_worktree_from_config(
+                "[core]\n\tworktree = \"C:/Users/dev/repo/branches/feat-x\"\n"
+            ),
+            Some("C:/Users/dev/repo/branches/feat-x".to_string())
+        );
     }
 }
