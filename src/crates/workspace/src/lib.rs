@@ -9,8 +9,10 @@ pub mod env;
 pub mod snapshot;
 
 pub use cow::{
-    CowStrategy, clone_path_cow, create_cow_workspace, materialize_tree_to_dir,
+    CowStrategy, CowWorkspaceOptions, clone_path_cow, create_cow_workspace,
+    create_cow_workspace_with_options, materialize_tree_to_dir,
     materialize_tree_to_dir_with_baseline, sanitize_build_cache, sync_missing_cow_caches,
+    sync_missing_cow_caches_with_options,
 };
 pub use disk_usage::{DirDiskUsage, format_bytes, measure_dir_usage};
 pub use env::{

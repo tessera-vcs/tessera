@@ -1303,6 +1303,24 @@ pub struct RepoConfig {
     pub port_stride: u16,
     /// Untracked dependency and build cache directories to Copy-on-Write clone and preserve across all languages.
     pub cow_cache_dirs: Vec<String>,
+    /// Relative directory names or paths excluded from Copy-on-Write sandbox cloning and cache sync
+    /// (for example `target`, `src/target`, or `node_modules`).
+    #[serde(default)]
+    pub cow_exclude_dirs: Vec<String>,
+    /// Maximum size in MiB of each dependency/build cache directory that may be copied when the
+    /// filesystem does not support native Copy-on-Write reflinks (`PortableCopy` fallback).
+    /// Defaults to `64`. Set to `0` to never copy caches without CoW.
+    #[serde(default = "default_portable_copy_cache_max_mb")]
+    pub portable_copy_cache_max_mb: u64,
+    /// Maximum number of idle non-trunk warm branch sandboxes retained before automatic LRU eviction
+    /// of clean sandboxes. Defaults to `8`. Set to `0` for unlimited warm sandboxes.
+    #[serde(default = "default_max_warm_sandboxes")]
+    pub max_warm_sandboxes: usize,
+    /// When `true`, excludes Cargo `target` directories from per-branch sandbox clones and points
+    /// `CARGO_TARGET_DIR` inside `tes exec` and `tes merge --verify` to a shared repository target
+    /// cache under `<sandboxes_root>/shared-target`. Defaults to `false`.
+    #[serde(default)]
+    pub shared_cargo_target: bool,
     /// Relative binary directories inside a workspace to automatically prepend to `PATH` during `tes exec`.
     pub extra_bin_dirs: Vec<String>,
     /// Optional workspace or package glob patterns (`crates/*`, `packages/*`, `apps/*`).
@@ -1329,6 +1347,16 @@ pub struct RepoConfig {
     /// environment variables, and CLI port-wrapper shims in `TES_SHIM_BIN`). Defaults to `false`.
     #[serde(default)]
     pub port_isolation: bool,
+}
+
+/// Default maximum cache directory copy budget (in MiB) under non-CoW `PortableCopy` fallback.
+const fn default_portable_copy_cache_max_mb() -> u64 {
+    64
+}
+
+/// Default maximum number of idle non-trunk warm branch sandboxes kept before automatic LRU eviction.
+const fn default_max_warm_sandboxes() -> usize {
+    8
 }
 
 impl RepoConfig {
@@ -1379,6 +1407,10 @@ impl Default for RepoConfig {
                 "cmake-build-debug".to_string(),
                 "cmake-build-release".to_string(),
             ],
+            cow_exclude_dirs: Vec::new(),
+            portable_copy_cache_max_mb: default_portable_copy_cache_max_mb(),
+            max_warm_sandboxes: default_max_warm_sandboxes(),
+            shared_cargo_target: false,
             extra_bin_dirs: vec![
                 ".venv/bin".to_string(),
                 "venv/bin".to_string(),

@@ -48,6 +48,10 @@ pub struct CommitOptions {
     /// temporary sandbox without mutating Git refs, working trees, branch sandboxes, or the `OpLog`.
     #[serde(default)]
     pub dry_run: bool,
+    /// When `true`, deletes merged non-trunk source branches (and their sandboxes) after a clean,
+    /// verified merge into the target branch.
+    #[serde(default)]
+    pub delete_branch: bool,
 }
 
 /// Rebased uncommitted state of a still-active session after a commit advanced its branch tip.
@@ -146,6 +150,9 @@ pub struct MergeReport {
     pub affected_packages: Vec<String>,
     /// Agent sessions automatically closed after a clean, verified merge.
     pub closed_agents: Vec<String>,
+    /// Merged non-trunk source branches deleted when `--delete-branch` (`-d`) was requested.
+    #[serde(default)]
+    pub deleted_branches: Vec<String>,
     /// `true` if the speculative verification gate (`--verify`) passed (or was not requested).
     pub verification_passed: bool,
     /// Compiler/test output if `--verify` was executed.

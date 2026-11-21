@@ -1489,12 +1489,54 @@ tes config set co_author_trailer "Tessera <noreply@tessera.getlunaris.dev>"
 
 - **Type:** `string[]`
 - **Default:** `["target", "node_modules", ".pnpm-store", ".turbo", ".next", ".nuxt", ".svelte-kit", "dist", "build", ".venv", "venv", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", "vendor", "_build", "deps", ".gradle", ".build", ".zig-cache", "zig-out", ".dart_tool", "cmake-build-debug", "cmake-build-release"]`
-- **Description:** Untracked dependency and build cache directories cloned via Copy-on-Write into every branch sandbox.
+- **Description:** Untracked dependency and build cache directories cloned via Copy-on-Write into every branch sandbox. On Rust projects, cloned `target/<profile>/incremental` directories are stripped automatically during sanitization because Cargo keys incremental sessions by absolute path.
 
 Add directories via CLI:
 
 ```bash
 tes config add-cache-dir .nx .angular
+```
+
+#### `cow_exclude_dirs`
+
+- **Type:** `string[]`
+- **Default:** `[]`
+- **Description:** Directory names or repository-relative paths (such as `target`, `src/target`, or `node_modules`) excluded from sandbox cloning and cache synchronization.
+
+Add excluded directories via CLI:
+
+```bash
+tes config add-exclude-dir src/target dist
+```
+
+#### `portable_copy_cache_max_mb`
+
+- **Type:** `number`
+- **Default:** `64`
+- **Description:** Maximum size in MiB (and 2,000 files) per dependency or build cache directory allowed to be copied when the filesystem does not support native Copy-on-Write reflinks (`PortableCopy` fallback on ext4/NTFS). Set to `0` to skip copying caches whenever native CoW is unavailable.
+
+```toml
+portable_copy_cache_max_mb = 64
+```
+
+#### `max_warm_sandboxes`
+
+- **Type:** `number`
+- **Default:** `8`
+- **Description:** Maximum number of idle non-trunk warm branch sandboxes retained before automatic LRU eviction removes the oldest clean sandboxes. Active, leased, dirty, trunk, and checked-out sandboxes are never evicted. Set to `0` for unlimited warm sandboxes.
+
+```toml
+max_warm_sandboxes = 8
+```
+
+#### `shared_cargo_target`
+
+- **Type:** `boolean`
+- **Default:** `false`
+- **Description:** When `true`, excludes Cargo `target` directories (including nested monorepo `src/target`) from per-branch sandbox clones and points `CARGO_TARGET_DIR` inside `tes exec` and `tes merge --verify` to a shared repository build cache at `<sandboxes_root>/shared-target`.
+
+```toml
+shared_cargo_target = true
 ```
 
 #### `package_globs`
@@ -1580,7 +1622,7 @@ tes config set-env APP_URL "http://localhost:{port}"
 
 ### Repository Trust (`tessera.toml`)
 
-When cloning an external repository that includes a checked-in `tessera.toml`, declarative settings (`trunk_branch`, `base_port`, `port_stride`, `watch_interval_ms`, `watch_timeout_secs`, `auto_isolate_dirty_claims`, `co_author`, `co_author_trailer`, `port_isolation`, `cow_cache_dirs`, and `package_globs`) are loaded automatically.
+When cloning an external repository that includes a checked-in `tessera.toml`, declarative settings (`trunk_branch`, `base_port`, `port_stride`, `watch_interval_ms`, `watch_timeout_secs`, `auto_isolate_dirty_claims`, `co_author`, `co_author_trailer`, `port_isolation`, `cow_cache_dirs`, `cow_exclude_dirs`, `portable_copy_cache_max_mb`, `max_warm_sandboxes`, `shared_cargo_target`, and `package_globs`) are loaded automatically.
 
 To prevent untrusted repositories from executing arbitrary commands, shadowing binaries, or injecting environment variables automatically, `verify_command`, `pager`, `extra_bin_dirs`, and `custom_env` in `tessera.toml` are ignored until you explicitly trust the current file digest:
 
@@ -2135,7 +2177,7 @@ When `<branch>` does not exist yet:
 - If `--from <base-branch>` or a positional `[start-point]` is provided (`tes switch -b <new-branch> <start-point>`), Tessera resolves that revision (or fails fast if it does not exist) and creates `<branch>` from it.
 - Otherwise, if the calling session is already bound to a feature branch (`tes switch feat/parent` followed by `tes switch feat/child`), `<branch>` forks from the session's current branch commit; if not, it forks from `HEAD`.
 
-When `--editor` is passed, `tes switch` updates the primary repository working tree (`repo_root`), `.git/HEAD`, and `.git/index` to `<branch>` and binds the calling terminal session to `<branch>` while preserving isolated sandboxes for all other background terminal sessions.
+When `--editor` is passed, `tes switch` updates the primary repository working tree (`repo_root`), `.git/HEAD`, and `.git/index` to `<branch>` and binds the calling terminal session to `<branch>` while preserving isolated sandboxes for all other background terminal sessions. Sandboxes are materialized lazily: clean solo switches that do not require an isolated background sandbox skip redundant whole-repository clones, and idle non-trunk sandboxes beyond `max_warm_sandboxes` (default `8`) are evicted automatically in LRU order when clean.
 
 ## Examples
 
@@ -2481,6 +2523,7 @@ tes merge [branches_or_sessions...] [options]
 - `--verify-cmd <CMD>` - Explicit speculative verification command to run before finalizing the merge (e.g., `--verify-cmd "npm run build"`; conflicts with `--verify`).
 - `--dry-run` - Preview the full semantic merge in memory (reporting files that would change and any conflicts that would occur) without advancing branch refs, modifying working-tree files, or recording an operation log entry.
 - `--keep-open` - Keep agent sessions open after merging.
+- `-d, --delete-branch` - Delete merged non-trunk source branches (and their cached sandboxes) after a clean, verified merge.
 - `--co-author [=<NAME <EMAIL>>]` - Append a `Co-authored-by:` trailer to the merge commit (defaults to configured `co_author_trailer` when passed without a value; repeatable).
 - `--no-co-author` - Omit `Co-authored-by:` trailers even if `co_author = true` in repository config.
 - `--author <NAME <EMAIL>>` - Override the commit `Author` identity for the merge commit.
@@ -2502,8 +2545,8 @@ tes merge -m "feat(pricing): add pricing calculator"
 # preview a multi-branch merge without mutating refs or the working tree
 tes merge feat/pricing feat/faq --into main --dry-run
 
-# merge two feature branches into main
-tes merge feat/pricing feat/faq --into main -m "feat: add pricing and faq"
+# merge two feature branches into main and delete the merged branches
+tes merge feat/pricing feat/faq --into main -d -m "feat: add pricing and faq"
 
 # merge with an explicit Co-authored-by trailer
 tes merge feat/pricing --into main -m "feat: add pricing" --co-author
@@ -3137,10 +3180,11 @@ tes config <subcommand> [arguments]
 ## Subcommands
 
 - `show` - Display the effective configuration for the repository (combining `.git/tessera/config.toml` and `tessera.toml`).
-- `set <KEY> <VALUE>` - Update `trunk_branch`, `base_port`, `port_stride`, `port_isolation`, `verify_command`, `watch_interval_ms`, `watch_timeout_secs`, `co_author`, `co_author_trailer`, `auto_isolate_dirty_claims`, or `pager`.
+- `set <KEY> <VALUE>` - Update `trunk_branch`, `base_port`, `port_stride`, `port_isolation`, `verify_command`, `watch_interval_ms`, `watch_timeout_secs`, `co_author`, `co_author_trailer`, `auto_isolate_dirty_claims`, `pager`, `portable_copy_cache_max_mb`, `max_warm_sandboxes`, `shared_cargo_target`, or `cow_exclude_dirs`.
 - `trust` - Trust the current digest of the repository's checked-in `tessera.toml` so its execution-sensitive settings (`verify_command`, `pager`, `extra_bin_dirs`, and `custom_env`) are honored.
 - `untrust` - Revoke local trust for the repository's `tessera.toml`.
 - `add-cache-dir <DIRS...>` - Add directories to `cow_cache_dirs`.
+- `add-exclude-dir <DIRS...>` - Add directory names or relative paths (such as `target`, `src/target`, or `node_modules`) to `cow_exclude_dirs` so they are never cloned into branch sandboxes.
 - `add-bin-dir <DIRS...>` - Add relative binary directories to `extra_bin_dirs` (defaults to `.venv/bin`, `venv/bin`, `node_modules/.bin`, `vendor/bin`; `bin` and `.bin` are excluded by default for security).
 - `add-package-glob <GLOBS...>` - Add monorepo package glob patterns to `package_globs` (defaults to `crates/*`, `packages/*`, `apps/*`, `services/*`).
 - `set-env <KEY> <TEMPLATE>` - Set a custom environment variable template (`{slot}`, `{port}`, `{branch}`, `{agent_id}`).
@@ -3171,6 +3215,12 @@ tes config trust
 
 # add a Copy-on-Write cache directory
 tes config add-cache-dir .nx
+
+# exclude heavy nested build caches or opt into a shared Cargo target directory
+tes config add-exclude-dir src/target
+tes config set shared_cargo_target true
+tes config set max_warm_sandboxes 6
+tes config set portable_copy_cache_max_mb 64
 
 # set a custom environment variable template
 tes config set-env DATABASE_URL "postgres://localhost:5432/app_slot_{slot}"

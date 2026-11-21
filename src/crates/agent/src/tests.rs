@@ -1,12 +1,6 @@
 //! Unit and integration tests for the `agent` crate, covering all session, sandbox, merge,
 //! conflict, hook, stash, pull, cherry-pick, undo, and harness auto-installer invariants.
 
-use std::collections::BTreeMap;
-use std::fs;
-use std::process::Command;
-
-use core::{ConflictKind, SessionWaypoint};
-
 use crate::harness::{
     strip_jsonc, upsert_claude_hooks_json, upsert_git_hook, upsert_marked_section, upsert_mcp_json,
     upsert_opencode_json, upsert_vscode_mcp_json,
@@ -22,6 +16,10 @@ use crate::{
     CommitOptions, Coordinator, ResolveStrategy, focus_session_waypoint, handle_post_tool_hook,
     handle_pre_tool_hook, install_harness_integrations_for,
 };
+use core::{ConflictKind, SessionWaypoint};
+use std::collections::BTreeMap;
+use std::fs;
+use std::process::Command;
 
 #[test]
 fn branch_delete_and_rename_clean_up_refs_sandboxes_and_sessions() {
@@ -3685,4 +3683,186 @@ fn gc_reconciles_deleted_refs_prunes_merged_verify_tmp_caches_and_preserves_dirt
 
     coord.close_agent("a-bound").expect("close a-bound");
     let _ = fs::remove_dir_all(&live_verify);
+}
+
+#[test]
+fn lazy_sandboxes_lru_eviction_shared_cargo_target_and_merge_delete_branch() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    fs::write(root.join("lib.rs"), "pub fn base() -> i32 { 1 }\n").expect("write lib.rs");
+    fs::create_dir_all(root.join("target/debug")).expect("mkdir target");
+    fs::write(root.join("target/debug/cached.rlib"), b"cached").expect("write rlib");
+
+    let (coord, _) = Coordinator::init_repo(root).expect("init_repo");
+
+    // Lazy sandbox creation: switching clean trunk session and solo editor switch avoid redundant clones.
+    coord
+        .switch_branch("solo-term", "main")
+        .expect("switch to trunk");
+    assert!(
+        !coord.branch_sandbox_dir("main").exists(),
+        "clean trunk switch should not eagerly clone branches/main"
+    );
+    coord.close_agent("solo-term").expect("close solo-term");
+
+    // Create a clean branch ref and switch editor to it without active sessions.
+    let main_cid = coord
+        .git()
+        .resolve_ref("refs/heads/main")
+        .expect("resolve main")
+        .expect("main cid");
+    coord
+        .git()
+        .update_ref("refs/heads/feat/solo-ed", &main_cid)
+        .expect("create feat/solo-ed");
+    coord
+        .switch_editor_branch("feat/solo-ed")
+        .expect("switch editor to feat/solo-ed");
+    assert!(
+        !coord.branch_sandbox_dir("main").exists(),
+        "solo editor switch off clean main must not materialize branches/main"
+    );
+    assert!(
+        !coord.branch_sandbox_dir("feat/solo-ed").exists(),
+        "solo editor switch onto clean feat/solo-ed must not materialize branches/feat-solo-ed"
+    );
+    coord
+        .switch_editor_branch("main")
+        .expect("switch editor back to main");
+
+    // Configure `max_warm_sandboxes = 2` and `shared_cargo_target = true`.
+    let mut cfg = coord.oplog().load_local_config().expect("load config");
+    cfg.max_warm_sandboxes = 2;
+    cfg.shared_cargo_target = true;
+    coord.oplog().save_config(&cfg).expect("save config");
+
+    // Materialize 3 non-trunk sandboxes; b1 is oldest clean, b2 is dirty, b3 triggers LRU eviction of b1.
+    coord.switch_branch("s1", "feat/lru-1").expect("lru-1");
+    let (_, ws1, env1) = coord
+        .prepare_branch_sandbox("s1", Some("feat/lru-1"))
+        .expect("prepare lru-1");
+    assert!(
+        !ws1.join("target").exists(),
+        "shared_cargo_target must exclude target from cloned sandbox"
+    );
+    let expected_shared = coord.sandboxes_root().join("shared-target");
+    assert_eq!(
+        env1.get("CARGO_TARGET_DIR").map(String::as_str),
+        Some(expected_shared.to_string_lossy().as_ref()),
+        "shared_cargo_target must point CARGO_TARGET_DIR to <sandboxes_root>/shared-target"
+    );
+    coord.close_agent("s1").expect("close s1");
+
+    std::thread::sleep(std::time::Duration::from_millis(30));
+
+    coord.switch_branch("s2", "feat/lru-2").expect("lru-2");
+    let (_, ws2, _) = coord
+        .prepare_branch_sandbox("s2", Some("feat/lru-2"))
+        .expect("prepare lru-2");
+    // Dirty ws2 so even if it were oldest it cannot be evicted.
+    fs::write(ws2.join("lib.rs"), "pub fn base() -> i32 { 22 }\n").expect("dirty ws2");
+    coord.close_agent("s2").expect("close s2");
+
+    std::thread::sleep(std::time::Duration::from_millis(30));
+
+    coord.switch_branch("s3", "feat/lru-3").expect("lru-3");
+    let (_, ws3, _) = coord
+        .prepare_branch_sandbox("s3", Some("feat/lru-3"))
+        .expect("prepare lru-3");
+    coord.close_agent("s3").expect("close s3");
+
+    assert!(
+        !ws1.exists(),
+        "LRU eviction must remove oldest clean sandbox feat/lru-1 when exceeding max_warm_sandboxes"
+    );
+    assert!(
+        ws2.is_dir(),
+        "dirty sandbox feat/lru-2 must never be evicted"
+    );
+    assert!(
+        ws3.is_dir(),
+        "newly created sandbox feat/lru-3 must survive"
+    );
+
+    // `merge_agents_with_options` with `delete_branch: true` deletes merged source branch & sandbox.
+    let new_blob = coord
+        .git()
+        .write_blob(b"pub fn base() -> i32 { 1 }\npub fn added() -> i32 { 42 }\n")
+        .expect("write blob");
+    let main_commit = coord.git().read_commit(&main_cid).expect("read main");
+    let mut tree_map = coord
+        .git()
+        .read_tree_to_map(&main_commit.tree_id)
+        .expect("read main tree");
+    tree_map.insert(
+        "lib.rs".to_string(),
+        core::FileEntry::regular(new_blob, false),
+    );
+    let feat_tree = coord
+        .git()
+        .write_tree_from_map(&tree_map)
+        .expect("write feat tree");
+    let feat_cid = coord
+        .git()
+        .write_commit(
+            &feat_tree,
+            &[main_cid],
+            "Tester <test@example.com>",
+            "feat: add added()",
+        )
+        .expect("write feat commit");
+    coord
+        .git()
+        .update_ref("refs/heads/feat/merge-del", &feat_cid)
+        .expect("create feat/merge-del");
+    let (_, del_ws, _) = coord
+        .prepare_branch_sandbox("s-del", Some("feat/merge-del"))
+        .expect("prepare feat/merge-del sandbox");
+    coord.close_agent("s-del").expect("close s-del");
+    assert!(del_ws.is_dir());
+
+    // Dry run with `delete_branch: true` must NOT delete the branch or sandbox.
+    let dry_rep = coord
+        .merge_agents_with_options(
+            &["feat/merge-del".to_string()],
+            Some("main"),
+            None,
+            false,
+            &crate::CommitOptions {
+                dry_run: true,
+                delete_branch: true,
+                ..Default::default()
+            },
+        )
+        .expect("dry-run merge");
+    assert!(dry_rep.deleted_branches.is_empty());
+    assert!(del_ws.is_dir());
+
+    // Real merge with `delete_branch: true` deletes the branch ref and sandbox.
+    let real_rep = coord
+        .merge_agents_with_options(
+            &["feat/merge-del".to_string()],
+            Some("main"),
+            None,
+            false,
+            &crate::CommitOptions {
+                message: Some("feat: merge and delete".to_string()),
+                delete_branch: true,
+                ..Default::default()
+            },
+        )
+        .expect("merge with delete_branch");
+    assert_eq!(real_rep.deleted_branches, vec!["feat/merge-del"]);
+    assert!(
+        coord
+            .git()
+            .resolve_ref("refs/heads/feat/merge-del")
+            .expect("resolve ref")
+            .is_none(),
+        "merged source branch ref must be deleted"
+    );
+    assert!(
+        !del_ws.exists(),
+        "merged source branch sandbox must be deleted"
+    );
 }

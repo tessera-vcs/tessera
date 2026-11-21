@@ -1240,6 +1240,19 @@ pub fn run_config(
 
             coord.oplog().save_config(&local_cfg)?;
         }
+        ConfigCommands::AddExcludeDir { dirs } => {
+            let mut local_cfg = coord.oplog().load_local_config()?;
+
+            for d in dirs {
+                let clean = core::validate_repo_rel_path(&d)?;
+
+                if !local_cfg.cow_exclude_dirs.contains(&clean) {
+                    local_cfg.cow_exclude_dirs.push(clean);
+                }
+            }
+
+            coord.oplog().save_config(&local_cfg)?;
+        }
         ConfigCommands::AddBinDir { dirs } => {
             let mut local_cfg = coord.oplog().load_local_config()?;
 
@@ -1342,6 +1355,45 @@ pub fn run_config(
                         Some(trimmed.to_string())
                     };
                 }
+                "portable_copy_cache_max_mb" => {
+                    local_cfg.portable_copy_cache_max_mb = value.trim().parse()?;
+                }
+                "max_warm_sandboxes" => {
+                    local_cfg.max_warm_sandboxes = value.trim().parse()?;
+                }
+                "shared_cargo_target" => {
+                    local_cfg.shared_cargo_target = match value.trim().to_ascii_lowercase().as_str()
+                    {
+                        "true" | "1" | "yes" | "on" => true,
+                        "false" | "0" | "no" | "off" => false,
+                        other => anyhow::bail!(
+                            "invalid value '{other}' for shared_cargo_target (expected true or false)"
+                        ),
+                    };
+                }
+                "cow_exclude_dirs" => {
+                    let trimmed = value.trim();
+
+                    if trimmed.is_empty() {
+                        local_cfg.cow_exclude_dirs.clear();
+                    } else {
+                        let mut parsed = Vec::new();
+
+                        for part in trimmed.split(',') {
+                            let item = part.trim();
+
+                            if !item.is_empty() {
+                                let clean = core::validate_repo_rel_path(item)?;
+
+                                if !parsed.contains(&clean) {
+                                    parsed.push(clean);
+                                }
+                            }
+                        }
+
+                        local_cfg.cow_exclude_dirs = parsed;
+                    }
+                }
                 other => anyhow::bail!("unknown config key '{other}'"),
             }
 
@@ -1355,7 +1407,7 @@ pub fn run_config(
         println!("{}", serde_json::to_string_pretty(&effective_cfg)?);
     } else {
         println!(
-            "trunk_branch = {:?}\nbase_port = {}\nport_stride = {}\nport_isolation = {}\nauto_isolate_dirty_claims = {}\nwatch_interval_ms = {}\nwatch_timeout_secs = {}\nco_author = {}\nco_author_trailer = {:?}\npager = {:?}\nverify_command = {:?}\ncow_cache_dirs = {:?}\nextra_bin_dirs = {:?}\npackage_globs = {:?}\ncustom_env = {:?}",
+            "trunk_branch = {:?}\nbase_port = {}\nport_stride = {}\nport_isolation = {}\nauto_isolate_dirty_claims = {}\nwatch_interval_ms = {}\nwatch_timeout_secs = {}\nco_author = {}\nco_author_trailer = {:?}\npager = {:?}\nverify_command = {:?}\ncow_cache_dirs = {:?}\ncow_exclude_dirs = {:?}\nportable_copy_cache_max_mb = {}\nmax_warm_sandboxes = {}\nshared_cargo_target = {}\nextra_bin_dirs = {:?}\npackage_globs = {:?}\ncustom_env = {:?}",
             effective_cfg.trunk_branch,
             effective_cfg.base_port,
             effective_cfg.port_stride,
@@ -1368,6 +1420,10 @@ pub fn run_config(
             effective_cfg.pager,
             effective_cfg.verify_command,
             effective_cfg.cow_cache_dirs,
+            effective_cfg.cow_exclude_dirs,
+            effective_cfg.portable_copy_cache_max_mb,
+            effective_cfg.max_warm_sandboxes,
+            effective_cfg.shared_cargo_target,
             effective_cfg.extra_bin_dirs,
             effective_cfg.package_globs,
             effective_cfg.custom_env

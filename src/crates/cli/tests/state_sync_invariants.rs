@@ -3315,3 +3315,102 @@ fn gc_all_sweeps_deleted_repo_and_doctor_reports_merged_verify_and_usage() {
         .expect("sandboxes_leases_conflicts");
     assert_eq!(rt_clean["status"], "pass", "{rt_clean}");
 }
+
+#[test]
+fn config_cache_policy_and_merge_delete_branch_cli_e2e() {
+    let repo = Repo::new(&[("lib.rs", "pub fn v() -> i32 { 1 }\n", false)]);
+
+    let cfg1_raw = repo.tes(
+        "cfg-agent",
+        &["config", "add-exclude-dir", "src/target", "dist", "--json"],
+    );
+    let cfg1: serde_json::Value = serde_json::from_str(&cfg1_raw).expect("cfg1 json");
+    assert_eq!(
+        cfg1["cow_exclude_dirs"],
+        serde_json::json!(["src/target", "dist"]),
+        "{cfg1}"
+    );
+
+    let cfg2_raw = repo.tes(
+        "cfg-agent",
+        &[
+            "config",
+            "set",
+            "portable_copy_cache_max_mb",
+            "32",
+            "--json",
+        ],
+    );
+    let cfg2: serde_json::Value = serde_json::from_str(&cfg2_raw).expect("cfg2 json");
+    assert_eq!(cfg2["portable_copy_cache_max_mb"], 32, "{cfg2}");
+
+    let cfg3_raw = repo.tes(
+        "cfg-agent",
+        &["config", "set", "max_warm_sandboxes", "4", "--json"],
+    );
+    let cfg3: serde_json::Value = serde_json::from_str(&cfg3_raw).expect("cfg3 json");
+    assert_eq!(cfg3["max_warm_sandboxes"], 4, "{cfg3}");
+
+    let cfg4_raw = repo.tes(
+        "cfg-agent",
+        &["config", "set", "shared_cargo_target", "true", "--json"],
+    );
+    let cfg4: serde_json::Value = serde_json::from_str(&cfg4_raw).expect("cfg4 json");
+    assert_eq!(cfg4["shared_cargo_target"], true, "{cfg4}");
+
+    // Create a feature branch, commit a change, then merge with `-d` and confirm branch deletion.
+    repo.tes(
+        "feat-agent",
+        &[
+            "claim",
+            "-b",
+            "feat/cli-merge-del",
+            "--intent",
+            "add helper",
+            "lib.rs",
+        ],
+    );
+    repo.write(
+        "lib.rs",
+        "pub fn v() -> i32 { 1 }\npub fn helper() -> i32 { 7 }\n",
+    );
+    repo.tes("feat-agent", &["hook", "post-tool", "--path", "lib.rs"]);
+    repo.tes("feat-agent", &["commit", "-m", "feat: add helper"]);
+
+    let merge_raw = repo.tes(
+        "cfg-agent",
+        &[
+            "merge",
+            "feat/cli-merge-del",
+            "--into",
+            "main",
+            "-d",
+            "-m",
+            "feat: merge helper",
+            "--json",
+        ],
+    );
+    let merge_json: serde_json::Value = serde_json::from_str(&merge_raw).expect("merge json");
+    assert_eq!(
+        merge_json["deleted_branches"],
+        serde_json::json!(["feat/cli-merge-del"]),
+        "{merge_json}"
+    );
+    assert!(
+        repo.read("lib.rs").contains("pub fn helper()"),
+        "merged helper must be present on main"
+    );
+
+    let branches_raw = repo.tes("cfg-agent", &["branch", "--json"]);
+    let branches_json: serde_json::Value =
+        serde_json::from_str(&branches_raw).expect("branch json");
+    let branch_list = branches_json["branches"]
+        .as_array()
+        .expect("branches array");
+    assert!(
+        !branch_list
+            .iter()
+            .any(|b| b.as_str() == Some("feat/cli-merge-del")),
+        "feat/cli-merge-del must be absent from branch list after `tes merge -d`: {branches_json}"
+    );
+}
