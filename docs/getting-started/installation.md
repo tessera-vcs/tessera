@@ -170,6 +170,18 @@ tes init --local
 tes init --local --harness claude,cursor
 ```
 
+## Upgrading Tessera
+
+Update `tes` in place at any time with SHA-256 verification and atomic binary replacement:
+
+```bash:no-line-numbers
+# check if a newer release is available
+tes upgrade --check
+
+# upgrade to the latest release (also works as `tes update`, `tes --upgrade`, or `tes --update`)
+tes upgrade
+```
+
 ## Uninstalling Tessera
 
 ### 1. Remove Shell Integration

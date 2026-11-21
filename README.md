@@ -28,6 +28,8 @@ curl -fsSL https://tessera.getlunaris.dev/install.sh | sh
 irm https://tessera.getlunaris.dev/install.ps1 | iex
 ```
 
+To upgrade an existing installation later, run `tes upgrade` (or `tes update` / `tes --upgrade`).
+
 ### 2. Initialize Your Repository
 
 ```bash

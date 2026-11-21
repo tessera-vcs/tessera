@@ -69,6 +69,20 @@ pub enum Commands {
     /// Run repository health, Copy-on-Write, config trust, hook, sandbox, and conflict diagnostics.
     Doctor,
 
+    /// Check for or install the latest Tessera CLI release (`tes upgrade`, `tes update`, `tes --upgrade`).
+    #[command(visible_alias = "update", alias = "self-update")]
+    Upgrade {
+        /// Check if a newer release is available without modifying the binary.
+        #[arg(long)]
+        check: bool,
+        /// Install a specific release version or tag (e.g., `0.0.3` or `v0.0.3`).
+        #[arg(long = "version", visible_alias = "tag", value_name = "VERSION")]
+        version: Option<String>,
+        /// Reinstall even if the installed version is already up to date or newer.
+        #[arg(short = 'f', long)]
+        force: bool,
+    },
+
     /// Snapshot and display the current session's status, branch, staged/unstaged changes, and touched symbols.
     Status {
         /// Give the output in the short-format (`-s` / `--short`).

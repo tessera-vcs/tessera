@@ -216,6 +216,7 @@ const ORDERED_DOC_PATHS = [
   'cli/agent.md',
   'cli/config.md',
   'cli/doctor.md',
+  'cli/upgrade.md',
   'cli/mcp.md'
 ]
 
@@ -456,6 +457,7 @@ export default defineConfig({
             { text: 'tes agent', link: '/cli/agent' },
             { text: 'tes config', link: '/cli/config' },
             { text: 'tes doctor', link: '/cli/doctor' },
+            { text: 'tes upgrade', link: '/cli/upgrade' },
             { text: 'tes mcp', link: '/cli/mcp' }
           ]
         }

@@ -1669,6 +1669,14 @@ pub fn run_complete(cwd: &Path, args: &CompleteArgs) {
                         "Diagnose repository, CoW, config trust, hooks, and sandboxes".to_string(),
                     ),
                     (
+                        "upgrade".to_string(),
+                        "Check for or install the latest Tessera CLI release".to_string(),
+                    ),
+                    (
+                        "update".to_string(),
+                        "Alias for upgrade: install the latest Tessera CLI release".to_string(),
+                    ),
+                    (
                         "status".to_string(),
                         "Show session status, branch, and staged/unstaged/peer changes".to_string(),
                     ),
@@ -1796,6 +1804,28 @@ pub fn run_complete(cwd: &Path, args: &CompleteArgs) {
                         (
                             "--local".to_string(),
                             "Add new harness files to .git/info/exclude".to_string(),
+                        ),
+                    ];
+                }
+            }
+            Some("upgrade" | "update" | "self-update") => {
+                if cur.starts_with('-') {
+                    candidates = vec![
+                        (
+                            "--check".to_string(),
+                            "Check for updates without replacing the binary".to_string(),
+                        ),
+                        (
+                            "--version".to_string(),
+                            "Install a specific release version (e.g. 0.0.3)".to_string(),
+                        ),
+                        (
+                            "--force".to_string(),
+                            "Reinstall even if already up to date".to_string(),
+                        ),
+                        (
+                            "--json".to_string(),
+                            "Emit machine-readable JSON output".to_string(),
                         ),
                     ];
                 }
