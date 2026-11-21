@@ -10,6 +10,14 @@
   <strong>Run multiple agents in the same Git repository.</strong>
 </p>
 
+<p align="center">
+  <a href="https://github.com/tessera-vcs/tessera/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/tessera-vcs/tessera/ci.yml?branch=main&amp;style=flat-square&amp;logo=githubactions&amp;logoColor=white&amp;label=CI" alt="CI"></a>
+  <a href="https://github.com/tessera-vcs/tessera/releases/latest"><img src="https://img.shields.io/github/v/release/tessera-vcs/tessera?style=flat-square&amp;logo=github&amp;label=release" alt="Release"></a>
+  <a href="https://tessera.getlunaris.dev"><img src="https://img.shields.io/badge/docs-tessera.getlunaris.dev-10b981?style=flat-square&amp;logo=vitepress&amp;logoColor=white" alt="Docs"></a>
+  <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/rust-1.98%2B-orange?style=flat-square&amp;logo=rust&amp;logoColor=white" alt="Rust 1.98+"></a>
+  <a href="./LICENSE"><img src="https://img.shields.io/github/license/tessera-vcs/tessera?style=flat-square&amp;label=license" alt="MIT License"></a>
+</p>
+
 Tessera coordinates concurrent AI agents and terminal tabs inside your existing Git repository. It stores session state in `.git/tessera`, isolates per-session branches and Copy-on-Write sandboxes, and merges source code and lockfiles at the AST level.
 
 ## Quick Start
