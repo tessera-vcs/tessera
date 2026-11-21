@@ -163,6 +163,17 @@ fn switch_editor_and_bind(
     Ok(())
 }
 
+/// Pads `label` to `width` characters before optionally wrapping it in an ANSI SGR color code
+/// so column alignment stays identical with and without terminal color output.
+fn pad_branch_label(label: &str, width: usize, ansi_code: Option<&str>, colored: bool) -> String {
+    let padded = format!("{label:<width$}");
+
+    match (colored, ansi_code) {
+        (true, Some(code)) => format!("\x1b[{code}m{padded}\x1b[0m"),
+        _ => padded,
+    }
+}
+
 /// Shared implementation for listing local and/or remote branches for `tes branch` and `tes switch`.
 fn list_branches(
     ctx: &CliContext,
@@ -354,6 +365,14 @@ fn list_branches(
     let mut out = String::new();
     let repo_root = coord.git().repo_root();
     let linked_session = format_session_link(session_id, repo_root, c_dim(session_id));
+    let colored = crate::output::use_color();
+    let name_width = filtered_local
+        .iter()
+        .map(|b| b.chars().count())
+        .chain(filtered_remotes.iter().map(|r| 8 + r.chars().count()))
+        .max()
+        .unwrap_or(0)
+        .max(20);
 
     for br in &filtered_local {
         if opts.verbose {
@@ -374,11 +393,12 @@ fn list_branches(
                 .unwrap_or_default();
 
             if *br == active_branch {
+                let padded_br = pad_branch_label(br, name_width, Some("1;32"), colored);
                 let _ = writeln!(
                     out,
-                    "{} {:<20} {} {} {}{}{}",
+                    "{} {} {} {} {}{}{}",
                     c_green("*"),
-                    c_green(br),
+                    padded_br,
                     c_yellow(&short_sha),
                     subject,
                     c_dim("(current session: "),
@@ -386,7 +406,8 @@ fn list_branches(
                     c_dim(")")
                 );
             } else {
-                let _ = writeln!(out, "  {:<20} {} {}", br, c_yellow(&short_sha), subject);
+                let padded_br = pad_branch_label(br, name_width, None, colored);
+                let _ = writeln!(out, "  {} {} {}", padded_br, c_yellow(&short_sha), subject);
             }
         } else if *br == active_branch {
             let _ = writeln!(
@@ -419,11 +440,13 @@ fn list_branches(
                 .and_then(|c| coord.git().read_commit(c).ok())
                 .and_then(|cm| cm.message.lines().next().map(ToString::to_string))
                 .unwrap_or_default();
+            let remote_label = format!("remotes/{rbr}");
+            let padded_remote = pad_branch_label(&remote_label, name_width, Some("1;36"), colored);
 
             let _ = writeln!(
                 out,
-                "  {:<20} {} {}",
-                c_cyan(format!("remotes/{rbr}")),
+                "  {} {} {}",
+                padded_remote,
                 c_yellow(&short_sha),
                 subject
             );
@@ -643,4 +666,74 @@ pub fn run_switch(ctx: &CliContext, args: SwitchArgs) -> anyhow::Result<()> {
     }
 
     list_branches(ctx, &coord, &session_id, ListBranchesOptions::default())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Strips ANSI CSI SGR escape sequences so visible character columns can be verified.
+    fn strip_ansi(input: &str) -> String {
+        let mut out = String::with_capacity(input.len());
+        let mut chars = input.chars().peekable();
+
+        while let Some(ch) = chars.next() {
+            if ch == '\x1b' && chars.peek() == Some(&'[') {
+                chars.next();
+
+                for esc_ch in chars.by_ref() {
+                    if esc_ch.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            } else {
+                out.push(ch);
+            }
+        }
+
+        out
+    }
+
+    #[test]
+    fn verbose_branch_labels_align_sha_columns_with_and_without_ansi() {
+        let width = "remotes/origin/fix/very-long-branch-name".chars().count();
+
+        for colored in [false, true] {
+            let active = format!(
+                "* {} deadbeef subject",
+                pad_branch_label("main", width, Some("1;32"), colored)
+            );
+            let inactive = format!(
+                "  {} deadbeef subject",
+                pad_branch_label("feat/auth", width, None, colored)
+            );
+            let remote = format!(
+                "  {} deadbeef subject",
+                pad_branch_label(
+                    "remotes/origin/fix/very-long-branch-name",
+                    width,
+                    Some("1;36"),
+                    colored
+                )
+            );
+
+            let cols: Vec<usize> = [active, inactive, remote]
+                .iter()
+                .map(|line| {
+                    let vis = strip_ansi(line);
+                    let idx = vis.find("deadbeef").expect("sha");
+                    vis[..idx].chars().count()
+                })
+                .collect();
+
+            assert_eq!(
+                cols[0], cols[1],
+                "active and inactive SHA columns must align"
+            );
+            assert_eq!(
+                cols[1], cols[2],
+                "inactive and remote SHA columns must align"
+            );
+        }
+    }
 }

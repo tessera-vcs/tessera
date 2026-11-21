@@ -22,6 +22,9 @@ clap.workspace = true
 flate2.workspace = true
 serde_json.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true
 

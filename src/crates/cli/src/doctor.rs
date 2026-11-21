@@ -10,7 +10,7 @@ use core::{GitBackend, OpLogStore};
 use serde_json::{Value, json};
 use workspace::{CowStrategy, clone_path_cow};
 
-use crate::output::{c_bold, c_cyan, c_dim, c_green, c_red, c_yellow, emit_paged_output};
+use crate::output::{emit_paged_output, use_color};
 
 /// Known repository-local AI harness files inspected by `tes doctor`.
 const KNOWN_HARNESS_FILES: &[&str] = &[
@@ -590,6 +590,62 @@ pub fn collect_doctor_report(cwd: &Path) -> Value {
     })
 }
 
+/// Formats a `tes doctor` diagnostic JSON report as aligned human-readable text.
+///
+/// Pads check names to a uniform display width before applying ANSI color escapes so columns stay
+/// aligned regardless of whether `colored` is enabled.
+#[must_use]
+pub fn format_doctor_report(report: &Value, colored: bool) -> String {
+    let style = |code: &str, text: &str| {
+        if colored {
+            format!("\x1b[{code}m{text}\x1b[0m")
+        } else {
+            text.to_string()
+        }
+    };
+
+    let mut buf = String::new();
+    let _ = writeln!(buf, "{}", style("1", "Tessera Doctor Diagnostics"));
+
+    if let Some(checks) = report.get("checks").and_then(Value::as_array) {
+        for check in checks {
+            let status = check
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("fail");
+            let name = check.get("name").and_then(Value::as_str).unwrap_or("Check");
+            let summary = check.get("summary").and_then(Value::as_str).unwrap_or("");
+            let badge = match status {
+                "pass" => style("1;32", "✓ PASS"),
+                "warn" => style("1;33", "! WARN"),
+                _ => style("1;31", "✗ FAIL"),
+            };
+            let padded_name = format!("{name:<30}");
+
+            let _ = writeln!(buf, "  {badge}  {} {summary}", style("1;36", &padded_name));
+        }
+    }
+
+    let pass = report["summary"]["pass"].as_u64().unwrap_or(0);
+    let warn = report["summary"]["warn"].as_u64().unwrap_or(0);
+    let fail = report["summary"]["fail"].as_u64().unwrap_or(0);
+
+    let _ = writeln!(
+        buf,
+        "\n{} {} passed, {} warning(s), {} failed",
+        style("2", "Summary:"),
+        style("1;32", &pass.to_string()),
+        style("1;33", &warn.to_string()),
+        if fail == 0 {
+            style("1;32", &fail.to_string())
+        } else {
+            style("1;31", &fail.to_string())
+        }
+    );
+
+    buf
+}
+
 /// Runs `tes doctor`, printing either structured JSON or a formatted diagnostic report.
 ///
 /// Exits with code 1 when any diagnostic check reports status `"fail"`.
@@ -608,44 +664,7 @@ pub fn run_doctor(
     if json_out {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        let mut buf = String::new();
-        let _ = writeln!(buf, "{}", c_bold("Tessera Doctor Diagnostics"));
-
-        if let Some(checks) = report.get("checks").and_then(Value::as_array) {
-            for check in checks {
-                let status = check
-                    .get("status")
-                    .and_then(Value::as_str)
-                    .unwrap_or("fail");
-                let name = check.get("name").and_then(Value::as_str).unwrap_or("Check");
-                let summary = check.get("summary").and_then(Value::as_str).unwrap_or("");
-                let badge = match status {
-                    "pass" => c_green("✓ PASS"),
-                    "warn" => c_yellow("! WARN"),
-                    _ => c_red("✗ FAIL"),
-                };
-
-                let _ = writeln!(buf, "  {badge}  {:<28} {summary}", c_cyan(name));
-            }
-        }
-
-        let pass = report["summary"]["pass"].as_u64().unwrap_or(0);
-        let warn = report["summary"]["warn"].as_u64().unwrap_or(0);
-        let fail = report["summary"]["fail"].as_u64().unwrap_or(0);
-
-        let _ = writeln!(
-            buf,
-            "\n{} {} passed, {} warning(s), {} failed",
-            c_dim("Summary:"),
-            c_green(pass),
-            c_yellow(warn),
-            if fail == 0 {
-                c_green(fail)
-            } else {
-                c_red(fail)
-            }
-        );
-
+        let buf = format_doctor_report(&report, use_color());
         let coord_opt = Coordinator::open(cwd).ok();
         emit_paged_output(
             &buf,
@@ -662,4 +681,66 @@ pub fn run_doctor(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Strips ANSI CSI SGR escape sequences so visible character columns can be verified.
+    fn strip_ansi(input: &str) -> String {
+        let mut out = String::with_capacity(input.len());
+        let mut chars = input.chars().peekable();
+
+        while let Some(ch) = chars.next() {
+            if ch == '\x1b' && chars.peek() == Some(&'[') {
+                chars.next();
+
+                for esc_ch in chars.by_ref() {
+                    if esc_ch.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            } else {
+                out.push(ch);
+            }
+        }
+
+        out
+    }
+
+    #[test]
+    fn doctor_human_output_aligns_summary_columns_with_and_without_ansi() {
+        let sample = json!({
+            "ok": true,
+            "summary": { "pass": 6, "warn": 1, "fail": 0 },
+            "checks": [
+                { "name": "Git Repository", "status": "pass", "summary": "S1" },
+                { "name": "Copy-on-Write Filesystem", "status": "pass", "summary": "S2" },
+                { "name": "Sandboxes, Leases & Conflicts", "status": "warn", "summary": "S3" }
+            ]
+        });
+
+        let char_col = |line: &str, needle: &str| -> usize {
+            let byte_idx = line.find(needle).expect("needle column");
+            line[..byte_idx].chars().count()
+        };
+
+        for colored in [false, true] {
+            let rendered = format_doctor_report(&sample, colored);
+            let visible_lines: Vec<String> = rendered.lines().map(strip_ansi).collect();
+            let s1_col = char_col(&visible_lines[1], "S1");
+            let s2_col = char_col(&visible_lines[2], "S2");
+            let s3_col = char_col(&visible_lines[3], "S3");
+
+            assert_eq!(
+                s1_col, s2_col,
+                "summary columns must align for short and long check names (colored={colored}):\n{rendered}"
+            );
+            assert_eq!(
+                s2_col, s3_col,
+                "summary columns must align for 29-char check names (colored={colored}):\n{rendered}"
+            );
+        }
+    }
 }
