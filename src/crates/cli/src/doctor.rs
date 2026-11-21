@@ -1,6 +1,6 @@
 //! Repository and environment health diagnostics for `tes doctor`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use agent::Coordinator;
 use core::{GitBackend, OpLogStore, authorized_sandbox_bases, sandbox_paths};
 use serde_json::{Value, json};
-use workspace::{CowStrategy, clone_path_cow};
+use workspace::{CowStrategy, DirDiskUsage, clone_path_cow, format_bytes, measure_dir_usage};
 
 use crate::output::{emit_paged_output, use_color};
 
@@ -210,6 +210,31 @@ fn is_worktree_inside_sandbox(worktree_path: &Path, repo_root: &Path) -> bool {
     authorized_sandbox_bases(repo_root)
         .iter()
         .any(|base| sandbox_paths::path_is_within(worktree_path, base))
+}
+
+/// Parses the owning PID from a `verify-sandbox-<pid>-<ms>-<seq>` directory name.
+fn parse_verify_sandbox_pid(dir_name: &str) -> Option<i32> {
+    let rest = dir_name.strip_prefix("verify-sandbox-")?;
+    rest.split('-').next()?.parse::<i32>().ok()
+}
+
+/// Returns `true` if `name` ends with `-<32 lowercase hex chars>`, matching Tessera's slug format.
+fn has_tessera_slug_suffix(name: &str) -> bool {
+    let Some((_, suffix)) = name.rsplit_once('-') else {
+        return false;
+    };
+
+    suffix.len() == 32
+        && suffix
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Returns `true` if `a` and `b` refer to the same canonical path.
+fn same_canonical_path(a: &Path, b: &Path) -> bool {
+    let ca = a.canonicalize().unwrap_or_else(|_| a.to_path_buf());
+    let cb = b.canonicalize().unwrap_or_else(|_| b.to_path_buf());
+    ca == cb
 }
 
 /// Probes Copy-on-Write cloning behavior on the filesystem hosting `probe_root`.
@@ -609,31 +634,83 @@ pub fn collect_doctor_report(cwd: &Path) -> Value {
         });
 
         let mut orphaned_sandboxes: Vec<String> = Vec::new();
+        let mut merged_sandboxes: Vec<String> = Vec::new();
+        let mut crashed_verify_sandboxes: Vec<String> = Vec::new();
+        let mut orphaned_agent_workspaces: Vec<String> = Vec::new();
+        let mut stale_global_repos: Vec<String> = Vec::new();
         let mut dead_port_leases: Vec<Value> = Vec::new();
         let mut active_conflicts_count: usize = 0;
+        let mut sandbox_disk_usage = DirDiskUsage::default();
 
         if let Some(coord) = &coord_opt {
+            let cfg = oplog.load_config().unwrap_or_default();
+            let current_head_branch = git
+                .current_branch_name()
+                .unwrap_or_else(|_| cfg.trunk_branch.clone());
+            let local_git_branches: BTreeSet<String> =
+                git.list_local_branches().into_iter().collect();
             let mut known_safe_branches: BTreeSet<String> = BTreeSet::new();
+            let mut safe_name_to_branch: BTreeMap<String, String> = BTreeMap::new();
+            let mut active_agent_ids: BTreeSet<String> = BTreeSet::new();
+            let mut active_target_branches: BTreeSet<String> = BTreeSet::new();
 
-            for br in git.list_local_branches() {
-                known_safe_branches.insert(Coordinator::sanitize_branch_name(&br));
+            known_safe_branches.insert(Coordinator::sanitize_branch_name(&cfg.trunk_branch));
+            known_safe_branches.insert(Coordinator::sanitize_branch_name(&current_head_branch));
+
+            for br in &local_git_branches {
+                let safe = Coordinator::sanitize_branch_name(br);
+                known_safe_branches.insert(safe.clone());
+                safe_name_to_branch.insert(safe, br.clone());
             }
 
             if let Ok(current) = oplog.load_current_reconciled() {
                 active_conflicts_count = current.view.conflicts.len();
 
-                for br in current.view.branches.keys() {
-                    known_safe_branches.insert(Coordinator::sanitize_branch_name(br));
+                for (aid, agent) in &current.view.agents {
+                    active_agent_ids.insert(aid.clone());
+
+                    if let Some(tb) = &agent.target_branch {
+                        if aid != "editor" {
+                            active_target_branches.insert(tb.clone());
+                        }
+
+                        if local_git_branches.contains(tb)
+                            || tb == &cfg.trunk_branch
+                            || tb == &current_head_branch
+                            || agent.has_own_changes()
+                        {
+                            known_safe_branches.insert(Coordinator::sanitize_branch_name(tb));
+                        }
+                    }
                 }
 
-                for agent in current.view.agents.values() {
-                    if let Some(tb) = &agent.target_branch {
-                        known_safe_branches.insert(Coordinator::sanitize_branch_name(tb));
+                for br in current.view.branches.keys() {
+                    let has_dirty_session = current.view.agents.values().any(|a| {
+                        a.target_branch.as_deref() == Some(br.as_str()) && a.has_own_changes()
+                    });
+
+                    if br == &cfg.trunk_branch
+                        || br == &current_head_branch
+                        || local_git_branches.contains(br)
+                        || has_dirty_session
+                    {
+                        let safe = Coordinator::sanitize_branch_name(br);
+                        known_safe_branches.insert(safe.clone());
+                        safe_name_to_branch
+                            .entry(safe)
+                            .or_insert_with(|| br.clone());
                     }
                 }
             }
 
+            let trunk_cid = git
+                .resolve_ref(&format!("refs/heads/{}", cfg.trunk_branch))
+                .ok()
+                .flatten();
+            let trunk_safe = Coordinator::sanitize_branch_name(&cfg.trunk_branch);
+            let head_safe = Coordinator::sanitize_branch_name(&current_head_branch);
             let branches_root = coord.branches_root();
+            sandbox_disk_usage = measure_dir_usage(&branches_root);
 
             if let Ok(entries) = fs::read_dir(&branches_root) {
                 for entry in entries.flatten() {
@@ -649,11 +726,130 @@ pub fn collect_doctor_report(cwd: &Path) -> Value {
 
                     if !known_safe_branches.contains(name) {
                         orphaned_sandboxes.push(name.to_string());
+                        continue;
+                    }
+
+                    if name == trunk_safe || name == head_safe {
+                        continue;
+                    }
+
+                    if let Some(t_cid) = trunk_cid.as_ref() {
+                        let raw_br = safe_name_to_branch
+                            .get(name)
+                            .map(String::as_str)
+                            .unwrap_or(name);
+
+                        if !active_target_branches.contains(raw_br) {
+                            if let Ok(Some(b_cid)) =
+                                git.resolve_ref(&format!("refs/heads/{raw_br}"))
+                            {
+                                if git.is_ancestor(&b_cid, t_cid) {
+                                    merged_sandboxes.push(name.to_string());
+                                }
+                            }
+                        }
                     }
                 }
             }
 
-            let leases_dir = coord.sandboxes_root().join("bin").join(".leases");
+            let sandboxes_root = coord.sandboxes_root();
+
+            if let Ok(entries) = fs::read_dir(&sandboxes_root) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+
+                    if !p.is_dir() {
+                        continue;
+                    }
+
+                    let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+                        continue;
+                    };
+
+                    if !name.starts_with("verify-sandbox-") {
+                        continue;
+                    }
+
+                    let alive = parse_verify_sandbox_pid(name).is_some_and(is_pid_alive);
+
+                    if !alive {
+                        crashed_verify_sandboxes.push(name.to_string());
+                    }
+                }
+            }
+
+            let in_repo_ws = git.repo_root().join(".tessera").join("workspaces");
+
+            if let Ok(entries) = fs::read_dir(&in_repo_ws) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+
+                    if !p.is_dir() {
+                        continue;
+                    }
+
+                    let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+                        continue;
+                    };
+
+                    if !active_agent_ids.contains(name) {
+                        orphaned_agent_workspaces.push(name.to_string());
+                    }
+                }
+            }
+
+            let mut global_bases: Vec<PathBuf> = Vec::new();
+            let isolated_root = sandbox_paths::configured_workspaces_root().is_some()
+                || sandbox_paths::is_path_inside_temp_dir(git.repo_root());
+
+            if let Some(parent) = sandboxes_root.parent() {
+                global_bases.push(parent.to_path_buf());
+            }
+
+            if !isolated_root {
+                if let Some(primary) = core::primary_global_workspaces_base() {
+                    if !global_bases
+                        .iter()
+                        .any(|b| same_canonical_path(b, &primary))
+                    {
+                        global_bases.push(primary);
+                    }
+                }
+            }
+
+            for base in global_bases {
+                let Ok(entries) = fs::read_dir(&base) else {
+                    continue;
+                };
+
+                for entry in entries.flatten() {
+                    let p = entry.path();
+
+                    if !p.is_dir() || same_canonical_path(&p, &sandboxes_root) {
+                        continue;
+                    }
+
+                    let Some(slug) = p.file_name().and_then(|n| n.to_str()) else {
+                        continue;
+                    };
+
+                    if !has_tessera_slug_suffix(slug) {
+                        continue;
+                    }
+
+                    let marker = p.join(".repo_root");
+
+                    if let Ok(raw) = fs::read_to_string(&marker) {
+                        let owner = PathBuf::from(raw.trim());
+
+                        if !raw.trim().is_empty() && !owner.join(".git").exists() {
+                            stale_global_repos.push(slug.to_string());
+                        }
+                    }
+                }
+            }
+
+            let leases_dir = sandboxes_root.join("bin").join(".leases");
 
             if let Ok(entries) = fs::read_dir(&leases_dir) {
                 for entry in entries.flatten() {
@@ -686,30 +882,77 @@ pub fn collect_doctor_report(cwd: &Path) -> Value {
         }
 
         orphaned_sandboxes.sort();
+        merged_sandboxes.sort();
+        crashed_verify_sandboxes.sort();
+        orphaned_agent_workspaces.sort();
+        stale_global_repos.sort();
 
-        let (rt_status, rt_summary) = if !orphaned_sandboxes.is_empty()
-            || !dead_port_leases.is_empty()
+        let has_local_prunable = !orphaned_sandboxes.is_empty()
+            || !merged_sandboxes.is_empty()
+            || !crashed_verify_sandboxes.is_empty()
+            || !orphaned_agent_workspaces.is_empty()
+            || !dead_port_leases.is_empty();
+        let usage_note = if sandbox_disk_usage.file_count > 0 {
+            format!(
+                " [sandboxes: {} unique / {} logical, {} files]",
+                format_bytes(sandbox_disk_usage.unique_bytes),
+                format_bytes(sandbox_disk_usage.logical_bytes),
+                sandbox_disk_usage.file_count
+            )
+        } else {
+            String::new()
+        };
+
+        let (rt_status, rt_summary) = if has_local_prunable
             || active_conflicts_count > 0
+            || !stale_global_repos.is_empty()
         {
-            let gc_hint = if !orphaned_sandboxes.is_empty() || !dead_port_leases.is_empty() {
+            let mut parts: Vec<String> = vec![
+                format!("{} orphaned sandbox(es)", orphaned_sandboxes.len()),
+                format!("{} dead port lease(s)", dead_port_leases.len()),
+                format!("{} active conflict(s)", active_conflicts_count),
+            ];
+
+            if !merged_sandboxes.is_empty() {
+                parts.push(format!("{} merged sandbox(es)", merged_sandboxes.len()));
+            }
+
+            if !crashed_verify_sandboxes.is_empty() {
+                parts.push(format!(
+                    "{} crashed verify sandbox(es)",
+                    crashed_verify_sandboxes.len()
+                ));
+            }
+
+            if !orphaned_agent_workspaces.is_empty() {
+                parts.push(format!(
+                    "{} orphaned agent workspace(s)",
+                    orphaned_agent_workspaces.len()
+                ));
+            }
+
+            if !stale_global_repos.is_empty() {
+                parts.push(format!(
+                    "{} deleted-repo sandbox cache(s)",
+                    stale_global_repos.len()
+                ));
+            }
+
+            let gc_hint = if has_local_prunable && !stale_global_repos.is_empty() {
+                " (run 'tes gc' or 'tes gc --all' to clean up)"
+            } else if has_local_prunable {
                 " (run 'tes gc' to clean up)"
+            } else if !stale_global_repos.is_empty() {
+                " (run 'tes gc --all' to clean up)"
             } else {
                 ""
             };
 
-            (
-                "warn",
-                format!(
-                    "{} orphaned sandbox(es), {} dead port lease(s), {} active conflict(s){gc_hint}",
-                    orphaned_sandboxes.len(),
-                    dead_port_leases.len(),
-                    active_conflicts_count
-                ),
-            )
+            ("warn", format!("{}{usage_note}{gc_hint}", parts.join(", ")))
         } else {
             (
                 "pass",
-                "No orphaned sandboxes, dead port leases, or active conflicts".to_string(),
+                format!("No orphaned sandboxes, dead port leases, or active conflicts{usage_note}"),
             )
         };
 
@@ -720,8 +963,17 @@ pub fn collect_doctor_report(cwd: &Path) -> Value {
             summary: rt_summary,
             details: json!({
                 "orphaned_sandboxes": orphaned_sandboxes,
+                "merged_sandboxes": merged_sandboxes,
+                "crashed_verify_sandboxes": crashed_verify_sandboxes,
+                "orphaned_agent_workspaces": orphaned_agent_workspaces,
+                "stale_global_repos": stale_global_repos,
                 "dead_port_leases": dead_port_leases,
                 "active_conflicts": active_conflicts_count,
+                "sandbox_disk_usage": {
+                    "logical_bytes": sandbox_disk_usage.logical_bytes,
+                    "unique_bytes": sandbox_disk_usage.unique_bytes,
+                    "file_count": sandbox_disk_usage.file_count,
+                },
             }),
         });
     }

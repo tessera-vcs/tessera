@@ -215,12 +215,54 @@ tes config set co_author_trailer "Tessera <noreply@tessera.getlunaris.dev>"
 
 - **Type:** `string[]`
 - **Default:** `["target", "node_modules", ".pnpm-store", ".turbo", ".next", ".nuxt", ".svelte-kit", "dist", "build", ".venv", "venv", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", "vendor", "_build", "deps", ".gradle", ".build", ".zig-cache", "zig-out", ".dart_tool", "cmake-build-debug", "cmake-build-release"]`
-- **Description:** Untracked dependency and build cache directories cloned via Copy-on-Write into every branch sandbox.
+- **Description:** Untracked dependency and build cache directories cloned via Copy-on-Write into every branch sandbox. On Rust projects, cloned `target/<profile>/incremental` directories are stripped automatically during sanitization because Cargo keys incremental sessions by absolute path.
 
 Add directories via CLI:
 
 ```bash:no-line-numbers
 tes config add-cache-dir .nx .angular
+```
+
+#### `cow_exclude_dirs`
+
+- **Type:** `string[]`
+- **Default:** `[]`
+- **Description:** Directory names or repository-relative paths (such as `target`, `src/target`, or `node_modules`) excluded from sandbox cloning and cache synchronization.
+
+Add excluded directories via CLI:
+
+```bash:no-line-numbers
+tes config add-exclude-dir src/target dist
+```
+
+#### `portable_copy_cache_max_mb`
+
+- **Type:** `number`
+- **Default:** `64`
+- **Description:** Maximum size in MiB (and 2,000 files) per dependency or build cache directory allowed to be copied when the filesystem does not support native Copy-on-Write reflinks (`PortableCopy` fallback on ext4/NTFS). Set to `0` to skip copying caches whenever native CoW is unavailable.
+
+```toml
+portable_copy_cache_max_mb = 64
+```
+
+#### `max_warm_sandboxes`
+
+- **Type:** `number`
+- **Default:** `8`
+- **Description:** Maximum number of idle non-trunk warm branch sandboxes retained before automatic LRU eviction removes the oldest clean sandboxes. Active, leased, dirty, trunk, and checked-out sandboxes are never evicted. Set to `0` for unlimited warm sandboxes.
+
+```toml
+max_warm_sandboxes = 8
+```
+
+#### `shared_cargo_target`
+
+- **Type:** `boolean`
+- **Default:** `false`
+- **Description:** When `true`, excludes Cargo `target` directories (including nested monorepo `src/target`) from per-branch sandbox clones and points `CARGO_TARGET_DIR` inside `tes exec` and `tes merge --verify` to a shared repository build cache at `<sandboxes_root>/shared-target`.
+
+```toml
+shared_cargo_target = true
 ```
 
 #### `package_globs`
@@ -306,7 +348,7 @@ tes config set-env APP_URL "http://localhost:{port}"
 
 ### Repository Trust (`tessera.toml`)
 
-When cloning an external repository that includes a checked-in `tessera.toml`, declarative settings (`trunk_branch`, `base_port`, `port_stride`, `watch_interval_ms`, `watch_timeout_secs`, `auto_isolate_dirty_claims`, `co_author`, `co_author_trailer`, `port_isolation`, `cow_cache_dirs`, and `package_globs`) are loaded automatically.
+When cloning an external repository that includes a checked-in `tessera.toml`, declarative settings (`trunk_branch`, `base_port`, `port_stride`, `watch_interval_ms`, `watch_timeout_secs`, `auto_isolate_dirty_claims`, `co_author`, `co_author_trailer`, `port_isolation`, `cow_cache_dirs`, `cow_exclude_dirs`, `portable_copy_cache_max_mb`, `max_warm_sandboxes`, `shared_cargo_target`, and `package_globs`) are loaded automatically.
 
 To prevent untrusted repositories from executing arbitrary commands, shadowing binaries, or injecting environment variables automatically, `verify_command`, `pager`, `extra_bin_dirs`, and `custom_env` in `tessera.toml` are ignored until you explicitly trust the current file digest:
 

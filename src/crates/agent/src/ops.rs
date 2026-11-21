@@ -3,18 +3,20 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::UNIX_EPOCH;
 
 use core::{
     ConflictKind, ConflictRecord, CoreError, CoreResult, EntryMode, FileEntry, GitBackend, Merge,
-    ObjectId, Operation, StashEntry, atomic_write_file, now_millis, resolve_confined_repo_path,
-    validate_ref_name,
+    ObjectId, Operation, StashEntry, View, atomic_write_file, now_millis,
+    resolve_confined_repo_path, validate_ref_name,
 };
 use merge::{merge_file_3way, merge_trees_3way};
 use workspace::{
-    materialize_tree_to_dir, materialize_tree_to_dir_with_baseline, snapshot_working_dir,
+    materialize_tree_to_dir, materialize_tree_to_dir_with_baseline, measure_dir_usage,
+    snapshot_working_dir,
 };
 
 use crate::merge::apply_co_author_trailer;
@@ -23,7 +25,7 @@ use crate::worktree::{
     same_canonical_path, write_worktree_file, write_worktree_file_checked, write_worktree_rel,
 };
 use crate::{
-    CherryPickReport, Coordinator, DeleteBranchReport, GcReport, LogEntry, PullReport,
+    CherryPickReport, Coordinator, DeleteBranchReport, GcOptions, GcReport, LogEntry, PullReport,
     RenameBranchReport, RestoreReport, StashPopReport,
 };
 
@@ -2470,43 +2472,373 @@ impl Coordinator {
             touched_paths: touched_paths.into_iter().collect(),
         })
     }
+}
+
+/// Returns a path's modification time in Unix epoch milliseconds, or `None` if unreadable.
+fn path_mtime_ms(path: &Path) -> Option<u64> {
+    let mtime = fs::metadata(path).ok()?.modified().ok()?;
+    let dur = mtime.duration_since(UNIX_EPOCH).ok()?;
+    Some(dur.as_millis() as u64)
+}
+
+/// Returns `true` if `name` ends with `-<32 lowercase hex chars>`, matching Tessera's Blake3
+/// repository workspace slug format.
+fn has_tessera_slug_suffix(name: &str) -> bool {
+    let Some((_, suffix)) = name.rsplit_once('-') else {
+        return false;
+    };
+
+    suffix.len() == 32
+        && suffix
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Returns `true` if any port lease under `<slug_dir>/bin/.leases/` belongs to a currently alive PID.
+fn slug_has_live_lease(slug_dir: &Path) -> bool {
+    let leases_dir = slug_dir.join("bin").join(".leases");
+    let Ok(entries) = fs::read_dir(&leases_dir) else {
+        return false;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+
+        if !path.is_dir() {
+            continue;
+        }
+
+        let pid_opt = fs::read_to_string(path.join("pid"))
+            .ok()
+            .and_then(|raw| raw.trim().parse::<i32>().ok());
+
+        if pid_opt.is_some_and(crate::session::is_process_alive) {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Discovers the source repository root recorded inside a global sandbox `<slug_dir>` via
+/// `<slug_dir>/.repo_root` or any branch sandbox's `.tessera/repo_root` marker.
+fn discover_slug_repo_root(slug_dir: &Path) -> Option<PathBuf> {
+    let direct_marker = slug_dir.join(".repo_root");
+
+    if direct_marker.is_file() {
+        if let Ok(raw) = fs::read_to_string(&direct_marker) {
+            let trimmed = raw.trim();
+
+            if !trimmed.is_empty() {
+                return Some(PathBuf::from(trimmed));
+            }
+        }
+    }
+
+    let branches_dir = slug_dir.join("branches");
+
+    if let Ok(entries) = fs::read_dir(&branches_dir) {
+        for entry in entries.flatten() {
+            let marker = entry.path().join(".tessera").join("repo_root");
+
+            if marker.is_file() {
+                if let Ok(raw) = fs::read_to_string(&marker) {
+                    let trimmed = raw.trim();
+
+                    if !trimmed.is_empty() {
+                        return Some(PathBuf::from(trimmed));
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Recursively collects matching cache directories (`cache_names`) under `root` up to `max_depth`,
+/// skipping `.git` and `.tessera` internals and never descending inside already-matched caches.
+fn collect_cache_dirs_bounded(
+    root: &Path,
+    dir: &Path,
+    depth: usize,
+    max_depth: usize,
+    cache_names: &BTreeSet<String>,
+    out: &mut Vec<(String, PathBuf)>,
+) {
+    if depth > max_depth {
+        return;
+    }
+
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+
+        if !ft.is_dir() || ft.is_symlink() {
+            continue;
+        }
+
+        let Some(name) = entry.file_name().to_str().map(ToString::to_string) else {
+            continue;
+        };
+
+        if name == ".git" || name == ".tessera" {
+            continue;
+        }
+
+        let Ok(rel) = path.strip_prefix(root) else {
+            continue;
+        };
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+
+        if cache_names.contains(&name) || cache_names.contains(&rel_str) {
+            out.push((rel_str, path));
+            continue;
+        }
+
+        collect_cache_dirs_bounded(root, &path, depth + 1, max_depth, cache_names, out);
+    }
+}
+
+/// Parses the owning process ID from a `verify-sandbox-<pid>-<ms>-<seq>` directory name.
+fn parse_verify_sandbox_pid(dir_name: &str) -> Option<i32> {
+    let rest = dir_name.strip_prefix("verify-sandbox-")?;
+    rest.split('-').next()?.parse::<i32>().ok()
+}
+
+impl Coordinator {
+    /// Returns `true` when `sandbox_dir` for `branch` has no live leased processes, no active
+    /// session edits in `view`, and no uncommitted file modifications compared to `branch`'s Git
+    /// tip tree, making it safe to evict as a disposable cache.
+    pub(crate) fn is_sandbox_clean(
+        &self,
+        branch: &str,
+        sandbox_dir: &Path,
+        view: &View,
+        current_head_branch: &str,
+        live_lease_workspaces: &[PathBuf],
+    ) -> bool {
+        if live_lease_workspaces
+            .iter()
+            .any(|ws| same_canonical_path(sandbox_dir, ws))
+        {
+            return false;
+        }
+
+        for agent in view.agents.values() {
+            if agent.agent_id != "editor" && agent.target_branch.as_deref() == Some(branch) {
+                return false;
+            }
+
+            if agent.effective_branch(current_head_branch) == branch && agent.has_own_changes() {
+                return false;
+            }
+
+            if let Some(ws) = &agent.workspace_path {
+                if same_canonical_path(sandbox_dir, Path::new(ws)) {
+                    return false;
+                }
+            }
+        }
+
+        let Ok(Some(branch_cid)) = self.git.resolve_ref(&format!("refs/heads/{branch}")) else {
+            return false;
+        };
+        let Ok(branch_commit) = self.git.read_commit(&branch_cid) else {
+            return false;
+        };
+        let Ok(branch_tree) = self.git.read_tree_to_map(&branch_commit.tree_id) else {
+            return false;
+        };
+
+        let temp_cache_key = format!("gc-clean-check-{}", std::process::id());
+        let snap_res = snapshot_working_dir(
+            &self.git,
+            sandbox_dir,
+            &temp_cache_key,
+            &[],
+            Some(&branch_commit.tree_id),
+        );
+        let temp_cache_file = self
+            .git
+            .git_dir()
+            .join("tessera")
+            .join("stat_cache")
+            .join(format!("{temp_cache_key}.json"));
+        let _ = fs::remove_file(&temp_cache_file);
+
+        let Ok(snap) = snap_res else {
+            return false;
+        };
+
+        for (rel_path, entry) in &snap.files {
+            if is_harness_config_path(rel_path) {
+                continue;
+            }
+
+            if branch_tree.get(rel_path) != Some(entry) {
+                return false;
+            }
+        }
+
+        for rel_path in branch_tree.keys() {
+            if is_harness_config_path(rel_path) {
+                continue;
+            }
+
+            if !snap.files.contains_key(rel_path) {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    /// Removes sandbox sidecar files (`.slot`, `.tree`, `.pending-merge`) for `safe_name` under
+    /// `branches_root` (or previews them under `dry_run`), recording each removed filename.
+    fn prune_branch_sidecars_for_stem(
+        &self,
+        branches_root: &Path,
+        safe_name: &str,
+        dry_run: bool,
+        pruned_sidecars: &mut Vec<String>,
+    ) {
+        let slots_lock_path = self.git.common_git_dir().join("tessera").join("slots.lock");
+
+        for (suffix, is_slot) in [(".slot", true), (".tree", false), (".pending-merge", false)] {
+            let fname = format!("{safe_name}{suffix}");
+            let path = branches_root.join(&fname);
+
+            if !path.is_file() {
+                continue;
+            }
+
+            if dry_run {
+                pruned_sidecars.push(fname);
+            } else if is_slot {
+                let _slot_lock = acquire_file_lock(&slots_lock_path).ok();
+
+                if fs::remove_file(&path).is_ok() {
+                    pruned_sidecars.push(fname);
+                }
+            } else if fs::remove_file(&path).is_ok() {
+                pruned_sidecars.push(fname);
+            }
+        }
+    }
 
     /// Compacts ephemeral micro-snapshot operations in `.git/tessera/oplog/` and prunes orphaned
-    /// branch sandboxes, stale sandbox sidecar metadata (`.slot`, `.tree`, `.pending-merge`), and
-    /// dead port leases whose owning PID is no longer alive.
+    /// or merged branch sandboxes, stale sidecars, crashed verify sandboxes, orphaned agent
+    /// workspaces, stale temporary dirs, stale metadata caches, and dead port leases.
     ///
-    /// When `dry_run` is `true`, computes and returns the complete [`GcReport`] without modifying
-    /// any Operation Log files, sandboxes, sidecars, or port leases. Orphaned sandboxes that still
-    /// host a live leased process or an active session workspace are skipped and reported in
-    /// [`GcReport::skipped_active_sandboxes`].
+    /// Delegates to [`Self::gc_with_options`] with default options.
     ///
     /// # Errors
     /// Returns [`CoreError`] if Operation Log compaction or configuration loading fails.
     pub fn gc(&self, dry_run: bool) -> CoreResult<GcReport> {
+        self.gc_with_options(&GcOptions {
+            dry_run,
+            ..GcOptions::default()
+        })
+    }
+
+    /// Runs garbage collection with explicit [`GcOptions`].
+    ///
+    /// When `opts.dry_run` is `true`, computes and returns the complete [`GcReport`] without
+    /// modifying any Operation Log files, sandboxes, sidecars, leases, or caches. Any sandbox
+    /// hosting a live leased process, an active dirty session, or uncommitted edits is skipped
+    /// and reported in [`GcReport::skipped_active_sandboxes`].
+    ///
+    /// # Errors
+    /// Returns [`CoreError`] if Operation Log compaction or configuration loading fails.
+    pub fn gc_with_options(&self, opts: &GcOptions) -> CoreResult<GcReport> {
+        const STAT_CACHE_TTL_MS: u64 = 24 * 60 * 60 * 1000;
+        const SESSION_SLOT_TTL_MS: u64 = 30 * 60 * 1000;
+        const UNMARKED_GLOBAL_SLUG_TTL_MS: u64 = 60 * 60 * 1000;
+
+        let dry_run = opts.dry_run;
+        let now = now_millis();
         let compacted_operations = self.oplog.gc_compact_with_options(dry_run)?;
         let cfg = self.oplog.load_config()?;
         let current = self.oplog.load_current_reconciled()?;
+        let current_head_branch = self
+            .git
+            .current_branch_name()
+            .unwrap_or_else(|_| cfg.trunk_branch.clone());
+        let local_git_branches: BTreeSet<String> =
+            self.git.list_local_branches().into_iter().collect();
 
+        // Reconcile `view.branches` against actual Git refs so branches deleted via raw
+        // `git branch -d` are not mistakenly treated as live branches.
+        let mut stale_view_branches: Vec<String> = Vec::new();
         let mut known_safe_branches: BTreeSet<String> = BTreeSet::new();
+        let mut safe_name_to_branch: BTreeMap<String, String> = BTreeMap::new();
+
         known_safe_branches.insert(Self::sanitize_branch_name(&cfg.trunk_branch));
+        known_safe_branches.insert(Self::sanitize_branch_name(&current_head_branch));
 
-        if let Ok(head_br) = self.git.current_branch_name() {
-            known_safe_branches.insert(Self::sanitize_branch_name(&head_br));
-        }
-
-        for br in self.git.list_local_branches() {
-            known_safe_branches.insert(Self::sanitize_branch_name(&br));
+        for br in &local_git_branches {
+            let safe = Self::sanitize_branch_name(br);
+            known_safe_branches.insert(safe.clone());
+            safe_name_to_branch.insert(safe, br.clone());
         }
 
         for br in current.view.branches.keys() {
-            known_safe_branches.insert(Self::sanitize_branch_name(br));
+            let has_dirty_session =
+                current.view.agents.values().any(|a| {
+                    a.target_branch.as_deref() == Some(br.as_str()) && a.has_own_changes()
+                });
+
+            if br == &cfg.trunk_branch
+                || br == &current_head_branch
+                || local_git_branches.contains(br)
+                || has_dirty_session
+            {
+                let safe = Self::sanitize_branch_name(br);
+                known_safe_branches.insert(safe.clone());
+                safe_name_to_branch
+                    .entry(safe)
+                    .or_insert_with(|| br.clone());
+            } else {
+                stale_view_branches.push(br.clone());
+            }
+        }
+
+        stale_view_branches.sort();
+
+        if !dry_run && !stale_view_branches.is_empty() {
+            let stale_clone = stale_view_branches.clone();
+            let _ = self.oplog.record_tx(
+                "gc",
+                format!("gc prune {} stale branch ref(s)", stale_clone.len()),
+                true,
+                |view| {
+                    for br in &stale_clone {
+                        view.branches.remove(br);
+                    }
+
+                    Ok(())
+                },
+            );
         }
 
         let mut active_workspace_paths: Vec<PathBuf> = Vec::new();
 
         for agent in current.view.agents.values() {
             if let Some(tb) = &agent.target_branch {
-                known_safe_branches.insert(Self::sanitize_branch_name(tb));
+                if local_git_branches.contains(tb)
+                    || tb == &cfg.trunk_branch
+                    || tb == &current_head_branch
+                    || agent.has_own_changes()
+                {
+                    known_safe_branches.insert(Self::sanitize_branch_name(tb));
+                }
             }
 
             if let Some(ws) = &agent.workspace_path {
@@ -2514,9 +2846,10 @@ impl Coordinator {
             }
         }
 
+        let sandboxes_root = self.sandboxes_root();
         let mut live_lease_workspaces: Vec<PathBuf> = Vec::new();
         let mut pruned_dead_leases: Vec<String> = Vec::new();
-        let leases_dir = self.sandboxes_root().join("bin").join(".leases");
+        let leases_dir = sandboxes_root.join("bin").join(".leases");
 
         if let Ok(entries) = fs::read_dir(&leases_dir) {
             for entry in entries.flatten() {
@@ -2559,9 +2892,27 @@ impl Coordinator {
         }
 
         let mut pruned_sandboxes: Vec<String> = Vec::new();
+        let mut pruned_merged_sandboxes: Vec<String> = Vec::new();
+        let mut pruned_stale_sandboxes: Vec<String> = Vec::new();
+        let mut pruned_verify_sandboxes: Vec<String> = Vec::new();
+        let mut pruned_agent_workspaces: Vec<String> = Vec::new();
+        let mut pruned_tmp_dirs: Vec<String> = Vec::new();
         let mut pruned_sidecars: Vec<String> = Vec::new();
+        let mut pruned_caches: Vec<String> = Vec::new();
+        let mut pruned_global_repos: Vec<String> = Vec::new();
         let mut skipped_active_sandboxes: Vec<String> = Vec::new();
+        let mut reclaimed_bytes: u64 = 0;
+
+        let trunk_cid = self
+            .git
+            .resolve_ref(&format!("refs/heads/{}", cfg.trunk_branch))
+            .ok()
+            .flatten();
         let branches_root = self.branches_root();
+        let locks_dir = self.git.common_git_dir().join("tessera").join("locks");
+        let mut surviving_branch_dirs: Vec<(String, PathBuf)> = Vec::new();
+        let mut removed_branch_stems: BTreeSet<String> = BTreeSet::new();
+        let mut skipped_set: BTreeSet<String> = BTreeSet::new();
 
         if let Ok(entries) = fs::read_dir(&branches_root) {
             let mut dir_entries: Vec<(String, PathBuf)> = Vec::new();
@@ -2584,35 +2935,127 @@ impl Coordinator {
                 }
             }
 
-            let mut skipped_set: BTreeSet<String> = BTreeSet::new();
-            let locks_dir = self.git.common_git_dir().join("tessera").join("locks");
+            let trunk_safe = Self::sanitize_branch_name(&cfg.trunk_branch);
+            let head_safe = Self::sanitize_branch_name(&current_head_branch);
 
             for (name, path) in dir_entries {
-                if known_safe_branches.contains(&name) {
-                    continue;
-                }
+                if !known_safe_branches.contains(&name) {
+                    let has_live_process = live_lease_workspaces
+                        .iter()
+                        .chain(active_workspace_paths.iter())
+                        .any(|ws| same_canonical_path(&path, ws));
 
-                let has_live_process = live_lease_workspaces
-                    .iter()
-                    .chain(active_workspace_paths.iter())
-                    .any(|ws| same_canonical_path(&path, ws));
+                    if has_live_process {
+                        skipped_set.insert(name.clone());
+                        skipped_active_sandboxes.push(name);
+                        continue;
+                    }
 
-                if has_live_process {
-                    skipped_set.insert(name.clone());
-                    skipped_active_sandboxes.push(name);
-                    continue;
-                }
+                    let bytes = measure_dir_usage(&path).unique_bytes;
+                    let removed = if dry_run {
+                        true
+                    } else {
+                        let lock_path = locks_dir.join(format!("sandbox-{name}.lock"));
+                        let _sandbox_lock = acquire_file_lock(&lock_path).ok();
+                        fs::remove_dir_all(&path).is_ok()
+                    };
 
-                if dry_run {
-                    pruned_sandboxes.push(name);
-                } else {
-                    let lock_path = locks_dir.join(format!("sandbox-{name}.lock"));
-                    let _sandbox_lock = acquire_file_lock(&lock_path).ok();
-
-                    if fs::remove_dir_all(&path).is_ok() {
+                    if removed {
+                        reclaimed_bytes = reclaimed_bytes.saturating_add(bytes);
+                        removed_branch_stems.insert(name.clone());
+                        self.prune_branch_sidecars_for_stem(
+                            &branches_root,
+                            &name,
+                            dry_run,
+                            &mut pruned_sidecars,
+                        );
                         pruned_sandboxes.push(name);
                     }
+
+                    continue;
                 }
+
+                if name == trunk_safe || name == head_safe {
+                    surviving_branch_dirs.push((name, path));
+                    continue;
+                }
+
+                let raw_branch = safe_name_to_branch
+                    .get(&name)
+                    .cloned()
+                    .unwrap_or_else(|| name.clone());
+
+                let is_merged = if !opts.keep_merged {
+                    if let (Some(t_cid), Ok(Some(b_cid))) = (
+                        trunk_cid.as_ref(),
+                        self.git.resolve_ref(&format!("refs/heads/{raw_branch}")),
+                    ) {
+                        self.git.is_ancestor(&b_cid, t_cid)
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+
+                let is_stale = if let Some(days) = opts.stale_days {
+                    let cutoff_ms = days.saturating_mul(24 * 60 * 60 * 1000);
+                    let stamp_mtime =
+                        path_mtime_ms(&branches_root.join(format!("{name}.tree"))).unwrap_or(0);
+                    let dir_mtime = path_mtime_ms(&path).unwrap_or(0);
+                    let latest = stamp_mtime.max(dir_mtime);
+
+                    latest > 0 && now.saturating_sub(latest) >= cutoff_ms
+                } else {
+                    false
+                };
+
+                if is_merged || is_stale {
+                    let clean = self.is_sandbox_clean(
+                        &raw_branch,
+                        &path,
+                        &current.view,
+                        &current_head_branch,
+                        &live_lease_workspaces,
+                    );
+
+                    if !clean {
+                        skipped_set.insert(name.clone());
+                        skipped_active_sandboxes.push(name.clone());
+                        surviving_branch_dirs.push((name, path));
+                        continue;
+                    }
+
+                    let bytes = measure_dir_usage(&path).unique_bytes;
+                    let removed = if dry_run {
+                        true
+                    } else {
+                        let lock_path = locks_dir.join(format!("sandbox-{name}.lock"));
+                        let _sandbox_lock = acquire_file_lock(&lock_path).ok();
+                        fs::remove_dir_all(&path).is_ok()
+                    };
+
+                    if removed {
+                        reclaimed_bytes = reclaimed_bytes.saturating_add(bytes);
+                        removed_branch_stems.insert(name.clone());
+                        self.prune_branch_sidecars_for_stem(
+                            &branches_root,
+                            &name,
+                            dry_run,
+                            &mut pruned_sidecars,
+                        );
+
+                        if is_merged {
+                            pruned_merged_sandboxes.push(name);
+                        } else {
+                            pruned_stale_sandboxes.push(name);
+                        }
+
+                        continue;
+                    }
+                }
+
+                surviving_branch_dirs.push((name, path));
             }
 
             let slots_lock_path = self.git.common_git_dir().join("tessera").join("slots.lock");
@@ -2628,7 +3071,10 @@ impl Coordinator {
                     continue;
                 };
 
-                if known_safe_branches.contains(stem) || skipped_set.contains(stem) {
+                if known_safe_branches.contains(stem)
+                    || skipped_set.contains(stem)
+                    || removed_branch_stems.contains(stem)
+                {
                     continue;
                 }
 
@@ -2646,18 +3092,379 @@ impl Coordinator {
             }
         }
 
+        // Prune crashed `verify-sandbox-<pid>-<ms>-<seq>` directories under `sandboxes_root`.
+        if let Ok(entries) = fs::read_dir(&sandboxes_root) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+
+                if !path.is_dir() {
+                    continue;
+                }
+
+                let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+
+                if !name.starts_with("verify-sandbox-") {
+                    continue;
+                }
+
+                let alive =
+                    parse_verify_sandbox_pid(name).is_some_and(crate::session::is_process_alive);
+
+                if alive {
+                    continue;
+                }
+
+                let bytes = measure_dir_usage(&path).unique_bytes;
+
+                if dry_run || fs::remove_dir_all(&path).is_ok() {
+                    reclaimed_bytes = reclaimed_bytes.saturating_add(bytes);
+                    pruned_verify_sandboxes.push(name.to_string());
+                }
+            }
+        }
+
+        // Prune orphaned in-repo agent workspaces at `<repo_root>/.tessera/workspaces/<agent_id>`.
+        let in_repo_workspaces = self.git.repo_root().join(".tessera").join("workspaces");
+
+        if let Ok(entries) = fs::read_dir(&in_repo_workspaces) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+
+                if !path.is_dir() {
+                    continue;
+                }
+
+                let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+
+                let is_active_agent = current.view.agents.contains_key(name);
+                let has_live_lease = live_lease_workspaces
+                    .iter()
+                    .any(|ws| same_canonical_path(&path, ws));
+
+                if is_active_agent || has_live_lease {
+                    continue;
+                }
+
+                let bytes = measure_dir_usage(&path).unique_bytes;
+
+                if dry_run || fs::remove_dir_all(&path).is_ok() {
+                    reclaimed_bytes = reclaimed_bytes.saturating_add(bytes);
+                    pruned_agent_workspaces.push(name.to_string());
+                }
+            }
+        }
+
+        // Prune stale `.tessera/tmp/<agent_id>` directories in `repo_root` and surviving sandboxes.
+        let mut tmp_roots: Vec<(String, PathBuf)> = vec![(
+            "repo".to_string(),
+            self.git.repo_root().join(".tessera").join("tmp"),
+        )];
+
+        for (bname, bpath) in &surviving_branch_dirs {
+            tmp_roots.push((bname.clone(), bpath.join(".tessera").join("tmp")));
+        }
+
+        for (scope_label, tmp_root) in tmp_roots {
+            let Ok(entries) = fs::read_dir(&tmp_root) else {
+                continue;
+            };
+
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Some(agent_name) = path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+
+                if current.view.agents.contains_key(agent_name) {
+                    continue;
+                }
+
+                let bytes = measure_dir_usage(&path).unique_bytes;
+                let removed = if dry_run {
+                    true
+                } else if path.is_dir() {
+                    fs::remove_dir_all(&path).is_ok()
+                } else {
+                    fs::remove_file(&path).is_ok()
+                };
+
+                if removed {
+                    reclaimed_bytes = reclaimed_bytes.saturating_add(bytes);
+                    pruned_tmp_dirs.push(format!("{scope_label}/{agent_name}"));
+                }
+            }
+        }
+
+        // Optionally strip `cow_cache_dirs` inside idle surviving sandboxes.
+        if opts.prune_caches {
+            let cache_names: BTreeSet<String> = cfg
+                .cow_cache_dirs
+                .iter()
+                .map(|s| s.trim_matches('/').to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+
+            for (name, path) in &surviving_branch_dirs {
+                let has_live_process = live_lease_workspaces
+                    .iter()
+                    .chain(active_workspace_paths.iter())
+                    .any(|ws| same_canonical_path(path, ws));
+
+                if has_live_process {
+                    continue;
+                }
+
+                let mut matched = Vec::new();
+                collect_cache_dirs_bounded(path, path, 0, 3, &cache_names, &mut matched);
+
+                for (rel_cache, cache_path) in matched {
+                    let bytes = measure_dir_usage(&cache_path).unique_bytes;
+
+                    if dry_run || fs::remove_dir_all(&cache_path).is_ok() {
+                        reclaimed_bytes = reclaimed_bytes.saturating_add(bytes);
+                        pruned_caches.push(format!("{name}/{rel_cache}"));
+                    }
+                }
+            }
+        }
+
+        // Prune stale `stat_cache/*` files older than 24 hours for inactive sessions.
+        let mut pruned_stat_caches: usize = 0;
+        let mut stat_cache_dirs: Vec<PathBuf> =
+            vec![self.git.git_dir().join("tessera").join("stat_cache")];
+        let common_stat_cache = self.git.common_git_dir().join("tessera").join("stat_cache");
+
+        if common_stat_cache != stat_cache_dirs[0] {
+            stat_cache_dirs.push(common_stat_cache);
+        }
+
+        for stat_cache_dir in stat_cache_dirs {
+            let Ok(entries) = fs::read_dir(&stat_cache_dir) else {
+                continue;
+            };
+
+            for entry in entries.flatten() {
+                let path = entry.path();
+
+                if !path.is_file() {
+                    continue;
+                }
+
+                let Some(fname) = path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                let stem = fname.strip_suffix(".json").unwrap_or(fname);
+                let is_active_session_cache = current
+                    .view
+                    .agents
+                    .keys()
+                    .any(|aid| stem == aid || stem.starts_with(&format!("{aid}-")));
+
+                if is_active_session_cache {
+                    continue;
+                }
+
+                let is_expired = path_mtime_ms(&path)
+                    .is_some_and(|mtime| now.saturating_sub(mtime) >= STAT_CACHE_TTL_MS);
+
+                if !is_expired {
+                    continue;
+                }
+
+                let sz = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+
+                if dry_run || fs::remove_file(&path).is_ok() {
+                    reclaimed_bytes = reclaimed_bytes.saturating_add(sz);
+                    pruned_stat_caches += 1;
+                }
+            }
+        }
+
+        // Prune stale `.git/tessera/locks/sandbox-*.lock` files for removed/orphaned branches.
+        let mut pruned_locks: usize = 0;
+
+        if let Ok(entries) = fs::read_dir(&locks_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+
+                if !path.is_file() {
+                    continue;
+                }
+
+                let Some(fname) = path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                let Some(stem) = fname
+                    .strip_prefix("sandbox-")
+                    .and_then(|s| s.strip_suffix(".lock"))
+                else {
+                    continue;
+                };
+
+                if (known_safe_branches.contains(stem) && !removed_branch_stems.contains(stem))
+                    || skipped_set.contains(stem)
+                {
+                    continue;
+                }
+
+                if dry_run || fs::remove_file(&path).is_ok() {
+                    pruned_locks += 1;
+                }
+            }
+        }
+
+        // Prune expired `.git/tessera/session-slots/*.slot` files.
+        let mut pruned_session_slots: usize = 0;
+        let session_slots_dir = self
+            .git
+            .common_git_dir()
+            .join("tessera")
+            .join("session-slots");
+        let session_slots_lock = self
+            .git
+            .common_git_dir()
+            .join("tessera")
+            .join("session-slots.lock");
+
+        if session_slots_dir.is_dir() {
+            let _lock = if dry_run {
+                None
+            } else {
+                acquire_file_lock(&session_slots_lock).ok()
+            };
+
+            if let Ok(entries) = fs::read_dir(&session_slots_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+
+                    if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some("slot")
+                    {
+                        continue;
+                    }
+
+                    let updated_ms = fs::read_to_string(&path)
+                        .ok()
+                        .and_then(|raw| raw.lines().nth(1)?.trim().parse::<u64>().ok())
+                        .or_else(|| path_mtime_ms(&path))
+                        .unwrap_or(0);
+
+                    if updated_ms > 0 && now.saturating_sub(updated_ms) > SESSION_SLOT_TTL_MS {
+                        if dry_run || fs::remove_file(&path).is_ok() {
+                            pruned_session_slots += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Global orphaned repository slug sweep (`--all`).
+        if opts.all_repos {
+            let mut global_bases: Vec<PathBuf> = Vec::new();
+            let isolated_root = core::sandbox_paths::configured_workspaces_root().is_some()
+                || core::sandbox_paths::is_path_inside_temp_dir(self.git.repo_root());
+
+            if let Some(parent) = sandboxes_root.parent() {
+                global_bases.push(parent.to_path_buf());
+            }
+
+            if !isolated_root {
+                if let Some(primary) = core::primary_global_workspaces_base() {
+                    if !global_bases
+                        .iter()
+                        .any(|b| same_canonical_path(b, &primary))
+                    {
+                        global_bases.push(primary);
+                    }
+                }
+            }
+
+            for base in global_bases {
+                let Ok(entries) = fs::read_dir(&base) else {
+                    continue;
+                };
+
+                for entry in entries.flatten() {
+                    let path = entry.path();
+
+                    if !path.is_dir() || same_canonical_path(&path, &sandboxes_root) {
+                        continue;
+                    }
+
+                    let Some(slug_name) = path.file_name().and_then(|n| n.to_str()) else {
+                        continue;
+                    };
+
+                    if !has_tessera_slug_suffix(slug_name) || slug_has_live_lease(&path) {
+                        continue;
+                    }
+
+                    let should_prune = match discover_slug_repo_root(&path) {
+                        Some(owner_repo) => !owner_repo.join(".git").exists(),
+                        None => {
+                            let has_any_branch = fs::read_dir(path.join("branches"))
+                                .ok()
+                                .is_some_and(|mut it| it.next().is_some());
+                            let is_tessera_layout = path.join("branches").is_dir()
+                                || path.join("bin").join(".tes-shim-dir").is_file();
+                            let old_enough = path_mtime_ms(&path).is_some_and(|m| {
+                                now.saturating_sub(m) >= UNMARKED_GLOBAL_SLUG_TTL_MS
+                            });
+
+                            is_tessera_layout && !has_any_branch && old_enough
+                        }
+                    };
+
+                    if !should_prune {
+                        continue;
+                    }
+
+                    let bytes = measure_dir_usage(&path).unique_bytes;
+
+                    if dry_run || fs::remove_dir_all(&path).is_ok() {
+                        reclaimed_bytes = reclaimed_bytes.saturating_add(bytes);
+                        pruned_global_repos.push(slug_name.to_string());
+                    }
+                }
+            }
+        }
+
         pruned_sandboxes.sort();
+        pruned_merged_sandboxes.sort();
+        pruned_stale_sandboxes.sort();
+        pruned_verify_sandboxes.sort();
+        pruned_agent_workspaces.sort();
+        pruned_tmp_dirs.sort();
         pruned_sidecars.sort();
+        pruned_sidecars.dedup();
         pruned_dead_leases.sort();
+        pruned_caches.sort();
+        pruned_global_repos.sort();
         skipped_active_sandboxes.sort();
+        skipped_active_sandboxes.dedup();
 
         Ok(GcReport {
             dry_run,
             compacted_operations,
             pruned_sandboxes,
+            pruned_merged_sandboxes,
+            pruned_stale_sandboxes,
+            pruned_verify_sandboxes,
+            pruned_agent_workspaces,
+            pruned_tmp_dirs,
             pruned_sidecars,
             pruned_dead_leases,
+            pruned_stat_caches,
+            pruned_locks,
+            pruned_session_slots,
+            pruned_stale_view_branches: stale_view_branches,
+            pruned_caches,
+            pruned_global_repos,
             skipped_active_sandboxes,
+            reclaimed_bytes,
         })
     }
 }
