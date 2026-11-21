@@ -479,7 +479,7 @@ jobs:
         uses: orhun/git-cliff-action@v4
         with:
           config: extensions/vscode/cliff.toml
-          args: --verbose --include-path "extensions/vscode/**" --tag "${{ steps.meta.outputs.tag }}" --output /tmp/ci-vscode-changelog.md
+          args: --verbose --include-path "extensions/vscode/**" --include-path "CHANGELOG.md" --tag "${{ steps.meta.outputs.tag }}" --output /tmp/ci-vscode-changelog.md
 
       - name: Inspect generated changelogs
         if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.vscode == 'true'
@@ -490,7 +490,8 @@ jobs:
           echo "=== GENERATED EXTENSION CHANGELOG ==="
           cat /tmp/ci-vscode-changelog.md
           grep -q "^## \[$VER_ESCAPED\]" /tmp/ci-root-changelog.md || grep -q "^## \[" /tmp/ci-root-changelog.md
-          grep -q "^## \[" /tmp/ci-vscode-changelog.md
+          grep -q "^## \[0\.0\.1\]" /tmp/ci-vscode-changelog.md
+          grep -q "^## \[0\.0\.2\]" /tmp/ci-vscode-changelog.md
           if grep -Eq "^- \*\((cli|core|merge|workspace|agent|ci)\)\*" /tmp/ci-vscode-changelog.md; then
             echo "Non-extension scoped commit leaked into extensions/vscode/CHANGELOG.md!" >&2
             exit 1

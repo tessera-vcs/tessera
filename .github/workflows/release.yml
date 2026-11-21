@@ -288,7 +288,7 @@ jobs:
         uses: orhun/git-cliff-action@v4
         with:
           config: extensions/vscode/cliff.toml
-          args: --verbose --include-path "extensions/vscode/**" --tag "${{ needs.prepare.outputs.tag }}" --output extensions/vscode/CHANGELOG.md
+          args: --verbose --include-path "extensions/vscode/**" --include-path "CHANGELOG.md" --tag "${{ needs.prepare.outputs.tag }}" --output extensions/vscode/CHANGELOG.md
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -337,7 +337,7 @@ jobs:
         uses: orhun/git-cliff-action@v4
         with:
           config: extensions/vscode/cliff.toml
-          args: --verbose --include-path "extensions/vscode/**" --tag "${{ needs.prepare.outputs.tag }}" --output extensions/vscode/CHANGELOG.md
+          args: --verbose --include-path "extensions/vscode/**" --include-path "CHANGELOG.md" --tag "${{ needs.prepare.outputs.tag }}" --output extensions/vscode/CHANGELOG.md
 
       - name: Commit and push changelogs
         id: changelog_commit
