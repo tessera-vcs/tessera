@@ -42,7 +42,9 @@ jobs:
               - 'docs/public/install.ps1'
             vscode:
               - 'extensions/vscode/**'
+              - 'cliff.toml'
               - '.github/workflows/ci.yml'
+              - '.github/workflows/release.yml'
             docs:
               - 'docs/**'
               - '.github/workflows/ci.yml'
@@ -133,6 +135,40 @@ jobs:
         env:
           TES_BIN: ${{ github.workspace }}/src/target/debug/tes
         run: ./scripts/ci_multi_shell_e2e.sh
+
+      - name: Execute Unix installer (install.sh) E2E
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARCH="$(uname -m)"
+          case "$ARCH" in
+            x86_64|amd64) RUST_ARCH="x86_64" ;;
+            arm64|aarch64) RUST_ARCH="aarch64" ;;
+            *) echo "Unsupported arch: $ARCH" >&2; exit 1 ;;
+          esac
+          if [ "$(uname -s)" = "Darwin" ]; then
+            TARGET="${RUST_ARCH}-apple-darwin"
+          else
+            TARGET="${RUST_ARCH}-unknown-linux-musl"
+          fi
+
+          TMP_DIR="$(mktemp -d)"
+          trap 'rm -rf "$TMP_DIR"' EXIT
+          mkdir -p "${TMP_DIR}/stage" "${TMP_DIR}/dist" "${TMP_DIR}/home"
+          cp "${GITHUB_WORKSPACE}/src/target/debug/tes" "${TMP_DIR}/stage/tes"
+          chmod +x "${TMP_DIR}/stage/tes"
+          tar -C "${TMP_DIR}/stage" -czf "${TMP_DIR}/dist/tes-${TARGET}.tar.gz" tes
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd "${TMP_DIR}/dist" && sha256sum "tes-${TARGET}.tar.gz" > "tes-${TARGET}.tar.gz.sha256")
+          else
+            (cd "${TMP_DIR}/dist" && shasum -a 256 "tes-${TARGET}.tar.gz" > "tes-${TARGET}.tar.gz.sha256")
+          fi
+
+          # Fresh install and atomic in-place reinstall.
+          HOME="${TMP_DIR}/home" TES_BASE_URL="file://${TMP_DIR}/dist" TES_INSTALL_DIR="${TMP_DIR}/home/.local/bin" sh docs/public/install.sh
+          HOME="${TMP_DIR}/home" TES_BASE_URL="file://${TMP_DIR}/dist" TES_INSTALL_DIR="${TMP_DIR}/home/.local/bin" sh docs/public/install.sh
+          "${TMP_DIR}/home/.local/bin/tes" --version
 
       - name: Run Windows PowerShell E2E lifecycle test
         if: runner.os == 'Windows'
@@ -318,6 +354,57 @@ jobs:
               Remove-Item -Recurse -Force $workDir -ErrorAction SilentlyContinue
           }
 
+      - name: Execute Windows installer (install.ps1) E2E in pwsh and Windows PowerShell 5.1
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tmpDir = Join-Path $env:TEMP ("tes-ps1-e2e-" + [guid]::NewGuid().ToString("N"))
+          $stageDir = Join-Path $tmpDir "stage"
+          $distDir = Join-Path $tmpDir "dist"
+          $installPwsh = Join-Path $tmpDir "install-pwsh"
+          $installPs51 = Join-Path $tmpDir "install-ps51"
+
+          try {
+              New-Item -ItemType Directory -Force -Path $stageDir, $distDir | Out-Null
+              Copy-Item "src\target\debug\tes.exe" (Join-Path $stageDir "tes.exe")
+
+              $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLowerInvariant()
+              $target = if ($arch -eq "arm64") { "aarch64-pc-windows-msvc" } else { "x86_64-pc-windows-msvc" }
+              $zipName = "tes-$target.zip"
+              $zipPath = Join-Path $distDir $zipName
+              Compress-Archive -Path (Join-Path $stageDir "tes.exe") -DestinationPath $zipPath -Force
+              $hash = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+              [System.IO.File]::WriteAllText((Join-Path $distDir "$zipName.sha256"), "$hash  $zipName`n", [System.Text.UTF8Encoding]::new($false))
+
+              $baseUrl = "file:///" + ($distDir -replace '\\', '/')
+              $scriptPath = (Resolve-Path "docs\public\install.ps1").Path
+
+              # Execute in PowerShell 7 (pwsh) for fresh install and overwrite.
+              $env:TES_BASE_URL = $baseUrl
+              $env:TES_INSTALL_DIR = $installPwsh
+              & $scriptPath
+              & $scriptPath
+              & (Join-Path $installPwsh "tes.exe") --version
+              if ($LASTEXITCODE -ne 0) {
+                  throw "pwsh installed tes.exe failed --version"
+              }
+
+              # Execute in Windows PowerShell 5.1 with redirected output to catch stderr NativeCommandError regressions.
+              $env:TES_INSTALL_DIR = $installPs51
+              $ps51Out = & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $scriptPath 2>&1
+              if ($LASTEXITCODE -ne 0) {
+                  throw "Windows PowerShell 5.1 install.ps1 failed (exit $LASTEXITCODE): $($ps51Out -join "`n")"
+              }
+              & (Join-Path $installPs51 "tes.exe") --version
+              if ($LASTEXITCODE -ne 0) {
+                  throw "Windows PowerShell 5.1 installed tes.exe failed --version"
+              }
+              Write-Host "Windows install.ps1 E2E passed in both pwsh and Windows PowerShell 5.1!"
+          } finally {
+              Remove-Item -Recurse -Force $tmpDir -ErrorAction SilentlyContinue
+          }
+
   bsd-matrix:
     name: BSD Cross-Platform Tests (FreeBSD & OpenBSD)
     needs: changes
@@ -369,18 +456,65 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve workspace version
+        id: meta
+        if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.vscode == 'true'
+        run: |
+          VER="$(python3 -c 'import tomllib; print(tomllib.load(open("src/Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+          echo "version=${VER}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${VER}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify root git-cliff changelog generation
+        if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.vscode == 'true'
+        uses: orhun/git-cliff-action@v4
+        with:
+          config: cliff.toml
+          args: --verbose --tag "${{ steps.meta.outputs.tag }}" --output /tmp/ci-root-changelog.md
+
+      - name: Verify VS Code extension git-cliff changelog generation
+        if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.vscode == 'true'
+        uses: orhun/git-cliff-action@v4
+        with:
+          config: extensions/vscode/cliff.toml
+          args: --verbose --include-path "extensions/vscode/**" --tag "${{ steps.meta.outputs.tag }}" --output /tmp/ci-vscode-changelog.md
+
+      - name: Inspect generated changelogs
+        if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.vscode == 'true'
+        run: |
+          set -euo pipefail
+          test -s /tmp/ci-root-changelog.md
+          test -s /tmp/ci-vscode-changelog.md
+          echo "=== GENERATED EXTENSION CHANGELOG ==="
+          cat /tmp/ci-vscode-changelog.md
+          grep -q "^## \[$VER_ESCAPED\]" /tmp/ci-root-changelog.md || grep -q "^## \[" /tmp/ci-root-changelog.md
+          grep -q "^## \[" /tmp/ci-vscode-changelog.md
+          if grep -Eq "^- \*\((cli|core|merge|workspace|agent|ci)\)\*" /tmp/ci-vscode-changelog.md; then
+            echo "Non-extension scoped commit leaked into extensions/vscode/CHANGELOG.md!" >&2
+            exit 1
+          fi
+        env:
+          VER_ESCAPED: ${{ steps.meta.outputs.version }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: "24"
 
-      - name: Build & Typecheck VS Code Extension
+      - name: Build, Typecheck & Verify VSIX Packaging
         if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.vscode == 'true'
         working-directory: extensions/vscode
         run: |
+          set -euo pipefail
           npm ci
           npm run compile
+          VSIX_FILES="$(npx --yes @vscode/vsce@4.1.1 ls --no-dependencies)"
+          echo "$VSIX_FILES" | grep -qx "CHANGELOG.md"
+          ! echo "$VSIX_FILES" | grep -qx "cliff.toml"
+          npx --yes @vscode/vsce@4.1.1 package --no-dependencies -o /tmp/tessera-ci-check.vsix
+          rm -f /tmp/tessera-ci-check.vsix
 
       - name: Build VitePress Documentation
         if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.docs == 'true'
