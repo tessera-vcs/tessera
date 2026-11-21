@@ -478,7 +478,7 @@ export default defineConfig({
     footer: {
       message:
         '<a href="/agents.txt" target="_blank">agents.txt</a> · <a href="/llms.txt" target="_blank">llms.txt</a> · <a href="/llms-full.txt" target="_blank">llms-full.txt</a> · Released under the MIT License.',
-      copyright: 'Copyright © 2026 Donald Pakkies'
+      copyright: 'Copyright © 2026 Lunaris'
     },
 
     search: {
