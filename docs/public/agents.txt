@@ -111,6 +111,7 @@ tes merge <branch1> [<branch2> ...] --into main -m "<commit message>"
 | `tes agent` (`session`) | `tes agent spawn \| list \| focus <id> \| exec <id> -- <cmd> \| close [id \| --all] \| clear [-f]` |
 | `tes config` | `tes config show \| set <k> <v> \| add-cache-dir <d> \| add-package-glob <p> \| add-bin-dir <d> \| set-env <k> <v> \| trust \| untrust` |
 | `tes doctor` | `tes doctor [--json]` (repository health, config trust, CoW, hooks, and session diagnostics) |
+| `tes upgrade` (`update`) | `tes upgrade [--check] [--version <ver>] [--force] [--json]` (self-update `tes` in place with SHA-256 verification; also `tes --upgrade` / `tes --update`) |
 | `tes mcp` | `tes mcp` (starts the Model Context Protocol JSON-RPC 2.0 server over stdio) |
 
 ---
