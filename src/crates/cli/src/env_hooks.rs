@@ -62,6 +62,36 @@ fn elvish_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
+/// Quotes `s` as a Nushell double-quoted string (`"..."`), escaping `\` and `"`.
+fn nu_double_quote(s: &str) -> String {
+    let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
+}
+
+/// Acquires an exclusive advisory OS file lock on `lock_path` (with `EINTR` retry)
+/// for the lifetime of the returned [`fs::File`] handle.
+fn acquire_env_file_lock(lock_path: &Path) -> Option<fs::File> {
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent).ok()?;
+    }
+
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(lock_path)
+        .ok()?;
+
+    loop {
+        match file.lock() {
+            Ok(()) => return Some(file),
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        }
+    }
+}
+
 /// Returns the non-`TES_PORT` managed port environment variable names for unsetting.
 fn non_tes_port_keys() -> Vec<&'static str> {
     workspace::POLYGLOT_PORT_ENV_KEYS
@@ -78,14 +108,15 @@ fn posix_strip_shim_from_path() -> &'static str {
 
 /// Allocates or retrieves a lightweight per-session slot file under
 /// `<common_git_dir>/tessera/session-slots/` without mutating the `OpLog`.
+///
+/// Serialized under `<common_git_dir>/tessera/session-slots.lock` so concurrently opened
+/// terminals never collide on the same passive runtime slot.
 fn allocate_passive_session_slot(coord: &Coordinator, view: &core::View, session_id: &str) -> u16 {
     const SLOT_TTL_MS: u64 = 30 * 60 * 1000;
 
-    let slots_dir = coord
-        .git()
-        .common_git_dir()
-        .join("tessera")
-        .join("session-slots");
+    let tessera_dir = coord.git().common_git_dir().join("tessera");
+    let _slots_lock = acquire_env_file_lock(&tessera_dir.join("session-slots.lock"));
+    let slots_dir = tessera_dir.join("session-slots");
     let safe_id = Coordinator::sanitize_branch_name(session_id);
     let slot_file = slots_dir.join(format!("{safe_id}.slot"));
     let now = now_millis();
@@ -1020,7 +1051,8 @@ fn install_shell_profiles(json_out: bool) -> anyhow::Result<()> {
             let nu_cache = home_path.join(".cache/tessera/init.nu");
             let _ = atomic_write_file_relaxed(&nu_cache, nu_plugin_script().as_bytes());
             let nu_cfg = nu_dir.join("config.nu");
-            let snippet = format!("source {}", nu_cache.display());
+            let nu_cache_str = nu_cache.display().to_string();
+            let snippet = format!("source {}", nu_double_quote(&nu_cache_str));
             append_profile_snippet(&nu_cfg, &snippet, &mut updated);
         }
 
@@ -1121,7 +1153,11 @@ fn install_shell_profiles(json_out: bool) -> anyhow::Result<()> {
 fn append_profile_snippet(rc_path: &Path, snippet: &str, updated: &mut Vec<String>) {
     let existing = fs::read_to_string(rc_path).unwrap_or_default();
 
-    if !existing.contains("tes env") && !existing.contains("tessera/init.nu") {
+    if !existing.contains("tes env")
+        && !existing.contains("tessera/init.nu")
+        && !existing.contains("tessera\\init.nu")
+        && !existing.contains("tessera\\\\init.nu")
+    {
         let mut next = existing;
 
         if !next.is_empty() && !next.ends_with('\n') {

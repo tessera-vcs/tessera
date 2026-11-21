@@ -925,27 +925,30 @@ pub fn merge_ast_union(path: &str, base: &str, left: &str, right: &str) -> Strin
 
     // Strip diff3 conflict markers (even if indented inside a container) while keeping both sides.
     let mut resolved_lines = Vec::new();
+    let mut in_conflict = false;
     let mut in_base_section = false;
 
     for line in outcome.content.lines() {
         let trimmed = line.trim_start();
 
         if trimmed.starts_with("<<<<<<< ") {
+            in_conflict = true;
             in_base_section = false;
             continue;
         }
 
-        if trimmed.starts_with("||||||| ") {
+        if in_conflict && trimmed.starts_with("||||||| ") {
             in_base_section = true;
             continue;
         }
 
-        if trimmed == "=======" {
+        if in_conflict && trimmed == "=======" {
             in_base_section = false;
             continue;
         }
 
-        if trimmed.starts_with(">>>>>>> ") {
+        if in_conflict && trimmed.starts_with(">>>>>>> ") {
+            in_conflict = false;
             in_base_section = false;
             continue;
         }
@@ -1054,6 +1057,24 @@ fn try_merge_container_declaration(
     } else {
         parse_container_members(lang, base_src)?.items
     };
+
+    let collect_other = |items: &[TopItem]| -> Vec<String> {
+        items
+            .iter()
+            .filter_map(|it| match it {
+                TopItem::Other(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+
+    let base_other = collect_other(&base_members);
+    let left_other = collect_other(&left_parsed.items);
+    let right_other = collect_other(&right_parsed.items);
+
+    if (base_other != left_other || base_other != right_other) && left_other != right_other {
+        return None;
+    }
 
     let indent = &left_parsed.indent;
     let is_comma = left_parsed.is_comma_separated;
@@ -1571,6 +1592,140 @@ fn find_first_param_identifier(node: Node<'_>, bytes: &[u8]) -> Option<String> {
     None
 }
 
+/// Returns `true` if `param` contains a top-level default-value assignment `=` outside nested
+/// delimiters (`(...)`, `[...]`, `{...}`, `<...>`) and string literals, ignoring arrow tokens
+/// (`=>`) and comparison operators (`==`, `!=`, `<=`, `>=`).
+fn has_default_value_equals(param: &str) -> bool {
+    let bytes = param.as_bytes();
+    let mut depth = 0usize;
+    let mut angle_depth = 0usize;
+    let mut in_quote: Option<char> = None;
+    let mut escaped = false;
+
+    for (idx, ch) in param.char_indices() {
+        if let Some(q) = in_quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == q {
+                in_quote = None;
+            }
+
+            continue;
+        }
+
+        if matches!(ch, '"' | '\'' | '`') {
+            in_quote = Some(ch);
+            continue;
+        }
+
+        if matches!(ch, '(' | '[' | '{') {
+            depth += 1;
+            continue;
+        }
+
+        if matches!(ch, ')' | ']' | '}') {
+            depth = depth.saturating_sub(1);
+            continue;
+        }
+
+        if depth == 0 {
+            if ch == '<' && !matches!(bytes.get(idx + 1), Some(b'=' | b'<')) {
+                angle_depth += 1;
+                continue;
+            }
+
+            if ch == '>' && angle_depth > 0 {
+                let prev = idx.checked_sub(1).and_then(|p| bytes.get(p)).copied();
+
+                if !matches!(prev, Some(b'=' | b'-')) {
+                    angle_depth -= 1;
+                    continue;
+                }
+            }
+
+            if ch == '=' && angle_depth == 0 {
+                let prev = idx.checked_sub(1).and_then(|p| bytes.get(p)).copied();
+                let next = bytes.get(idx + 1).copied();
+
+                if !matches!(next, Some(b'>' | b'='))
+                    && !matches!(prev, Some(b'=' | b'!' | b'<' | b'>'))
+                {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
+/// Returns `true` if `param` carries a top-level TypeScript optional parameter marker (`?:` or
+/// trailing `?`) outside nested delimiters and string literals.
+fn has_optional_param_marker(param: &str) -> bool {
+    let bytes = param.as_bytes();
+    let mut depth = 0usize;
+    let mut angle_depth = 0usize;
+    let mut in_quote: Option<char> = None;
+    let mut escaped = false;
+
+    for (idx, ch) in param.char_indices() {
+        if let Some(q) = in_quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == q {
+                in_quote = None;
+            }
+
+            continue;
+        }
+
+        if matches!(ch, '"' | '\'' | '`') {
+            in_quote = Some(ch);
+            continue;
+        }
+
+        if matches!(ch, '(' | '[' | '{') {
+            depth += 1;
+            continue;
+        }
+
+        if matches!(ch, ')' | ']' | '}') {
+            depth = depth.saturating_sub(1);
+            continue;
+        }
+
+        if depth == 0 {
+            if ch == '<' && !matches!(bytes.get(idx + 1), Some(b'=' | b'<')) {
+                angle_depth += 1;
+                continue;
+            }
+
+            if ch == '>' && angle_depth > 0 {
+                let prev = idx.checked_sub(1).and_then(|p| bytes.get(p)).copied();
+
+                if !matches!(prev, Some(b'=' | b'-')) {
+                    angle_depth -= 1;
+                    continue;
+                }
+            }
+
+            if ch == '?' && angle_depth == 0 {
+                let next = bytes.get(idx + 1).copied();
+
+                if next == Some(b':') || next.is_none() {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
 /// Classifies a formal parameter into its language-valid positional ordering tier:
 /// `0` = receiver (`self`/`&self`/`&mut self`/`cls`/`this`), `1` = required positional,
 /// `2` = optional/defaulted, `3` = variadic/rest (`*args`, `...rest`, `...T`), `4` = `**kwargs`.
@@ -1608,7 +1763,7 @@ fn param_order_tier(lang: AstLanguage, key: &str, raw: &str, idx: usize) -> u8 {
     if matches!(
         lang,
         AstLanguage::Python | AstLanguage::TypeScript | AstLanguage::Tsx | AstLanguage::JavaScript
-    ) && (trimmed.contains('=') || trimmed.contains("?:"))
+    ) && (has_default_value_equals(trimmed) || has_optional_param_marker(trimmed))
     {
         return 2;
     }
@@ -2240,8 +2395,12 @@ fn collect_items_from_nodes(
 }
 
 /// Ensures no two sibling [`TopItem::Decl`] entries share the exact same key (which would
-/// otherwise overwrite one another in `BTreeMap`), disambiguating TypeScript overload signatures
-/// by normalized signature and repeated `impl` blocks by occurrence ordinal.
+/// otherwise overwrite one another in `BTreeMap`).
+///
+/// TypeScript overload signature keys (`fn_sig::`) always include their normalized signature
+/// discriminator `@@{sig_norm}` so transitioning between 1 and >=2 overloads preserves stable
+/// keys across `base`, `left`, and `right`. Repeated non-overload declarations (such as multiple
+/// `impl` blocks) are disambiguated by occurrence ordinal.
 fn disambiguate_duplicate_decl_keys(items: &mut [TopItem]) {
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
 
@@ -2255,13 +2414,13 @@ fn disambiguate_duplicate_decl_keys(items: &mut [TopItem]) {
 
     for item in items.iter_mut() {
         if let TopItem::Decl { key, text, .. } = item {
-            if counts.get(key.as_str()).copied().unwrap_or(0) <= 1 {
-                continue;
-            }
-
             if key.starts_with("fn_sig::") {
                 let sig_norm: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
                 *key = format!("{key}@@{sig_norm}");
+                continue;
+            }
+
+            if counts.get(key.as_str()).copied().unwrap_or(0) <= 1 {
                 continue;
             }
 
@@ -2530,19 +2689,15 @@ fn merge_imports_3way(
         return merge_go_imports_3way(base_items, left_items, right_items, left_label, right_label);
     }
 
-    let base_map = extract_import_map(base_items);
-    let left_map = extract_import_map(left_items);
-    let right_map = extract_import_map(right_items);
+    let (_, base_map) = extract_import_map(base_items);
+    let (left_keys, left_map) = extract_import_map(left_items);
+    let (right_keys, right_map) = extract_import_map(right_items);
 
     let mut ordered_keys: Vec<String> = Vec::new();
 
-    for item in left_items.iter().chain(right_items.iter()) {
-        if let TopItem::Import(s) = item {
-            let k = extract_import_module_key(s.trim());
-
-            if !ordered_keys.contains(&k) {
-                ordered_keys.push(k);
-            }
+    for k in left_keys.into_iter().chain(right_keys) {
+        if !ordered_keys.contains(&k) {
+            ordered_keys.push(k);
         }
     }
 
@@ -2776,13 +2931,35 @@ fn merge_go_imports_3way(
             (Some(b), Some(l), None) => {
                 if l != b {
                     has_conflicts = true;
-                    merged_specs.push(l.to_string());
+
+                    if base_snippet.is_empty()
+                        && left_snippet.is_empty()
+                        && right_snippet.is_empty()
+                    {
+                        base_snippet = b.to_string();
+                        left_snippet = l.to_string();
+                        right_snippet = "<deleted>".to_string();
+                    }
+
+                    let res = merge_text_3way(b, l, "", left_label, right_label);
+                    merged_specs.push(res.content.trim_end().to_string());
                 }
             }
             (Some(b), None, Some(r)) => {
                 if r != b {
                     has_conflicts = true;
-                    merged_specs.push(r.to_string());
+
+                    if base_snippet.is_empty()
+                        && left_snippet.is_empty()
+                        && right_snippet.is_empty()
+                    {
+                        base_snippet = b.to_string();
+                        left_snippet = "<deleted>".to_string();
+                        right_snippet = r.to_string();
+                    }
+
+                    let res = merge_text_3way(b, "", r, left_label, right_label);
+                    merged_specs.push(res.content.trim_end().to_string());
                 }
             }
             (Some(_), None, None) | (None, None, None) => {}
@@ -2899,28 +3076,63 @@ fn try_merge_import_with_attrs(base: Option<&str>, left: &str, right: &str) -> O
     }
 }
 
-/// Builds a map of import statements keyed by their module skeleton (plus any leading attributes)
-/// so duplicate imports from the same module under the same `#[cfg(...)]` are coalesced.
-fn extract_import_map(items: &[TopItem]) -> BTreeMap<String, String> {
+/// Builds an ordered list of canonical import keys and a map of import statements keyed by their
+/// module skeleton (plus any leading attributes), coalescing combinable imports from the same
+/// module and disambiguating non-combinable duplicate-key imports with ordinal `#N` suffixes so
+/// no distinct import statement is ever silently overwritten.
+fn extract_import_map(items: &[TopItem]) -> (Vec<String>, BTreeMap<String, String>) {
+    let mut ordered_keys: Vec<String> = Vec::new();
     let mut map: BTreeMap<String, String> = BTreeMap::new();
 
     for item in items {
         if let TopItem::Import(s) = item {
             let trimmed = s.trim().to_string();
-            let key = extract_import_module_key(&trimmed);
+            let base_key = extract_import_module_key(&trimmed);
 
-            if let Some(existing) = map.get(&key).cloned() {
-                if let Some(combined) = try_merge_import_with_attrs(None, &existing, &trimmed) {
-                    map.insert(key, combined);
+            if let Some(existing) = map.get(&base_key).cloned() {
+                if existing == trimmed {
                     continue;
                 }
+
+                if let Some(combined) = try_merge_import_with_attrs(None, &existing, &trimmed) {
+                    map.insert(base_key, combined);
+                    continue;
+                }
+
+                let mut suffix = 2usize;
+
+                loop {
+                    let candidate_key = format!("{base_key}#{suffix}");
+
+                    if let Some(existing_dup) = map.get(&candidate_key).cloned() {
+                        if existing_dup == trimmed {
+                            break;
+                        }
+
+                        if let Some(combined) =
+                            try_merge_import_with_attrs(None, &existing_dup, &trimmed)
+                        {
+                            map.insert(candidate_key, combined);
+                            break;
+                        }
+
+                        suffix += 1;
+                    } else {
+                        ordered_keys.push(candidate_key.clone());
+                        map.insert(candidate_key, trimmed);
+                        break;
+                    }
+                }
+
+                continue;
             }
 
-            map.insert(key, trimmed);
+            ordered_keys.push(base_key.clone());
+            map.insert(base_key, trimmed);
         }
     }
 
-    map
+    (ordered_keys, map)
 }
 
 /// Computes the canonical skeleton key for an import statement, preserving any leading `#[cfg(...)]`
@@ -3555,5 +3767,209 @@ export const CONFIG = { host: "localhost", port: 8080, timeout: 5000 };
         assert!(res.right_conflict_snippet.contains("Right Title"));
         assert!(res.content.contains("export function LeftView()"));
         assert!(res.content.contains("export function RightView()"));
+    }
+
+    #[test]
+    fn overlapping_nested_rust_use_statements_are_both_preserved() {
+        let base = "use std::{fs::{File}, io::Read};\nuse std::{fs::{OpenOptions}, path::Path};\n\npub fn alpha() -> i32 {\n    1\n}\n\npub fn beta() -> i32 {\n    2\n}\n";
+        let left = "use std::{fs::{File}, io::Read};\nuse std::{fs::{OpenOptions}, path::Path};\n\npub fn alpha() -> i32 {\n    10\n}\n\npub fn beta() -> i32 {\n    2\n}\n";
+        let right = "use std::{fs::{File}, io::Read};\nuse std::{fs::{OpenOptions}, path::Path};\n\npub fn alpha() -> i32 {\n    1\n}\n\npub fn beta() -> i32 {\n    20\n}\n";
+
+        let res = merge_file_3way("src/io.rs", base, left, right, "a", "b");
+        assert!(
+            !res.has_conflicts,
+            "expected clean merge preserving both nested use statements, got:\n{}",
+            res.content
+        );
+        assert!(
+            res.content.contains("use std::{fs::{File}, io::Read};"),
+            "first nested use statement was dropped:\n{}",
+            res.content
+        );
+        assert!(
+            res.content
+                .contains("use std::{fs::{OpenOptions}, path::Path};"),
+            "second nested use statement was dropped:\n{}",
+            res.content
+        );
+        assert!(res.content.contains("10"));
+        assert!(res.content.contains("20"));
+    }
+
+    #[test]
+    fn container_interior_other_item_conflicts_do_not_silently_duplicate() {
+        let base = "class Config:\n    TIMEOUT = 30\n\n    def get_timeout(self):\n        return self.TIMEOUT\n";
+        let left = "class Config:\n    TIMEOUT = 60\n\n    def get_timeout(self):\n        return self.TIMEOUT\n";
+        let right = "class Config:\n    TIMEOUT = 90\n\n    def get_timeout(self):\n        return self.TIMEOUT\n";
+
+        let res = merge_file_3way("app/config.py", base, left, right, "a", "b");
+        assert!(
+            res.has_conflicts,
+            "divergent Python class attribute edits must conflict, got:\n{}",
+            res.content
+        );
+        assert!(res.content.contains("<<<<<<< a"));
+        assert!(res.content.contains("TIMEOUT = 60"));
+        assert!(res.content.contains("TIMEOUT = 90"));
+        assert!(res.content.contains(">>>>>>> b"));
+
+        let right_deleted = "class Config:\n    def get_timeout(self):\n        return 0\n";
+        let res_del = merge_file_3way("app/config.py", base, left, right_deleted, "a", "b");
+        assert!(
+            res_del.has_conflicts,
+            "delete-vs-modify on Python class attribute must conflict, got:\n{}",
+            res_del.content
+        );
+        assert!(res_del.content.contains("<<<<<<< a"));
+    }
+
+    #[test]
+    fn typescript_arrow_type_parameter_keeps_required_tier_order() {
+        assert!(!has_default_value_equals("onDone: (ok: boolean) => void"));
+        assert!(has_default_value_equals(
+            "onDone: (ok: boolean) => void = () => {}"
+        ));
+        assert!(!has_default_value_equals("fn: <T = string>(x: T) => T"));
+        assert!(has_default_value_equals(
+            "items: Map<string, (a: number) => void> = new Map()"
+        ));
+        assert_eq!(
+            param_order_tier(
+                AstLanguage::TypeScript,
+                "onDone",
+                "onDone: (ok: boolean) => void",
+                1
+            ),
+            1
+        );
+        assert_eq!(
+            param_order_tier(
+                AstLanguage::TypeScript,
+                "onDone",
+                "onDone?: (ok: boolean) => void",
+                1
+            ),
+            2
+        );
+        assert_eq!(
+            param_order_tier(AstLanguage::TypeScript, "cb", "cb: (x?: number) => void", 1),
+            1
+        );
+
+        let base = "export function submit(url: string, retries: number = 3) {\n  return url;\n}\n";
+        let left = "export function submit(url: string, retries: number = 3, timeout: number = 5000) {\n  return url;\n}\n";
+        let right = "export function submit(url: string, onDone: (ok: boolean) => void, retries: number = 3) {\n  return url;\n}\n";
+
+        let res = merge_file_3way("src/submit.ts", base, left, right, "a", "b");
+        assert!(
+            !res.has_conflicts,
+            "expected clean parameter merge with required arrow-type param before defaults, got:\n{}",
+            res.content
+        );
+        assert!(
+            res.content.contains(
+                "export function submit(url: string, onDone: (ok: boolean) => void, retries: number = 3, timeout: number = 5000)"
+            ),
+            "required callback param must precede defaulted params, got:\n{}",
+            res.content
+        );
+    }
+
+    #[test]
+    fn go_import_delete_vs_modify_emits_conflict_markers_and_snippets() {
+        let base = "package main\n\nimport (\n\t\"fmt\"\n\t\"net/http\"\n)\n\nfunc main() {\n\tfmt.Println(\"ok\")\n}\n";
+        let left = "package main\n\nimport (\n\t\"fmt\"\n\tmyhttp \"net/http\"\n)\n\nfunc main() {\n\tfmt.Println(\"ok\")\n}\n";
+        let right =
+            "package main\n\nimport (\n\t\"fmt\"\n)\n\nfunc main() {\n\tfmt.Println(\"ok\")\n}\n";
+
+        let res_lr = merge_file_3way("cmd/main.go", base, left, right, "agent-a", "agent-b");
+        assert!(res_lr.has_conflicts);
+        assert!(res_lr.content.contains("<<<<<<< agent-a"));
+        assert!(res_lr.content.contains("======="));
+        assert!(res_lr.content.contains(">>>>>>> agent-b"));
+        assert_eq!(res_lr.base_conflict_snippet, "\"net/http\"");
+        assert_eq!(res_lr.left_conflict_snippet, "myhttp \"net/http\"");
+        assert_eq!(res_lr.right_conflict_snippet, "<deleted>");
+
+        let res_rl = merge_file_3way("cmd/main.go", base, right, left, "agent-a", "agent-b");
+        assert!(res_rl.has_conflicts);
+        assert!(res_rl.content.contains("<<<<<<< agent-a"));
+        assert!(res_rl.content.contains("======="));
+        assert!(res_rl.content.contains(">>>>>>> agent-b"));
+        assert_eq!(res_rl.base_conflict_snippet, "\"net/http\"");
+        assert_eq!(res_rl.left_conflict_snippet, "<deleted>");
+        assert_eq!(res_rl.right_conflict_snippet, "myhttp \"net/http\"");
+    }
+
+    #[test]
+    fn merge_ast_union_preserves_standalone_equals_lines_outside_conflicts() {
+        let base = "Heading\n=======\n\nconst LIMIT = 10;\n";
+        let left = "Heading\n=======\n\nconst LIMIT = 25;\n";
+        let right = "Heading\n=======\n\nconst LIMIT = 50;\n";
+
+        let unioned = merge_ast_union("README.md", base, left, right);
+        assert!(!unioned.contains("<<<<<<<"));
+        assert!(!unioned.contains(">>>>>>>"));
+        assert!(
+            unioned.contains("Heading\n=======\n"),
+            "standalone ======= underline outside conflicts must be preserved, got:\n{unioned}"
+        );
+        assert!(unioned.contains("const LIMIT = 25;"));
+        assert!(unioned.contains("const LIMIT = 50;"));
+    }
+
+    #[test]
+    fn typescript_overload_transition_between_one_and_multiple_preserves_stable_keys() {
+        let base = "export function parse(x: string): number;\nexport function parse(x: string | number): number | string {\n  return Number(x);\n}\n";
+        let left = "export function parse(x: string): number;\nexport function parse(x: number): string;\nexport function parse(x: string | number): number | string {\n  return typeof x === \"string\" ? Number(x) : String(x);\n}\n";
+        let right = "export function parse(x: string): number;\nexport function parse(x: string | number): number | string {\n  return Number(x);\n}\n\nexport function helper() {\n  return true;\n}\n";
+
+        let res = merge_file_3way("src/parse.ts", base, left, right, "a", "b");
+        assert!(
+            !res.has_conflicts,
+            "1 -> 2 overload transition must merge cleanly, got:\n{}",
+            res.content
+        );
+        assert_eq!(
+            res.content
+                .matches("export function parse(x: string): number;")
+                .count(),
+            1,
+            "surviving overload must not be duplicated:\n{}",
+            res.content
+        );
+        assert!(
+            res.content
+                .contains("export function parse(x: number): string;")
+        );
+        assert!(res.content.contains("export function helper()"));
+
+        let base_two = "export function parse(x: string): number;\nexport function parse(x: number): string;\nexport function parse(x: unknown): unknown {\n  return x;\n}\n";
+        let left_one = "export function parse(x: string): number;\nexport function parse(x: unknown): unknown {\n  return x;\n}\n";
+        let right_three = "export function parse(x: string): number;\nexport function parse(x: number): string;\nexport function parse(x: boolean): number;\nexport function parse(x: unknown): unknown {\n  return x;\n}\n";
+
+        let res_two = merge_file_3way("src/parse.ts", base_two, left_one, right_three, "a", "b");
+        assert!(
+            !res_two.has_conflicts,
+            "2 -> 1 vs 2 -> 3 overload transition must merge cleanly, got:\n{}",
+            res_two.content
+        );
+        assert_eq!(
+            res_two
+                .content
+                .matches("export function parse(x: string): number;")
+                .count(),
+            1
+        );
+        assert!(
+            !res_two
+                .content
+                .contains("export function parse(x: number): string;")
+        );
+        assert!(
+            res_two
+                .content
+                .contains("export function parse(x: boolean): number;")
+        );
     }
 }

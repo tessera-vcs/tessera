@@ -12,7 +12,8 @@ tes merge [branches_or_sessions...] [options]
 
 - `--into <BRANCH>` - Target branch to merge into (defaults to the active session's branch or `main`).
 - `-m, --message <MSG>` - Commit message for the merge commit.
-- `--verify <CMD>` - Verification command to run before finalizing the merge.
+- `--verify[=<CMD>]` - Run speculative verification before finalizing the merge. Uses the configured `verify_command` when passed without a value, or runs a custom command when passed with `=` (e.g., `--verify="npm run build"`; `=` is required when supplying a command).
+- `--verify-cmd <CMD>` - Explicit speculative verification command to run before finalizing the merge (e.g., `--verify-cmd "npm run build"`; conflicts with `--verify`).
 - `--dry-run` - Preview the full semantic merge in memory (reporting files that would change and any conflicts that would occur) without advancing branch refs, modifying working-tree files, or recording an operation log entry.
 - `--keep-open` - Keep agent sessions open after merging.
 - `--co-author [=<NAME <EMAIL>>]` - Append a `Co-authored-by:` trailer to the merge commit (defaults to configured `co_author_trailer` when passed without a value; repeatable).
@@ -43,5 +44,6 @@ tes merge feat/pricing feat/faq --into main -m "feat: add pricing and faq"
 tes merge feat/pricing --into main -m "feat: add pricing" --co-author
 
 # run a verification command before completing the merge
-tes merge feat/pricing --into main --verify "npm run build" -m "feat: add pricing"
+tes merge feat/pricing --into main --verify="npm run build" -m "feat: add pricing"
+tes merge feat/pricing --into main --verify-cmd "npm run build" -m "feat: add pricing"
 ```

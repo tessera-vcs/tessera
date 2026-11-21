@@ -428,7 +428,7 @@ Open a new terminal tab (or reload your shell profile) to activate the prompt in
 | **Elvish** (`--elvish`) | Yes | No | Use `tes exec [-b <branch>] -- <cmd>` |
 
 > [!INFO]
-> Environment variables (`TES_PORT`, `PORT` when `port_isolation = true`, `TES_BRANCH`, `TES_DB_NAME`, and locally configured `DATABASE_URL`) work cross-platform across macOS, Linux, BSD, and Windows. Executable CLI port-wrapper shims (`TES_SHIM_BIN`) are POSIX-only (macOS, Linux, BSD, and WSL).
+> `tes env` exports `TES_BRANCH` and `TES_PORT` across all supported shells (including PowerShell and Elvish), while automatic `PORT` and framework port variable export in shell hooks applies to POSIX (`zsh`, `bash`, `sh`), Fish, `tcsh`, and Nushell. On Windows (or in Elvish), use `tes exec [-b <branch>] -- <cmd>` for isolated `PORT`, framework port variables, `TES_DB_NAME`, and locally configured `DATABASE_URL`. Executable CLI port-wrapper shims (`TES_SHIM_BIN`) are POSIX-only (macOS, Linux, BSD, and WSL).
 
 ### Manual Shell Setup
 
@@ -553,7 +553,7 @@ Remove-Item -Force "$HOME\.local\bin\tes.exe"
 
 ### 3. Clean Up Repository State (Optional)
 
-Inside any repository where you ran `tes init`, Tessera stores its metadata and sandboxes in `.git/tessera` (and Git hooks that automatically no-op when `tes` is not installed). To remove the local Tessera state from a repository, delete `.git/tessera`.
+Inside any repository where you ran `tes init`, Tessera stores repository metadata in `.git/tessera` (plus Git hooks that automatically no-op when `tes` is not installed), while branch Copy-on-Write sandboxes live in the OS cache directory (`~/Library/Caches/tessera/workspaces/` on macOS, `~/.cache/tessera/workspaces/` or `/var/tmp/tessera-workspaces-<uid>/` on Linux, and `%LOCALAPPDATA%\tessera\workspaces\` on Windows). To remove local Tessera state completely, delete `.git/tessera` inside the repository and remove the corresponding workspace cache directory.
 
 ---
 
@@ -1196,10 +1196,11 @@ The Tessera extension (`tessera-vscode.vsix`) works in **VS Code** and all **VS 
 
 ## Status Bar
 
-When you open a repository initialized with `tes init`, two items appear on the left side of the status bar:
+When you open a repository initialized with `tes init`, two persistent items appear on the left side of the status bar (plus a third conflict badge whenever conflicts exist):
 
 1. **Current Branch (`main`)**: Displays the branch currently checked out in your editor working tree. Click it at any time to switch your editor to another branch.
-2. **`Graph` / `N Conflicts`**: Opens the Branch Graph. If any unresolved conflicts exist, this item highlights in red (`N Conflicts`) and opens the Conflict Resolver when clicked.
+2. **`Graph`**: Stays visible whenever Tessera is initialized and opens the 2D Branch Graph.
+3. **`1 Conflict` / `N Conflicts`** *(shown alongside `Graph` when conflicts exist)*: Appears as a separate error-styled status bar item and opens the Conflict Resolver when clicked.
 
 > **Note:** In workspaces that have not been initialized with `tes init`, the Tessera status bar items stay hidden automatically.
 
@@ -1949,14 +1950,14 @@ For AI coding editors that support the Model Context Protocol (MCP), [tes mcp](/
 | `status` | `{ agent_id? }` | Snapshot and return session status, branch state, and claimed symbols |
 | `radar` | `{}` | Return all active agent sessions, target branches, and overlapping edits |
 | `claim` | `{ intent?, branch?, from?, symbols?, agent_id? }` | Claim a task intent, optional target branch and parent base, and file/symbol list |
-| `commit` | `{ message?, branch?, amend?, author?, co_author?, no_co_author?, verify?, agent_id? }` | Commit the session's isolated changes onto its target branch |
-| `diff` | `{ branch?, staged?, rev_range?, paths?, agent_id? }` | Inspect unified diffs for the session, staged edits, branch, or revision range |
-| `log` | `{ branch?, limit? }` | Return commit history for a branch |
+| `commit` | `{ message?, branch?, amend?, dry_run?, author?, co_author?, no_co_author?, verify?, agent_id? }` | Commit the session's isolated changes onto its target branch |
+| `diff` | `{ branch?, staged?, all?, range?, stat?, name_status?, paths?, agent_id? }` | Inspect unified diffs for the session, staged edits, branch, or revision range |
+| `log` | `{ branch?, limit?, agent_id? }` | Return commit history for a branch |
 | `oplog` | `{ limit? }` | Return recent entries from the Operation Log |
-| `push` | `{ remote?, branch?, force?, tags?, dry_run?, agent_id? }` | Push the active (or specified) branch to a Git remote |
+| `push` | `{ remote?, branch?, message?, set_upstream?, force?, force_with_lease?, tags?, delete?, dry_run?, no_auto_commit?, agent_id? }` | Push the active (or specified) branch to a Git remote |
 | `pull` | `{ remote?, branch?, agent_id? }` | Fetch and fast-forward or 3-way AST-merge a remote branch and rebase sessions |
 | `checkpoint` | `{ label, agent_id? }` | Create a named atomic checkpoint in the Operation Log |
-| `restore` | `{ source?, branch?, paths?, agent_id? }` | Restore a branch or file paths to a commit, branch, or checkpoint |
+| `restore` | `{ source?, revision?, branch?, paths?, agent_id? }` | Restore a branch or file paths to a commit, branch, or checkpoint |
 | `branch` | `{ action?: "list"\|"switch"\|"delete"\|"rename", branch?, new_branch?, from?, force?, agent_id? }` | List, switch, delete, or rename branches across Git refs, sandboxes, and sessions |
 | `stash` | `{ action?: "push"\|"pop"\|"apply"\|"list"\|"drop"\|"clear", message?, branch?, paths?, index?, agent_id? }` | Session-isolated AST stash operations |
 | `cherry-pick` | `{ commit, branch?, agent_id? }` | 3-way AST cherry-pick a commit onto a target branch |
@@ -1965,7 +1966,7 @@ For AI coding editors that support the Model Context Protocol (MCP), [tes mcp](/
 | `sync` | `{}` | Non-blocking auto-rebase of active sessions onto the latest trunk commit |
 | `undo` | `{ op?, checkpoint? }` | Atomically roll back to the previous operation, an `OpId` prefix, or a checkpoint |
 | `merge` | `{ agents?, into?, message?, verify?, keep_open?, dry_run?, author?, co_author?, no_co_author? }` | Commit the session or AST-merge multiple branches into a target branch |
-| `agent` | `{ action?: "list"\|"close"\|"clear", agent_id?, force? }` | List, close, or clear active agent sessions |
+| `agent` | `{ action?: "list"\|"close"\|"clear", name?, all?, force?, agent_id? }` | List, close, or clear active agent sessions |
 | `config` | `{ action?: "show" }` | Inspect effective repository configuration |
 | `doctor` | `{}` | Run repository health, config trust, filesystem, and integration diagnostics |
 
@@ -2053,7 +2054,7 @@ tes env [options]
 
 ## Description
 
-The `env` command configures your shell so each terminal tab displays its active Tessera branch (`(tes:<branch>)`) in the prompt, syncs session environment variables (`TES_BRANCH`, `TES_PORT`, `TES_WORKSPACE`, `TES_REPO_ROOT`, plus `PORT` and framework port variables when `port_isolation = true`), and enables dynamic `<TAB>` completion and automatic sandbox command routing where supported by the shell.
+The `env` command configures your shell so each terminal tab displays its active Tessera branch (`(tes:<branch>)`) in the prompt, syncs session environment variables (`TES_BRANCH` and `TES_PORT` across all shells including PowerShell and Elvish, plus `TES_WORKSPACE`, `TES_REPO_ROOT`, and automatic `PORT` / framework port variables when `port_isolation = true` in POSIX, Fish, `tcsh`, and Nushell hooks), and enables dynamic `<TAB>` completion and automatic sandbox command routing where supported by the shell.
 
 ### Per-Shell Capabilities
 
@@ -2068,7 +2069,7 @@ The `env` command configures your shell so each terminal tab displays its active
 | **Nushell** (`--nu`) | Yes | No | No (use `tes exec [-b <branch>] -- <cmd>`) |
 | **Elvish** (`--elvish`) | Yes | No | No (use `tes exec [-b <branch>] -- <cmd>`) |
 
-> **Platform Note:** Environment variable syncing (`TES_BRANCH`, `TES_PORT`, and `PORT` when `port_isolation = true`) works cross-platform across macOS, Linux, BSD, and Windows. Executable CLI port-wrapper shims (`TES_SHIM_BIN`) are POSIX-only (macOS, Linux, BSD, and WSL).
+> **Platform Note:** `tes env` exports `TES_BRANCH` and `TES_PORT` across all supported shells (including PowerShell and Elvish). Automatic `PORT` and framework port variable export in shell hooks applies to POSIX (`zsh`, `bash`, `sh`), Fish, `tcsh`, and Nushell; on Windows (or in Elvish), use `tes exec [-b <branch>] -- <cmd>` for isolated `PORT` and framework port variables. Executable CLI port-wrapper shims (`TES_SHIM_BIN`) are POSIX-only (macOS, Linux, BSD, and WSL).
 
 Even without `tes env` installed in your shell profile, Tessera automatically isolates terminal tabs across macOS, Linux, FreeBSD, OpenBSD, and Windows using terminal session environment variables (`TERM_SESSION_ID`, `ITERM_SESSION_ID`, `TMUX_PANE`, `ZELLIJ_PANE_ID`, `WEZTERM_PANE`, `KITTY_WINDOW_ID`, `GHOSTTY_SURFACE_ID`, `ALACRITTY_WINDOW_ID`, `GNOME_TERMINAL_SCREEN`, `KONSOLE_DBUS_SESSION`, `TILIX_ID`, `WT_SESSION`), POSIX session leader (`getsid(0)`), and Windows console/process tree tracking.
 
@@ -2169,7 +2170,10 @@ Alias: `tes branches`
 
 ## Options
 
-- `-l, --list` - List branches.
+- `-l, --list` - List branches (optionally filtered by a glob pattern).
+- `--show-current` - Print only the current active branch name.
+- `-r, --remotes` - List remote-tracking branches.
+- `-a, --all` - List both local and remote-tracking branches.
 - `-v, --verbose` - Show the tip commit SHA and subject line for each branch in list mode.
 - `-d, --delete` - Safely delete `<branch>` and its Copy-on-Write sandbox (refuses if unmerged or dirty).
 - `-D, --force-delete` - Force-delete `<branch>` and its Copy-on-Write sandbox even if unmerged or dirty.
@@ -2186,6 +2190,13 @@ When run with no arguments (or with `-l` / `-v`), `tes branch` lists all local G
 ```bash
 # list all branches
 tes branch
+
+# print only the current active branch name
+tes branch --show-current
+
+# list remote-tracking branches or both local and remote branches
+tes branch -r
+tes branch -a
 
 # list branches with short commit SHAs and commit subjects
 tes branch -v
@@ -2466,7 +2477,8 @@ tes merge [branches_or_sessions...] [options]
 
 - `--into <BRANCH>` - Target branch to merge into (defaults to the active session's branch or `main`).
 - `-m, --message <MSG>` - Commit message for the merge commit.
-- `--verify <CMD>` - Verification command to run before finalizing the merge.
+- `--verify[=<CMD>]` - Run speculative verification before finalizing the merge. Uses the configured `verify_command` when passed without a value, or runs a custom command when passed with `=` (e.g., `--verify="npm run build"`; `=` is required when supplying a command).
+- `--verify-cmd <CMD>` - Explicit speculative verification command to run before finalizing the merge (e.g., `--verify-cmd "npm run build"`; conflicts with `--verify`).
 - `--dry-run` - Preview the full semantic merge in memory (reporting files that would change and any conflicts that would occur) without advancing branch refs, modifying working-tree files, or recording an operation log entry.
 - `--keep-open` - Keep agent sessions open after merging.
 - `--co-author [=<NAME <EMAIL>>]` - Append a `Co-authored-by:` trailer to the merge commit (defaults to configured `co_author_trailer` when passed without a value; repeatable).
@@ -2497,7 +2509,8 @@ tes merge feat/pricing feat/faq --into main -m "feat: add pricing and faq"
 tes merge feat/pricing --into main -m "feat: add pricing" --co-author
 
 # run a verification command before completing the merge
-tes merge feat/pricing --into main --verify "npm run build" -m "feat: add pricing"
+tes merge feat/pricing --into main --verify="npm run build" -m "feat: add pricing"
+tes merge feat/pricing --into main --verify-cmd "npm run build" -m "feat: add pricing"
 ```
 
 ---
@@ -2549,7 +2562,8 @@ tes commit [-m <MESSAGE>] [options]
 - `-b, --branch <BRANCH>` - Explicit target branch override.
 - `--amend` - Amend the tip commit of the target branch instead of creating a new child commit.
 - `--no-edit` - Reuse the previous commit message when amending without `-m`.
-- `--verify <CMD>` - Run a verification command before committing.
+- `--verify[=<CMD>]` - Run speculative verification before committing. Uses the configured `verify_command` when passed without a value, or runs a custom command when passed with `=` (e.g., `--verify="npm run build"`; `=` is required when supplying a command).
+- `--verify-cmd <CMD>` - Explicit speculative verification command to run before committing (e.g., `--verify-cmd "npm run build"`; conflicts with `--verify`).
 - `--co-author [=<NAME <EMAIL>>]` - Append a `Co-authored-by:` trailer to this commit (defaults to configured `co_author_trailer` when passed without a value; repeatable).
 - `--no-co-author` - Omit `Co-authored-by:` trailers for this commit even if `co_author = true` in repository config.
 - `--author <NAME <EMAIL>>` - Override the commit `Author` identity for this commit.
@@ -2580,6 +2594,10 @@ tes commit -m "feat(pricing): add tier selector" --co-author
 # include a custom Co-authored-by trailer or override the commit author
 tes commit -m "feat(pricing): pair on billing logic" --co-author "Alice <alice@example.com>"
 tes commit -m "fix(auth): token refresh" --author "Jane Doe <jane@example.com>"
+
+# run a verification command before committing
+tes commit -m "feat(pricing): add tier selector" --verify="npm run build"
+tes commit -m "feat(pricing): add tier selector" --verify-cmd "npm run build"
 ```
 
 ---
@@ -2627,22 +2645,38 @@ tes push [remote] [branch] [options]
 
 ## Options
 
+- `-u, --set-upstream` - Set the upstream tracking reference (`git push -u`).
 - `-m, --message <MSG>` - Commit message if uncommitted session changes need to be committed before pushing.
-- `-f, --force` - Push with `--force-with-lease`.
+- `-f, --force` - Force push using raw `git push --force` (unconditionally overwrites the remote branch; conflicts with `--force-with-lease`).
+- `--force-with-lease` - Safely force push with `git push --force-with-lease`, refusing to overwrite remote commits you have not fetched (conflicts with `--force`).
+- `--tags` - Push all tags (`git push --tags`).
+- `-d, --delete` - Delete the specified branch or ref on the remote (`git push --delete`).
+- `-n, --dry-run` - Simulate the push without updating remote refs (`git push --dry-run`).
+- `--no-auto-commit` - Skip auto-committing uncommitted session changes before pushing.
 - `-a, --agent <ID>` - Explicit session ID.
 
 ## Description
 
-`tes push` commits any uncommitted changes in the current session onto the active branch and runs `git push -u <remote> refs/heads/<branch>:refs/heads/<branch>`.
+`tes push` commits any uncommitted changes in the current session onto the active branch (unless `--no-auto-commit` is passed) and runs `git push` for `<remote>` and `refs/heads/<branch>:refs/heads/<branch>`.
 
 ## Examples
 
 ```bash
-# push the active branch to origin
-tes push
+# push the active branch to origin and set upstream tracking
+tes push -u
 
 # push a specific branch to origin
 tes push origin feat/pricing
+
+# safely force-push a rewritten branch
+tes push --force-with-lease origin feat/pricing
+
+# preview a push without mutating remote refs or auto-committing local edits
+tes push --dry-run --no-auto-commit
+
+# push tags or delete a remote branch
+tes push --tags
+tes push -d origin feat/old-experiment
 ```
 
 ---
@@ -3149,7 +3183,7 @@ tes doctor [options]
 1. **Git and `.git/tessera` State**: Verifies the Git repository, `.git/tessera` store initialization, operation log heads, and branch reference consistency.
 2. **Configuration and Trust**: Validates `.git/tessera/config.toml` and any checked-in `tessera.toml`, reporting whether execution-sensitive fields (`verify_command`, `pager`, `extra_bin_dirs`, `custom_env`) are trusted via `tes config trust`.
 3. **Copy-on-Write Filesystem Support**: Checks whether the repository filesystem supports native Copy-on-Write clones (`clonefile` on macOS APFS, `FICLONE` on Linux Btrfs/XFS/bcachefs) or uses the portable fallback.
-4. **Hooks, Harnesses, and Shell Integration**: Checks installed Git sync hooks (`.git/hooks/post-commit`, `post-merge`, `post-checkout`), AI editor rule files, and shell prompt integration (`tes env`).
+4. **Hooks and Harnesses**: Checks installed Git sync hooks (`.git/hooks/post-commit`, `post-merge`, `post-checkout`) and AI editor rule files.
 5. **Sessions, Sandboxes, and Conflicts**: Surfaces active conflicts, stale or orphaned sessions, and sandbox health.
 
 ## Examples
@@ -3234,14 +3268,14 @@ tes mcp
 | `status` | `{ agent_id? }` | Snapshot and return the session's status, Change-ID, commit SHA, intent, and claimed symbols |
 | `radar` | `{}` | Return live multi-agent radar showing active sessions, intents, and overlapping edits |
 | `claim` | `{ intent?, branch?, from?, symbols?, agent_id? }` | Claim a task intent, optional target branch and parent base (`from`), and file/symbol paths |
-| `commit` | `{ message?, branch?, amend?, author?, co_author?, no_co_author?, verify?, agent_id? }` | Commit the session's isolated changes onto its target branch |
-| `diff` | `{ branch?, staged?, rev_range?, paths?, agent_id? }` | Inspect unified diffs for the session, staged edits, branch, or revision range |
-| `log` | `{ branch?, limit? }` | Return commit history for a branch |
+| `commit` | `{ message?, branch?, amend?, dry_run?, author?, co_author?, no_co_author?, verify?, agent_id? }` | Commit the session's isolated changes onto its target branch |
+| `diff` | `{ branch?, staged?, all?, range?, stat?, name_status?, paths?, agent_id? }` | Inspect unified diffs for the session, staged edits, branch, or revision range |
+| `log` | `{ branch?, limit?, agent_id? }` | Return commit history for a branch |
 | `oplog` | `{ limit? }` | Return recent entries from the lock-free Operation Log |
-| `push` | `{ remote?, branch?, force?, tags?, dry_run?, agent_id? }` | Push the session's active (or specified) branch to a Git remote |
+| `push` | `{ remote?, branch?, message?, set_upstream?, force?, force_with_lease?, tags?, delete?, dry_run?, no_auto_commit?, agent_id? }` | Push the session's active (or specified) branch to a Git remote |
 | `pull` | `{ remote?, branch?, agent_id? }` | Fetch and fast-forward or 3-way AST-merge a remote branch and rebase active sessions |
 | `checkpoint` | `{ label, agent_id? }` | Create a named atomic checkpoint in the Operation Log |
-| `restore` | `{ source?, branch?, paths?, agent_id? }` | Restore a branch or specific paths to a commit SHA, `HEAD~N`, branch, or checkpoint |
+| `restore` | `{ source?, revision?, branch?, paths?, agent_id? }` | Restore a branch or specific paths to a commit SHA, `HEAD~N`, branch, or checkpoint |
 | `branch` | `{ action?: "list"\|"switch"\|"delete"\|"rename", branch?, new_branch?, from?, force?, agent_id? }` | List, switch, delete, or rename branches across Git refs, sandboxes, and sessions |
 | `stash` | `{ action?: "push"\|"pop"\|"apply"\|"list"\|"drop"\|"clear", message?, branch?, paths?, index?, agent_id? }` | Save or reapply session-isolated uncommitted changes via 3-way AST merge |
 | `cherry-pick` | `{ commit, branch?, agent_id? }` | Apply the delta of an existing commit onto the target branch via 3-way AST merge |
@@ -3250,7 +3284,7 @@ tes mcp
 | `sync` | `{}` | Non-blocking auto-rebase of all active sessions onto the latest trunk commit |
 | `undo` | `{ op?, checkpoint? }` | Atomically roll back repository state to the previous operation, an `OpId` prefix, or a checkpoint |
 | `merge` | `{ agents?, into?, message?, verify?, keep_open?, dry_run?, author?, co_author?, no_co_author? }` | Semantically merge sessions or branches into a target branch (or preview with `dry_run`) |
-| `agent` | `{ action?: "list"\|"close"\|"clear", agent_id?, force? }` | List, close, or clear active agent sessions |
+| `agent` | `{ action?: "list"\|"close"\|"clear", name?, all?, force?, agent_id? }` | List, close, or clear active agent sessions |
 | `config` | `{ action?: "show" }` | Inspect effective repository configuration |
 | `doctor` | `{}` | Run repository health, config trust, filesystem, and integration diagnostics |
 

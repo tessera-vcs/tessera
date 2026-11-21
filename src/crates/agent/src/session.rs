@@ -2264,9 +2264,15 @@ impl Coordinator {
     /// or the shared repository root), extracts modified AST symbols via Tree-sitter, auto-infers
     /// semantic intent if needed, and updates the agent's Git commit and `ChangeId` ref.
     ///
+    /// Serialized under `<common_git_dir>/tessera/edit.lock` so concurrent `tes status`/`tes diff`
+    /// snapshots cannot regress incremental updates from [`Self::record_single_path_edit`].
+    ///
     /// # Errors
     /// Returns [`CoreError`] if snapshotting or Git commit creation fails.
     pub fn snapshot_agent(&self, agent_id: &str, is_ephemeral: bool) -> CoreResult<AgentMetadata> {
+        let _edit_lock =
+            acquire_file_lock(&self.git.common_git_dir().join("tessera").join("edit.lock"))?;
+
         let meta = self.ensure_session(agent_id, None)?;
         let work_dir = meta
             .workspace_path

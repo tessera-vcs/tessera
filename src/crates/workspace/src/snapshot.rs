@@ -104,12 +104,30 @@ pub(crate) const ALWAYS_IGNORED_DIRS: &[&str] = &[
 /// directories such as `src/target/x86.rs` or `src/dist/mod.rs` rely on `.gitignore`.
 const TOP_LEVEL_IGNORED_DIRS: &[&str] = &["target", "dist", ".cache", "venv"];
 
-/// Returns `true` if a path segment matches `.git`, `.tessera`, or an NTFS short-name or
-/// trailing-dot/space alias targeting repository internals.
-pub(crate) fn is_vcs_internal_segment(seg: &str) -> bool {
-    let trimmed = seg.trim_end_matches(['.', ' ']);
+/// Joins a `/`- or `\`-separated relative path onto `base` by pushing each non-empty segment
+/// individually so Windows `\\?\` verbatim paths never receive embedded forward slashes.
+pub(crate) fn join_rel_segments(base: &Path, rel: &str) -> PathBuf {
+    let mut path = base.to_path_buf();
 
-    if trimmed.eq_ignore_ascii_case(".git") || trimmed.eq_ignore_ascii_case(".tessera") {
+    for seg in rel.split(['/', '\\']) {
+        if !seg.is_empty() {
+            path.push(seg);
+        }
+    }
+
+    path
+}
+
+/// Returns `true` if a path segment contains an NTFS Alternate Data Stream colon (`:`) or matches
+/// `.git`, `.tessera`, or an NTFS short-name or trailing-dot/space alias targeting repository internals.
+pub(crate) fn is_vcs_internal_segment(seg: &str) -> bool {
+    let base = seg.split(':').next().unwrap_or(seg);
+    let trimmed = base.trim_end_matches(['.', ' ']);
+
+    if seg.contains(':')
+        || trimmed.eq_ignore_ascii_case(".git")
+        || trimmed.eq_ignore_ascii_case(".tessera")
+    {
         return true;
     }
 
@@ -443,6 +461,7 @@ pub fn is_ignored_or_secret_path(
 
     let mut matcher = IgnoreMatcher::load(working_dir, git_dir, None);
     let mut prefix = String::new();
+    let mut parent_dir = working_dir.to_path_buf();
 
     if let Some((parent, _)) = trimmed.rsplit_once('/') {
         for segment in parent.split('/') {
@@ -451,7 +470,7 @@ pub fn is_ignored_or_secret_path(
             }
 
             prefix.push_str(segment);
-            let parent_dir = working_dir.join(&prefix);
+            parent_dir.push(segment);
 
             // Never ingest files residing inside a nested Git submodule or sub-repository.
             if fs::symlink_metadata(parent_dir.join(".git")).is_ok() {
@@ -466,7 +485,7 @@ pub fn is_ignored_or_secret_path(
         }
     }
 
-    let is_dir = working_dir.join(trimmed).is_dir();
+    let is_dir = join_rel_segments(working_dir, trimmed).is_dir();
     matcher.is_ignored(trimmed, is_dir)
 }
 
@@ -487,40 +506,72 @@ fn metadata_mtime(meta: &fs::Metadata) -> (u64, u32) {
         .unwrap_or((0, 0))
 }
 
-/// Extracts platform stat attributes `(executable, inode, dev, ctime_secs, ctime_nanos)` for a
-/// discovered file or symlink, preserving tracked executable bits on non-Unix platforms.
-fn extract_stat_attrs(
-    meta: &fs::Metadata,
-    is_symlink: bool,
+/// Resolves `(is_symlink_mode, executable)` for a discovered entry on non-Unix filesystems where
+/// POSIX executable bits and symlinks (`120000`) may be materialized as regular files on disk.
+///
+/// When `disk_is_symlink` is `false` and `disk_is_file` is `true`, preserves a tracked
+/// [`EntryMode::Symlink`] or executable bit recorded in `base_map_opt` so snapshots on Windows
+/// never silently downgrade tracked `120000` symlinks or `100755` scripts to `100644`.
+#[cfg_attr(unix, allow(dead_code))]
+fn resolve_non_unix_entry_kind(
+    disk_is_symlink: bool,
+    disk_is_file: bool,
     rel_str: &str,
     base_map_opt: Option<&BTreeMap<String, FileEntry>>,
-) -> (bool, u64, u64, u64, u32) {
+) -> (bool, bool) {
+    if disk_is_symlink {
+        return (true, false);
+    }
+
+    if !disk_is_file {
+        return (false, false);
+    }
+
+    match base_map_opt.and_then(|bm| bm.get(rel_str)) {
+        Some(entry) if entry.is_symlink() => (true, false),
+        Some(entry) if !entry.is_gitlink() => (false, entry.executable),
+        _ => (false, false),
+    }
+}
+
+/// Extracts platform stat attributes `(is_symlink, executable, inode, dev, ctime_secs, ctime_nanos)`
+/// for a discovered file or symlink, preserving tracked symlink (`120000`) and executable (`100755`)
+/// modes on non-Unix platforms.
+fn extract_stat_attrs(
+    meta: &fs::Metadata,
+    disk_is_symlink: bool,
+    disk_is_file: bool,
+    rel_str: &str,
+    base_map_opt: Option<&BTreeMap<String, FileEntry>>,
+) -> (bool, bool, u64, u64, u64, u32) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-        let _ = (rel_str, base_map_opt);
-        let executable = !is_symlink && (meta.permissions().mode() & 0o111 != 0);
+        let _ = (disk_is_file, rel_str, base_map_opt);
+        let executable = !disk_is_symlink && (meta.permissions().mode() & 0o111 != 0);
         let inode = meta.ino();
         let dev = meta.dev();
         let ctime_secs = u64::try_from(meta.ctime()).unwrap_or(0);
         let ctime_nanos = u32::try_from(meta.ctime_nsec()).unwrap_or(0);
 
-        (executable, inode, dev, ctime_secs, ctime_nanos)
+        (
+            disk_is_symlink,
+            executable,
+            inode,
+            dev,
+            ctime_secs,
+            ctime_nanos,
+        )
     }
 
     #[cfg(not(unix))]
     {
         let _ = meta;
-        let executable = if is_symlink {
-            false
-        } else {
-            base_map_opt
-                .and_then(|bm| bm.get(rel_str))
-                .is_some_and(|e| !e.is_symlink() && !e.is_gitlink() && e.executable)
-        };
+        let (is_symlink, executable) =
+            resolve_non_unix_entry_kind(disk_is_symlink, disk_is_file, rel_str, base_map_opt);
 
-        (executable, 0u64, 0u64, 0u64, 0u32)
+        (is_symlink, executable, 0u64, 0u64, 0u64, 0u32)
     }
 }
 
@@ -537,6 +588,7 @@ struct DiscoveredEntry {
     dev: u64,
     executable: bool,
     is_symlink: bool,
+    disk_is_symlink: bool,
 }
 
 /// Loads the persisted stat cache and computes the conservative racy-Git cutoff timestamp.
@@ -683,9 +735,10 @@ pub fn snapshot_working_dir(
 
     for entry in walker.flatten() {
         let ft = entry.file_type();
-        let is_symlink = ft.is_symlink();
+        let disk_is_symlink = ft.is_symlink();
+        let disk_is_file = ft.is_file();
 
-        if !ft.is_file() && !is_symlink {
+        if !disk_is_file && !disk_is_symlink {
             continue;
         }
 
@@ -702,8 +755,13 @@ pub fn snapshot_working_dir(
             continue;
         };
         let (mtime_secs, mtime_nanos) = metadata_mtime(&meta);
-        let (executable, inode, dev, ctime_secs, ctime_nanos) =
-            extract_stat_attrs(&meta, is_symlink, &rel_str, base_map_opt.as_ref());
+        let (is_symlink, executable, inode, dev, ctime_secs, ctime_nanos) = extract_stat_attrs(
+            &meta,
+            disk_is_symlink,
+            disk_is_file,
+            &rel_str,
+            base_map_opt.as_ref(),
+        );
 
         discovered.push(DiscoveredEntry {
             rel_path: rel_str,
@@ -717,6 +775,7 @@ pub fn snapshot_working_dir(
             dev,
             executable,
             is_symlink,
+            disk_is_symlink,
         });
     }
 
@@ -740,7 +799,7 @@ pub fn snapshot_working_dir(
                 continue;
             }
 
-            let full_path = working_dir.join(tracked_path);
+            let full_path = join_rel_segments(working_dir, tracked_path);
             let Ok(meta) = fs::symlink_metadata(&full_path) else {
                 continue;
             };
@@ -756,15 +815,21 @@ pub fn snapshot_working_dir(
                 continue;
             }
 
-            let is_symlink = meta.file_type().is_symlink();
+            let disk_is_symlink = meta.file_type().is_symlink();
+            let disk_is_file = meta.is_file();
 
-            if !meta.is_file() && !is_symlink {
+            if !disk_is_file && !disk_is_symlink {
                 continue;
             }
 
             let (mtime_secs, mtime_nanos) = metadata_mtime(&meta);
-            let (executable, inode, dev, ctime_secs, ctime_nanos) =
-                extract_stat_attrs(&meta, is_symlink, tracked_path, Some(base_map));
+            let (is_symlink, executable, inode, dev, ctime_secs, ctime_nanos) = extract_stat_attrs(
+                &meta,
+                disk_is_symlink,
+                disk_is_file,
+                tracked_path,
+                Some(base_map),
+            );
 
             discovered.push(DiscoveredEntry {
                 rel_path: tracked_path.clone(),
@@ -778,6 +843,7 @@ pub fn snapshot_working_dir(
                 dev,
                 executable,
                 is_symlink,
+                disk_is_symlink,
             });
         }
     }
@@ -810,7 +876,7 @@ pub fn snapshot_working_dir(
                 }
             }
 
-            let bytes = if entry.is_symlink {
+            let bytes = if entry.disk_is_symlink {
                 read_symlink_target_bytes(&entry.full_path)?
             } else {
                 fs::read(&entry.full_path).map_err(|source| CoreError::Io {
@@ -1164,8 +1230,8 @@ mod tests {
         // timestamp check can force a rehash.
         let new_meta = fs::metadata(&file_path).expect("meta");
         let (mtime_secs, mtime_nanos) = metadata_mtime(&new_meta);
-        let (executable, inode, dev, ctime_secs, ctime_nanos) =
-            extract_stat_attrs(&new_meta, false, "data.txt", None);
+        let (_is_symlink, executable, inode, dev, ctime_secs, ctime_nanos) =
+            extract_stat_attrs(&new_meta, false, true, "data.txt", None);
         envelope.cache_mtime_secs = mtime_secs;
         envelope.cache_mtime_nanos = mtime_nanos;
         envelope.entries.insert(
@@ -1223,5 +1289,59 @@ mod tests {
         assert!(matcher.is_ignored("sub/important.log", false));
         assert!(!matcher.is_ignored("override.bak", false));
         assert!(matcher.is_ignored("other.bak", false));
+    }
+
+    #[test]
+    fn vcs_internal_segment_rejects_ntfs_ads_and_aliases() {
+        assert!(is_vcs_internal_segment(".git"));
+        assert!(is_vcs_internal_segment(".tessera"));
+        assert!(is_vcs_internal_segment(".git::$INDEX_ALLOCATION"));
+        assert!(is_vcs_internal_segment(".git:$I30:$INDEX_ALLOCATION"));
+        assert!(is_vcs_internal_segment(".tessera:stream"));
+        assert!(is_vcs_internal_segment("git~1:stream"));
+        assert!(is_vcs_internal_segment("foo:bar"));
+        assert!(!is_vcs_internal_segment("src"));
+        assert!(!is_vcs_internal_segment(".github"));
+    }
+
+    #[test]
+    fn non_unix_entry_kind_preserves_tracked_symlink_and_executable_modes() {
+        let oid = ObjectId::from_hex("1111111111111111111111111111111111111111").expect("oid");
+        let mut base_map = BTreeMap::new();
+        base_map.insert(
+            "links/latest".to_string(),
+            FileEntry::from_mode(oid, EntryMode::Symlink),
+        );
+        base_map.insert("scripts/run.sh".to_string(), FileEntry::regular(oid, true));
+        base_map.insert("src/lib.rs".to_string(), FileEntry::regular(oid, false));
+        base_map.insert(
+            "vendor/submod".to_string(),
+            FileEntry::from_mode(oid, EntryMode::Gitlink),
+        );
+
+        assert_eq!(
+            resolve_non_unix_entry_kind(false, true, "links/latest", Some(&base_map)),
+            (true, false)
+        );
+        assert_eq!(
+            resolve_non_unix_entry_kind(true, false, "src/lib.rs", Some(&base_map)),
+            (true, false)
+        );
+        assert_eq!(
+            resolve_non_unix_entry_kind(false, true, "scripts/run.sh", Some(&base_map)),
+            (false, true)
+        );
+        assert_eq!(
+            resolve_non_unix_entry_kind(false, true, "src/lib.rs", Some(&base_map)),
+            (false, false)
+        );
+        assert_eq!(
+            resolve_non_unix_entry_kind(false, true, "new.txt", Some(&base_map)),
+            (false, false)
+        );
+        assert_eq!(
+            resolve_non_unix_entry_kind(false, true, "vendor/submod", Some(&base_map)),
+            (false, false)
+        );
     }
 }

@@ -47,7 +47,6 @@ where
 
         if matches!(token, "--json" | "-P" | "--no-pager" | "--paginate")
             || token.starts_with("--repo=")
-            || (token.starts_with("-C") && token.len() > 2)
         {
             i += 1;
             continue;
@@ -56,6 +55,32 @@ where
         if matches!(token, "-C" | "--repo") {
             i += 2;
             continue;
+        }
+
+        if let Some(short_cluster) = token.strip_prefix('-') {
+            if !short_cluster.is_empty() && !short_cluster.starts_with('-') {
+                let bytes = short_cluster.as_bytes();
+                let mut pos = 0usize;
+
+                while pos < bytes.len() && bytes[pos] == b'P' {
+                    pos += 1;
+                }
+
+                if pos == bytes.len() {
+                    i += 1;
+                    continue;
+                }
+
+                if bytes[pos] == b'C' {
+                    if pos + 1 == bytes.len() {
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+
+                    continue;
+                }
+            }
         }
 
         if matches!(token, "--upgrade" | "--update") {
@@ -424,7 +449,7 @@ mod tests {
 
     use crate::args::{AgentCommands, Cli, Commands, StashCommands};
     use crate::commands::branch::glob_matches;
-    use crate::commands::ops::extract_hook_file_paths;
+    use crate::commands::ops::{extract_hook_file_paths, snippet_preview};
     use crate::normalize_cli_args;
     use crate::output::{resolve_pager_command, resolve_user_pathspecs};
 
@@ -481,6 +506,47 @@ mod tests {
         // Post-subcommand `--update` flags must not be rewritten into `upgrade`.
         let passthrough = normalize_cli_args(to_os(&["tes", "add", "--update"]));
         assert_eq!(passthrough, to_os(&["tes", "add", "--update"]));
+
+        // Combined global short flags (`-PC /tmp`, `-PC/tmp`, `-C/tmp`) before `--upgrade`/`--update`.
+        let combined_sep = Cli::try_parse_from(normalize_cli_args(to_os(&[
+            "tes",
+            "-PC",
+            "/tmp",
+            "--upgrade",
+            "--check",
+        ])))
+        .unwrap();
+        assert!(combined_sep.no_pager);
+        assert_eq!(
+            combined_sep.repo.as_deref(),
+            Some(std::path::Path::new("/tmp"))
+        );
+        assert!(matches!(
+            combined_sep.command,
+            Commands::Upgrade {
+                check: true,
+                version: None,
+                force: false
+            }
+        ));
+
+        let combined_inline = Cli::try_parse_from(normalize_cli_args(to_os(&[
+            "tes", "-PC/tmp", "--update", "--check",
+        ])))
+        .unwrap();
+        assert!(combined_inline.no_pager);
+        assert_eq!(
+            combined_inline.repo.as_deref(),
+            Some(std::path::Path::new("/tmp"))
+        );
+        assert!(matches!(
+            combined_inline.command,
+            Commands::Upgrade {
+                check: true,
+                version: None,
+                force: false
+            }
+        ));
     }
 
     #[test]
@@ -607,6 +673,19 @@ mod tests {
         match merge_verify_branch.command {
             Commands::Merge { agents, verify, .. } => {
                 assert_eq!(verify.as_deref(), Some(""));
+                assert_eq!(agents, vec!["feat/a".to_string()]);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let merge_co_author_branch =
+            Cli::try_parse_from(["tes", "merge", "--co-author", "feat/a"]).unwrap();
+
+        match merge_co_author_branch.command {
+            Commands::Merge {
+                agents, co_author, ..
+            } => {
+                assert_eq!(co_author, vec![String::new()]);
                 assert_eq!(agents, vec!["feat/a".to_string()]);
             }
             other => panic!("unexpected command: {other:?}"),
@@ -788,5 +867,23 @@ mod tests {
                 ":(exclude)target".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn snippet_preview_truncates_multibyte_utf8_safely() {
+        let emoji_line = "🦀".repeat(150);
+        let preview = snippet_preview(&emoji_line, 3);
+        assert_eq!(preview.len(), 1);
+        assert!(preview[0].ends_with("..."));
+        assert_eq!(preview[0].chars().count(), 120);
+
+        let accented_line = "é".repeat(125);
+        let accented_preview = snippet_preview(&accented_line, 3);
+        assert_eq!(accented_preview.len(), 1);
+        assert!(accented_preview[0].ends_with("..."));
+        assert_eq!(accented_preview[0].chars().count(), 120);
+
+        let short_emoji = "🦀".repeat(50);
+        assert_eq!(snippet_preview(&short_emoji, 3), vec![short_emoji]);
     }
 }

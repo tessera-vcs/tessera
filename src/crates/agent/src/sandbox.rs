@@ -1168,6 +1168,14 @@ impl Coordinator {
         let effective_tree_id = self.git.write_tree_from_map(&tree_map)?;
         let stamp_payload = format!("{branch_cid}:{effective_tree_id}");
 
+        let sandbox_lock_path = self
+            .git
+            .common_git_dir()
+            .join("tessera")
+            .join("locks")
+            .join(format!("sandbox-{safe_branch}.lock"));
+        let _sandbox_lock = acquire_file_lock(&sandbox_lock_path)?;
+
         if !branch_ws_dir.exists() {
             create_cow_workspace(
                 self.git.repo_root(),
@@ -1201,6 +1209,8 @@ impl Coordinator {
                 self.git.repo_root().display().to_string().as_bytes(),
             );
         }
+
+        drop(_sandbox_lock);
 
         let mut env_meta = meta;
         env_meta.target_branch = Some(target_branch.clone());

@@ -93,11 +93,11 @@ tes merge <branch1> [<branch2> ...] --into main -m "<commit message>"
 | `tes stash` | `tes stash [-a <id>] [push [-m "<msg>"] [-b <branch>] [<paths...>]] \| pop \| apply \| list \| drop \| clear` (`-a` works before or after subcommands) |
 | `tes radar` | `tes radar [--json]` (lists all active sessions, ports, branches, and claimed files) |
 | `tes exec` | `tes exec [-b <branch>] [-a <id>] -- <cmd> [args...]` |
-| `tes commit` | `tes commit [-m "<msg>"] [-b <branch>] [--amend] [--no-edit] [--verify [cmd]] [--author "<Name <email>>"] [--co-author \| --no-co-author]` |
-| `tes merge` | `tes merge [<branches...>] [--into <target>] [-m "<msg>"] [--verify [cmd]] [--dry-run] [--keep-open] [--author "<Name <email>>"] [--co-author \| --no-co-author]` |
+| `tes commit` | `tes commit [-m "<msg>"] [-b <branch>] [--amend] [--no-edit] [--verify[=<cmd>] \| --verify-cmd <cmd>] [--author "<Name <email>>"] [--co-author \| --no-co-author]` |
+| `tes merge` | `tes merge [<branches...>] [--into <target>] [-m "<msg>"] [--verify[=<cmd>] \| --verify-cmd <cmd>] [--dry-run] [--keep-open] [--author "<Name <email>>"] [--co-author \| --no-co-author]` |
 | `tes cherry-pick` | `tes cherry-pick <commit> [-b <target-branch>] [-a <id>]` |
 | `tes pull` | `tes pull [<remote>] [<branch>] [-a <id>]` |
-| `tes push` | `tes push [-u] [-m "<msg>"] [-f] [<remote>] [<branch>] [-a <id>]` |
+| `tes push` | `tes push [-u] [-m "<msg>"] [-f \| --force-with-lease] [--tags] [-d \| --delete] [-n \| --dry-run] [--no-auto-commit] [<remote>] [<branch>] [-a <id>]` |
 | `tes log` | `tes log [-n <count>] [-b <branch>] [--oneline] [-p] [--stat] [--name-only] [--name-status] [--graph] [--all] [--author <pat>] [--grep <pat>] [-S <str>] [-- <paths...>]` |
 | `tes conflicts` | `tes conflicts [--json]` |
 | `tes resolve` | `tes resolve <path> --strategy <ast-union\|ours\|theirs\|working\|content> [--content <text> \| --content-file <file>]` |
@@ -124,14 +124,14 @@ When connected via MCP (`tes mcp`), the following tools, resources, and prompts 
 - `status`: `{ agent_id? }`
 - `radar`: `{}`
 - `claim`: `{ intent?, branch?, from?, symbols?, agent_id? }`
-- `commit`: `{ message?, branch?, amend?, author?, co_author?, no_co_author?, verify?, agent_id? }`
-- `diff`: `{ branch?, staged?, rev_range?, paths?, agent_id? }`
-- `log`: `{ branch?, limit? }`
+- `commit`: `{ message?, branch?, amend?, dry_run?, author?, co_author?, no_co_author?, verify?, agent_id? }`
+- `diff`: `{ branch?, staged?, all?, range?, stat?, name_status?, paths?, agent_id? }`
+- `log`: `{ branch?, limit?, agent_id? }`
 - `oplog`: `{ limit? }`
-- `push`: `{ remote?, branch?, force?, tags?, dry_run?, agent_id? }`
+- `push`: `{ remote?, branch?, message?, set_upstream?, force?, force_with_lease?, tags?, delete?, dry_run?, no_auto_commit?, agent_id? }`
 - `pull`: `{ remote?, branch?, agent_id? }`
 - `checkpoint`: `{ label, agent_id? }`
-- `restore`: `{ source?, branch?, paths?, agent_id? }`
+- `restore`: `{ source?, revision?, branch?, paths?, agent_id? }`
 - `branch`: `{ action?: "list"|"switch"|"delete"|"rename", branch?, new_branch?, from?, force?, agent_id? }`
 - `stash`: `{ action?: "push"|"pop"|"apply"|"list"|"drop"|"clear", message?, branch?, paths?, index?, agent_id? }`
 - `cherry-pick`: `{ commit, branch?, agent_id? }`
@@ -140,7 +140,7 @@ When connected via MCP (`tes mcp`), the following tools, resources, and prompts 
 - `sync`: `{}`
 - `undo`: `{ op?, checkpoint? }`
 - `merge`: `{ agents?, into?, message?, verify?, keep_open?, dry_run?, author?, co_author?, no_co_author? }`
-- `agent`: `{ action?: "list"|"close"|"clear", agent_id?, force? }`
+- `agent`: `{ action?: "list"|"close"|"clear", name?, all?, force?, agent_id? }`
 - `config`: `{ action?: "show" }`
 - `doctor`: `{}`
 

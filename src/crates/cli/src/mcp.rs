@@ -991,6 +991,32 @@ fn dispatch_tool_call(
             };
             let outcome = execute_push(&coord, &session_id, &push_args, true, false)
                 .map_err(|e| CoreError::InvalidArgument(e.to_string()))?;
+
+            if outcome.exit_code != 0 {
+                let detail = outcome
+                    .payload
+                    .get("stderr")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| {
+                        outcome
+                            .payload
+                            .get("reason")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                    })
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| format!("exit code {}", outcome.exit_code));
+                let payload_json = serde_json::to_string(&outcome.payload).unwrap_or_default();
+
+                return Err(CoreError::InvalidArgument(format!(
+                    "push failed (exit code {}): {detail} ({payload_json})",
+                    outcome.exit_code
+                )));
+            }
+
             Ok(outcome.payload)
         }
         "cherry-pick" => {

@@ -1293,8 +1293,12 @@ impl PartialEq for OrderedJson {
 
 impl Eq for OrderedJson {}
 
+/// Maximum allowed JSON container nesting depth in [`OrderedJsonParser`] to prevent stack
+/// overflow on pathologically nested inputs.
+const MAX_JSON_DEPTH: usize = 128;
+
 /// Lightweight recursive-descent parser that parses valid JSON into [`OrderedJson`] while
-/// rejecting duplicate keys within the same JSON object.
+/// rejecting duplicate keys within the same JSON object and enforcing [`MAX_JSON_DEPTH`].
 struct OrderedJsonParser<'a> {
     /// Source JSON text.
     src: &'a str,
@@ -1305,21 +1309,25 @@ struct OrderedJsonParser<'a> {
 }
 
 impl<'a> OrderedJsonParser<'a> {
-    /// Parses `src` into an [`OrderedJson`] tree, returning `None` on syntax error or duplicate object keys.
-    fn parse(src: &'a str) -> Option<OrderedJson> {
+    /// Parses `src` into an [`OrderedJson`] tree.
+    ///
+    /// # Errors
+    /// Returns an error description on invalid JSON syntax, duplicate object keys, trailing
+    /// non-whitespace tokens, or nesting deeper than [`MAX_JSON_DEPTH`].
+    fn parse(src: &'a str) -> Result<OrderedJson, &'static str> {
         let mut p = Self {
             src,
             bytes: src.as_bytes(),
             pos: 0,
         };
-        let val = p.parse_value()?;
+        let val = p.parse_value(0)?;
         p.skip_ws();
 
         if p.pos != p.bytes.len() {
-            return None;
+            return Err("trailing characters after JSON value");
         }
 
-        Some(val)
+        Ok(val)
     }
 
     /// Advances past JSON whitespace characters.
@@ -1331,46 +1339,65 @@ impl<'a> OrderedJsonParser<'a> {
         }
     }
 
-    /// Parses a single JSON value.
-    fn parse_value(&mut self) -> Option<OrderedJson> {
+    /// Parses a single JSON value at nesting level `depth`.
+    ///
+    /// # Errors
+    /// Returns an error if `depth > MAX_JSON_DEPTH` or the input is not valid JSON.
+    fn parse_value(&mut self, depth: usize) -> Result<OrderedJson, &'static str> {
+        if depth > MAX_JSON_DEPTH {
+            return Err("JSON nesting depth exceeds maximum limit");
+        }
+
         self.skip_ws();
-        let &b = self.bytes.get(self.pos)?;
+        let &b = self
+            .bytes
+            .get(self.pos)
+            .ok_or("unexpected end of JSON input")?;
 
         match b {
-            b'{' => self.parse_object(),
-            b'[' => self.parse_array(),
+            b'{' => self.parse_object(depth + 1),
+            b'[' => self.parse_array(depth + 1),
             b'"' => self.parse_string().map(OrderedJson::String),
             b't' => {
                 if self.src[self.pos..].starts_with("true") {
                     self.pos += 4;
-                    Some(OrderedJson::Bool(true))
+                    Ok(OrderedJson::Bool(true))
                 } else {
-                    None
+                    Err("invalid JSON literal")
                 }
             }
             b'f' => {
                 if self.src[self.pos..].starts_with("false") {
                     self.pos += 5;
-                    Some(OrderedJson::Bool(false))
+                    Ok(OrderedJson::Bool(false))
                 } else {
-                    None
+                    Err("invalid JSON literal")
                 }
             }
             b'n' => {
                 if self.src[self.pos..].starts_with("null") {
                     self.pos += 4;
-                    Some(OrderedJson::Null)
+                    Ok(OrderedJson::Null)
                 } else {
-                    None
+                    Err("invalid JSON literal")
                 }
             }
             b'-' | b'0'..=b'9' => self.parse_number(),
-            _ => None,
+            _ => Err("unexpected token in JSON"),
         }
     }
 
-    /// Parses a JSON object while rejecting duplicate keys within the same object.
-    fn parse_object(&mut self) -> Option<OrderedJson> {
+    /// Parses a JSON object at nesting level `depth` while rejecting duplicate keys within the
+    /// same object.
+    ///
+    /// # Errors
+    /// Returns an error if `depth > MAX_JSON_DEPTH`, a duplicate key is encountered, or object
+    /// syntax is malformed.
+    fn parse_object(&mut self, depth: usize) -> Result<OrderedJson, &'static str> {
+        if depth > MAX_JSON_DEPTH {
+            return Err("JSON nesting depth exceeds maximum limit");
+        }
+
         self.pos += 1;
         self.skip_ws();
 
@@ -1379,7 +1406,7 @@ impl<'a> OrderedJsonParser<'a> {
 
         if self.bytes.get(self.pos) == Some(&b'}') {
             self.pos += 1;
-            return Some(OrderedJson::Object(entries));
+            return Ok(OrderedJson::Object(entries));
         }
 
         loop {
@@ -1387,17 +1414,17 @@ impl<'a> OrderedJsonParser<'a> {
             let key = self.parse_string()?;
 
             if !seen.insert(key.clone()) {
-                return None;
+                return Err("duplicate JSON object key");
             }
 
             self.skip_ws();
 
             if self.bytes.get(self.pos) != Some(&b':') {
-                return None;
+                return Err("expected ':' after JSON object key");
             }
 
             self.pos += 1;
-            let val = self.parse_value()?;
+            let val = self.parse_value(depth)?;
             entries.push((key, val));
             self.skip_ws();
 
@@ -1407,15 +1434,22 @@ impl<'a> OrderedJsonParser<'a> {
                 }
                 Some(&b'}') => {
                     self.pos += 1;
-                    return Some(OrderedJson::Object(entries));
+                    return Ok(OrderedJson::Object(entries));
                 }
-                _ => return None,
+                _ => return Err("expected ',' or '}' in JSON object"),
             }
         }
     }
 
-    /// Parses a JSON array.
-    fn parse_array(&mut self) -> Option<OrderedJson> {
+    /// Parses a JSON array at nesting level `depth`.
+    ///
+    /// # Errors
+    /// Returns an error if `depth > MAX_JSON_DEPTH` or array syntax is malformed.
+    fn parse_array(&mut self, depth: usize) -> Result<OrderedJson, &'static str> {
+        if depth > MAX_JSON_DEPTH {
+            return Err("JSON nesting depth exceeds maximum limit");
+        }
+
         self.pos += 1;
         self.skip_ws();
 
@@ -1423,11 +1457,11 @@ impl<'a> OrderedJsonParser<'a> {
 
         if self.bytes.get(self.pos) == Some(&b']') {
             self.pos += 1;
-            return Some(OrderedJson::Array(items));
+            return Ok(OrderedJson::Array(items));
         }
 
         loop {
-            let val = self.parse_value()?;
+            let val = self.parse_value(depth)?;
             items.push(val);
             self.skip_ws();
 
@@ -1437,17 +1471,21 @@ impl<'a> OrderedJsonParser<'a> {
                 }
                 Some(&b']') => {
                     self.pos += 1;
-                    return Some(OrderedJson::Array(items));
+                    return Ok(OrderedJson::Array(items));
                 }
-                _ => return None,
+                _ => return Err("expected ',' or ']' in JSON array"),
             }
         }
     }
 
     /// Parses a JSON string token using `serde_json` for RFC 8259 unescaping.
-    fn parse_string(&mut self) -> Option<String> {
+    ///
+    /// # Errors
+    /// Returns an error if the token does not start with `"`, is unterminated, or contains invalid
+    /// escape sequences.
+    fn parse_string(&mut self) -> Result<String, &'static str> {
         if self.bytes.get(self.pos) != Some(&b'"') {
-            return None;
+            return Err("expected '\"' at start of JSON string");
         }
 
         let start = self.pos;
@@ -1464,17 +1502,21 @@ impl<'a> OrderedJsonParser<'a> {
             } else if b == b'"' {
                 let end = self.pos;
                 self.pos += 1;
-                return serde_json::from_str::<String>(&self.src[start..=end]).ok();
+                return serde_json::from_str::<String>(&self.src[start..=end])
+                    .map_err(|_| "invalid JSON string literal");
             }
 
             self.pos += 1;
         }
 
-        None
+        Err("unterminated JSON string literal")
     }
 
     /// Parses a JSON numeric literal preserving its raw source spelling.
-    fn parse_number(&mut self) -> Option<OrderedJson> {
+    ///
+    /// # Errors
+    /// Returns an error if the token is not a valid RFC 8259 JSON number.
+    fn parse_number(&mut self) -> Result<OrderedJson, &'static str> {
         let start = self.pos;
 
         while self.pos < self.bytes.len()
@@ -1487,13 +1529,13 @@ impl<'a> OrderedJsonParser<'a> {
         }
 
         let raw = &self.src[start..self.pos];
-        let serde_json::Value::Number(value) =
-            serde_json::from_str::<serde_json::Value>(raw).ok()?
+        let serde_json::Value::Number(value) = serde_json::from_str::<serde_json::Value>(raw)
+            .map_err(|_| "invalid JSON number literal")?
         else {
-            return None;
+            return Err("invalid JSON number literal");
         };
 
-        Some(OrderedJson::Number {
+        Ok(OrderedJson::Number {
             raw: raw.to_string(),
             value,
         })
@@ -1612,13 +1654,20 @@ fn merge_json_3way_labeled(
         });
     }
 
+    let left_val = OrderedJsonParser::parse(left).ok()?;
+    let right_val = OrderedJsonParser::parse(right).ok()?;
     let base_val = if base.trim().is_empty() {
-        OrderedJson::Object(Vec::new())
+        if matches!(
+            (&left_val, &right_val),
+            (OrderedJson::Array(_), OrderedJson::Array(_))
+        ) {
+            OrderedJson::Array(Vec::new())
+        } else {
+            OrderedJson::Object(Vec::new())
+        }
     } else {
-        OrderedJsonParser::parse(base)?
+        OrderedJsonParser::parse(base).ok()?
     };
-    let left_val = OrderedJsonParser::parse(left)?;
-    let right_val = OrderedJsonParser::parse(right)?;
 
     let mut conflicts = Vec::new();
     let merged_val = merge_ordered_json("", Some(&base_val), &left_val, &right_val, &mut conflicts);
@@ -1637,7 +1686,7 @@ fn merge_json_3way_labeled(
     let strict = merge_text_3way_strict(base, left, right, left_label, right_label);
 
     if !strict.has_conflicts {
-        if let Some(parsed) = OrderedJsonParser::parse(&strict.content) {
+        if let Ok(parsed) = OrderedJsonParser::parse(&strict.content) {
             if parsed == merged_val {
                 return Some(DriverMergeOutcome {
                     content: strict.content,
@@ -2250,5 +2299,72 @@ source = "git+https://example.com/blake3"
         assert!(!is_migration_dir("examples/migrations"));
         assert!(is_migration_file("0001_users.sql"));
         assert!(!is_migration_file("0001_overview.md"));
+    }
+
+    #[test]
+    fn deeply_nested_json_returns_clean_fallback_without_stack_overflow() {
+        let at_limit = format!(
+            "{}{}",
+            "[".repeat(MAX_JSON_DEPTH),
+            "]".repeat(MAX_JSON_DEPTH)
+        );
+        assert!(OrderedJsonParser::parse(&at_limit).is_ok());
+
+        let deep_arr = format!(
+            "{}{}",
+            "[".repeat(MAX_JSON_DEPTH + 1),
+            "]".repeat(MAX_JSON_DEPTH + 1)
+        );
+        assert!(OrderedJsonParser::parse(&deep_arr).is_err());
+
+        let deep_obj = format!(
+            "{}1{}",
+            "{\"a\":".repeat(MAX_JSON_DEPTH + 1),
+            "}".repeat(MAX_JSON_DEPTH + 1)
+        );
+        assert!(OrderedJsonParser::parse(&deep_obj).is_err());
+
+        let wrap = |inner: &str| {
+            format!(
+                "{}{inner}{}",
+                "[".repeat(MAX_JSON_DEPTH + 64),
+                "]".repeat(MAX_JSON_DEPTH + 64)
+            )
+        };
+        let res = merge_json_3way(&wrap("1"), &wrap("2"), &wrap("3"));
+        assert!(res.is_none());
+    }
+
+    #[test]
+    fn empty_base_concurrent_json_array_creation_merges_cleanly() {
+        let base = "";
+        let left = "[\n  \"alpha\",\n  \"beta\"\n]\n";
+        let right = "[\n  \"alpha\",\n  \"gamma\"\n]\n";
+
+        let res = merge_json_3way(base, left, right).expect("empty-base json array merge");
+        assert!(
+            !res.has_conflicts,
+            "expected clean empty-base array merge, got:\n{}",
+            res.content
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&res.content).expect("valid json");
+        assert_eq!(parsed, serde_json::json!(["alpha", "beta", "gamma"]));
+
+        let left_disjoint = "[\n  \"first\"\n]\n";
+        let right_disjoint = "[\n  \"second\"\n]\n";
+        let res_disjoint =
+            merge_json_3way(base, left_disjoint, right_disjoint).expect("disjoint array merge");
+        assert!(
+            !res_disjoint.has_conflicts,
+            "expected clean disjoint array merge, got:\n{}",
+            res_disjoint.content
+        );
+        let parsed_disjoint: serde_json::Value =
+            serde_json::from_str(&res_disjoint.content).expect("valid json");
+        assert_eq!(parsed_disjoint, serde_json::json!(["first", "second"]));
+
+        let res_mismatch =
+            merge_json_3way(base, "[\n  \"a\"\n]\n", "{\n  \"a\": 1\n}\n").expect("mismatch");
+        assert!(res_mismatch.has_conflicts);
     }
 }

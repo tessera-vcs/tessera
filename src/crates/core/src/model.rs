@@ -58,6 +58,39 @@ pub enum CoreError {
 /// Result alias for `core` operations.
 pub type CoreResult<T> = Result<T, CoreError>;
 
+/// Atomically renames `tmp_path` onto `target_path`, clearing Windows read-only attributes on an
+/// existing target and retrying once if `fs::rename` fails with `PermissionDenied`.
+fn rename_replacing_target(tmp_path: &Path, target_path: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        match fs::rename(tmp_path, target_path) {
+            Ok(()) => Ok(()),
+            Err(err)
+                if err.kind() == std::io::ErrorKind::PermissionDenied && target_path.exists() =>
+            {
+                if let Ok(meta) = fs::metadata(target_path) {
+                    let mut perms = meta.permissions();
+
+                    if perms.readonly() {
+                        // Windows-only: clears FILE_ATTRIBUTE_READONLY without affecting Unix modes.
+                        #[allow(clippy::permissions_set_readonly_false)]
+                        perms.set_readonly(false);
+                        let _ = fs::set_permissions(target_path, perms);
+                    }
+                }
+
+                fs::rename(tmp_path, target_path)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        fs::rename(tmp_path, target_path)
+    }
+}
+
 /// Shared implementation for crash-safe sibling temporary file creation and atomic rename,
 /// optionally issuing a hardware `sync_all` barrier before renaming.
 ///
@@ -106,7 +139,7 @@ fn atomic_write_file_inner(target_path: &Path, bytes: &[u8], sync_data: bool) ->
         }
     }
 
-    fs::rename(&tmp_path, target_path).map_err(|source| {
+    rename_replacing_target(&tmp_path, target_path).map_err(|source| {
         let _ = fs::remove_file(&tmp_path);
         CoreError::Io {
             path: target_path.display().to_string(),
@@ -215,7 +248,7 @@ pub fn write_working_tree_file_safe(target_path: &Path, bytes: &[u8]) -> CoreRes
         let _ = perms;
     }
 
-    fs::rename(&tmp_path, target_path).map_err(|source| {
+    rename_replacing_target(&tmp_path, target_path).map_err(|source| {
         let _ = fs::remove_file(&tmp_path);
         CoreError::Io {
             path: target_path.display().to_string(),
@@ -224,12 +257,17 @@ pub fn write_working_tree_file_safe(target_path: &Path, bytes: &[u8]) -> CoreRes
     })
 }
 
-/// Returns `true` if a single path segment matches `.git`, `.tessera`, or an NTFS short-name /
-/// trailing-dot/space alias that could target repository internals on case-insensitive filesystems.
+/// Returns `true` if a single path segment contains an NTFS Alternate Data Stream colon (`:`)
+/// or matches `.git`, `.tessera`, or an NTFS short-name / trailing-dot/space alias that could
+/// target repository internals on case-insensitive filesystems.
 fn is_forbidden_vcs_segment(seg: &str) -> bool {
-    let trimmed = seg.trim_end_matches(['.', ' ']);
+    let base = seg.split(':').next().unwrap_or(seg);
+    let trimmed = base.trim_end_matches(['.', ' ']);
 
-    if trimmed.eq_ignore_ascii_case(".git") || trimmed.eq_ignore_ascii_case(".tessera") {
+    if seg.contains(':')
+        || trimmed.eq_ignore_ascii_case(".git")
+        || trimmed.eq_ignore_ascii_case(".tessera")
+    {
         return true;
     }
 
@@ -251,7 +289,8 @@ fn is_forbidden_vcs_segment(seg: &str) -> bool {
 }
 
 /// Validates and normalizes a repository-relative path, rejecting traversal (`..`),
-/// `.git` and `.tessera` directory access (including NTFS aliases), NUL bytes, and Windows drive prefixes.
+/// `.git` and `.tessera` directory access (including NTFS aliases and Alternate Data Streams),
+/// NUL bytes, colons (`:`), and Windows drive prefixes.
 ///
 /// # Errors
 /// Returns [`CoreError::InvalidArgument`] if `raw` is empty or contains forbidden components.
@@ -286,7 +325,7 @@ pub fn validate_repo_rel_path(raw: &str) -> CoreResult<String> {
             continue;
         }
 
-        if seg == ".." || is_forbidden_vcs_segment(seg) {
+        if seg == ".." || seg.contains(':') || is_forbidden_vcs_segment(seg) {
             return Err(CoreError::InvalidArgument(format!(
                 "path '{raw}' contains forbidden component '{seg}'"
             )));
@@ -632,7 +671,16 @@ impl ObjectId {
 
     /// Returns a short 8-character prefix for human-readable output.
     pub fn short(&self) -> &str {
-        &self.as_str()[..8]
+        utf8_prefix_chars(self.as_str(), 8)
+    }
+}
+
+/// Returns a UTF-8 safe prefix slice of at most `max_chars` Unicode scalar values without
+/// panicking on multi-byte characters.
+fn utf8_prefix_chars(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((byte_idx, _)) => &s[..byte_idx],
+        None => s,
     }
 }
 
@@ -691,7 +739,7 @@ impl ChangeId {
 
     /// Returns an 8-character short prefix for CLI display.
     pub fn short(&self) -> &str {
-        &self.0[..8.min(self.0.len())]
+        utf8_prefix_chars(&self.0, 8)
     }
 }
 
@@ -719,7 +767,7 @@ impl OpId {
 
     /// Returns a 12-character short prefix for display.
     pub fn short(&self) -> &str {
-        &self.0[..12.min(self.0.len())]
+        utf8_prefix_chars(&self.0, 12)
     }
 }
 
@@ -742,7 +790,7 @@ pub struct ConflictId(pub String);
 impl ConflictId {
     /// Returns an 8-character short prefix for display.
     pub fn short(&self) -> &str {
-        &self.0[..8.min(self.0.len())]
+        utf8_prefix_chars(&self.0, 8)
     }
 }
 
@@ -1413,5 +1461,41 @@ mod tests {
         assert!(validate_safe_identifier("session", "antigravity-123_a.b").is_ok());
         assert!(validate_safe_identifier("session", "../escape").is_err());
         assert!(validate_safe_identifier("session", "-flag").is_err());
+    }
+
+    #[test]
+    fn validate_repo_rel_path_rejects_ntfs_ads_and_colon_segments() {
+        assert!(validate_repo_rel_path(".git::$INDEX_ALLOCATION/config").is_err());
+        assert!(validate_repo_rel_path(".git:$I30:$INDEX_ALLOCATION/config").is_err());
+        assert!(validate_repo_rel_path(".tessera:stream/state").is_err());
+        assert!(validate_repo_rel_path("git~1:stream/config").is_err());
+        assert!(validate_repo_rel_path("foo:bar").is_err());
+        assert!(validate_repo_rel_path("src/C:/escape.rs").is_err());
+
+        assert!(is_forbidden_vcs_segment(".git::$INDEX_ALLOCATION"));
+        assert!(is_forbidden_vcs_segment(".git:$I30:$INDEX_ALLOCATION"));
+        assert!(is_forbidden_vcs_segment("foo:bar"));
+    }
+
+    #[test]
+    fn id_short_methods_are_utf8_safe_on_multibyte_inputs() {
+        let short_cid = ChangeId("a🦀🦀".to_string());
+        assert_eq!(short_cid.short(), "a🦀🦀");
+
+        let long_cid = ChangeId("a🦀🦀🦀🦀🦀🦀🦀🦀🦀".to_string());
+        assert_eq!(long_cid.short(), "a🦀🦀🦀🦀🦀🦀🦀");
+        assert_eq!(long_cid.short().chars().count(), 8);
+
+        let short_op = OpId("a🦀🦀🦀".to_string());
+        assert_eq!(short_op.short(), "a🦀🦀🦀");
+
+        let long_op = OpId("é".repeat(20));
+        assert_eq!(long_op.short().chars().count(), 12);
+
+        let short_conflict = ConflictId("a🦀🦀".to_string());
+        assert_eq!(short_conflict.short(), "a🦀🦀");
+
+        let long_conflict = ConflictId("é".repeat(12));
+        assert_eq!(long_conflict.short().chars().count(), 8);
     }
 }

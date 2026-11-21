@@ -19,7 +19,7 @@ tes doctor [options]
 1. **Git and `.git/tessera` State**: Verifies the Git repository, `.git/tessera` store initialization, operation log heads, and branch reference consistency.
 2. **Configuration and Trust**: Validates `.git/tessera/config.toml` and any checked-in `tessera.toml`, reporting whether execution-sensitive fields (`verify_command`, `pager`, `extra_bin_dirs`, `custom_env`) are trusted via `tes config trust`.
 3. **Copy-on-Write Filesystem Support**: Checks whether the repository filesystem supports native Copy-on-Write clones (`clonefile` on macOS APFS, `FICLONE` on Linux Btrfs/XFS/bcachefs) or uses the portable fallback.
-4. **Hooks, Harnesses, and Shell Integration**: Checks installed Git sync hooks (`.git/hooks/post-commit`, `post-merge`, `post-checkout`), AI editor rule files, and shell prompt integration (`tes env`).
+4. **Hooks and Harnesses**: Checks installed Git sync hooks (`.git/hooks/post-commit`, `post-merge`, `post-checkout`) and AI editor rule files.
 5. **Sessions, Sandboxes, and Conflicts**: Surfaces active conflicts, stale or orphaned sessions, and sandbox health.
 
 ## Examples

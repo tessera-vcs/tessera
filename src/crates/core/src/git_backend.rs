@@ -275,9 +275,11 @@ fn cmp_git_tree_entry_names(
     a_next.cmp(&b_next)
 }
 
-/// Validates that a single Git tree entry name cannot escape its directory or target `.git` / `.tessera`.
+/// Validates that a single Git tree entry name cannot escape its directory, inject an NTFS
+/// Alternate Data Stream, or target `.git` / `.tessera`.
 fn validate_tree_entry_name(tree_id: &ObjectId, name: &str) -> CoreResult<()> {
-    let trimmed = name.trim_end_matches(['.', ' ']);
+    let base = name.split(':').next().unwrap_or(name);
+    let trimmed = base.trim_end_matches(['.', ' ']);
     let lower = trimmed.to_ascii_lowercase();
     let is_short_alias = lower
         .strip_prefix("git~")
@@ -290,6 +292,7 @@ fn validate_tree_entry_name(tree_id: &ObjectId, name: &str) -> CoreResult<()> {
         || name.contains('/')
         || name.contains('\\')
         || name.contains('\0')
+        || name.contains(':')
         || trimmed.eq_ignore_ascii_case(".git")
         || trimmed.eq_ignore_ascii_case(".tessera")
         || is_short_alias
@@ -301,6 +304,35 @@ fn validate_tree_entry_name(tree_id: &ObjectId, name: &str) -> CoreResult<()> {
     }
 
     Ok(())
+}
+
+/// Joins a `/`- or `\`-separated relative path onto `base` by pushing each non-empty segment
+/// individually so Windows `\\?\` verbatim paths never receive embedded forward slashes.
+fn join_rel_segments(base: &Path, rel: &str) -> PathBuf {
+    let mut path = base.to_path_buf();
+
+    for seg in rel.split(['/', '\\']) {
+        if !seg.is_empty() {
+            path.push(seg);
+        }
+    }
+
+    path
+}
+
+/// Returns `true` if `path` is equal to or nested inside `prefix`, comparing both lexical paths
+/// and canonicalized forms to handle OS symlinked roots (e.g. `/var` vs `/private/var`) and
+/// Windows `\\?\` verbatim prefixes.
+fn path_starts_with_canonical(path: &Path, prefix: &Path) -> bool {
+    if path.starts_with(prefix) {
+        return true;
+    }
+
+    if let (Ok(canon_path), Ok(canon_prefix)) = (path.canonicalize(), prefix.canonicalize()) {
+        return canon_path.starts_with(&canon_prefix);
+    }
+
+    false
 }
 
 /// Returns `true` if `slug_path` resides directly inside one of the authorized Tessera external
@@ -439,8 +471,10 @@ pub fn is_valid_sandbox_repo_root(
         }
     }
 
-    let is_inside_repo = sandbox_dir.starts_with(target_root.join(".tessera").join("workspaces"))
-        || sandbox_dir.starts_with(common_git_dir.join("tessera"));
+    let workspaces_dir = target_root.join(".tessera").join("workspaces");
+    let tessera_store_dir = common_git_dir.join("tessera");
+    let is_inside_repo = path_starts_with_canonical(sandbox_dir, &workspaces_dir)
+        || path_starts_with_canonical(sandbox_dir, &tessera_store_dir);
 
     if is_inside_repo {
         return Some(target_root);
@@ -495,13 +529,39 @@ impl GitBackend {
     /// # Errors
     /// Returns [`CoreError::RepoNotFound`] if no `.git` directory or pointer exists in `start_dir` or its ancestors.
     pub fn discover(start_dir: &Path) -> CoreResult<Self> {
-        let mut curr = if start_dir.is_absolute() {
+        let cwd = std::env::current_dir().ok();
+        let env_root = std::env::var("TES_REPO_ROOT").ok();
+        let env_ws = std::env::var("TES_WORKSPACE").ok();
+
+        Self::discover_with_context(
+            start_dir,
+            cwd.as_deref(),
+            env_root.as_deref(),
+            env_ws.as_deref(),
+        )
+    }
+
+    /// Internal discovery implementation accepting explicit `cwd` and sandbox environment variables
+    /// so relative start paths and `TES_WORKSPACE` fallback can be tested deterministically.
+    fn discover_with_context(
+        start_dir: &Path,
+        cwd: Option<&Path>,
+        env_root: Option<&str>,
+        env_ws: Option<&str>,
+    ) -> CoreResult<Self> {
+        let abs_start = if start_dir.is_absolute() {
             start_dir.to_path_buf()
         } else {
-            std::env::current_dir()
-                .map(|cwd| cwd.join(start_dir))
-                .unwrap_or_else(|_| start_dir.to_path_buf())
+            cwd.map(|dir| {
+                if start_dir == Path::new(".") || start_dir.as_os_str().is_empty() {
+                    dir.to_path_buf()
+                } else {
+                    dir.join(start_dir)
+                }
+            })
+            .unwrap_or_else(|| start_dir.to_path_buf())
         };
+        let mut curr = abs_start.clone();
 
         loop {
             if let Some((git_dir, common_git_dir)) = resolve_dot_git(&curr) {
@@ -515,6 +575,23 @@ impl GitBackend {
                     .and_then(|s| s.to_str())
                     == Some(".tessera")
             {
+                if let (Some(raw_root), Some(raw_ws)) = (env_root, env_ws) {
+                    let ws_path = PathBuf::from(raw_ws.trim());
+                    let target_root = PathBuf::from(raw_root.trim());
+
+                    // Only honor `TES_WORKSPACE` inside `.tessera/tmp` when `TES_WORKSPACE` itself
+                    // resides inside this `.tessera/tmp` boundary so tempdirs created under `tes exec`
+                    // never escape back into the enclosing host sandbox.
+                    if !ws_path.as_os_str().is_empty()
+                        && path_starts_with_canonical(&ws_path, &curr)
+                        && path_starts_with_canonical(&abs_start, &ws_path)
+                    {
+                        if let Some((target_git, target_common)) = resolve_dot_git(&target_root) {
+                            return Ok(Self::with_paths(target_root, target_git, target_common));
+                        }
+                    }
+                }
+
                 return Err(CoreError::RepoNotFound(start_dir.display().to_string()));
             }
 
@@ -525,14 +602,13 @@ impl GitBackend {
             }
 
             if !curr.pop() {
-                if let (Ok(env_root), Ok(env_ws)) = (
-                    std::env::var("TES_REPO_ROOT"),
-                    std::env::var("TES_WORKSPACE"),
-                ) {
-                    let ws_path = PathBuf::from(env_ws.trim());
-                    let target_root = PathBuf::from(env_root.trim());
+                if let (Some(raw_root), Some(raw_ws)) = (env_root, env_ws) {
+                    let ws_path = PathBuf::from(raw_ws.trim());
+                    let target_root = PathBuf::from(raw_root.trim());
 
-                    if !ws_path.as_os_str().is_empty() && start_dir.starts_with(&ws_path) {
+                    if !ws_path.as_os_str().is_empty()
+                        && path_starts_with_canonical(&abs_start, &ws_path)
+                    {
                         if let Some((target_git, target_common)) = resolve_dot_git(&target_root) {
                             return Ok(Self::with_paths(target_root, target_git, target_common));
                         }
@@ -554,21 +630,29 @@ impl GitBackend {
             resolved
         } else {
             let dot_git = repo_root.join(".git");
-            fs::create_dir_all(dot_git.join("objects/info")).map_err(|source| CoreError::Io {
-                path: dot_git.display().to_string(),
-                source,
+            fs::create_dir_all(join_rel_segments(&dot_git, "objects/info")).map_err(|source| {
+                CoreError::Io {
+                    path: dot_git.display().to_string(),
+                    source,
+                }
             })?;
-            fs::create_dir_all(dot_git.join("objects/pack")).map_err(|source| CoreError::Io {
-                path: dot_git.display().to_string(),
-                source,
+            fs::create_dir_all(join_rel_segments(&dot_git, "objects/pack")).map_err(|source| {
+                CoreError::Io {
+                    path: dot_git.display().to_string(),
+                    source,
+                }
             })?;
-            fs::create_dir_all(dot_git.join("refs/heads")).map_err(|source| CoreError::Io {
-                path: dot_git.display().to_string(),
-                source,
+            fs::create_dir_all(join_rel_segments(&dot_git, "refs/heads")).map_err(|source| {
+                CoreError::Io {
+                    path: dot_git.display().to_string(),
+                    source,
+                }
             })?;
-            fs::create_dir_all(dot_git.join("refs/tags")).map_err(|source| CoreError::Io {
-                path: dot_git.display().to_string(),
-                source,
+            fs::create_dir_all(join_rel_segments(&dot_git, "refs/tags")).map_err(|source| {
+                CoreError::Io {
+                    path: dot_git.display().to_string(),
+                    source,
+                }
             })?;
 
             atomic_write_file(&dot_git.join("HEAD"), b"ref: refs/heads/main\n")?;
@@ -654,7 +738,16 @@ impl GitBackend {
             source,
         })?;
 
-        atomic_write_file_relaxed(&path, &compressed)?;
+        if let Err(err) = atomic_write_file_relaxed(&path, &compressed) {
+            // Git loose objects are immutable and content-addressed: if a concurrent writer or
+            // Git process created the same read-only object between our check and rename, succeed.
+            if path.is_file() {
+                return Ok(oid);
+            }
+
+            return Err(err);
+        }
+
         Ok(oid)
     }
 
@@ -986,32 +1079,63 @@ impl GitBackend {
         Ok(nodes)
     }
 
-    /// Recursively builds hierarchical Git `tree` objects from a flat `path -> FileEntry` map
-    /// using zero-allocation slice partitioning and returns the root tree [`ObjectId`].
+    /// Recursively builds hierarchical Git `tree` objects from a flat `path -> FileEntry` map,
+    /// validating every repository-relative path and rejecting duplicate or file/directory name
+    /// collisions, and returns the root tree [`ObjectId`].
     ///
     /// # Errors
-    /// Returns [`CoreError`] if writing any tree object fails.
+    /// Returns [`CoreError::InvalidArgument`] if any path is invalid, contains empty segments, or
+    /// collides with another leaf or directory entry, or [`CoreError::Io`] / [`CoreError::InvalidGitObject`]
+    /// if writing any tree object fails.
     pub fn write_tree_from_map(&self, files: &BTreeMap<String, FileEntry>) -> CoreResult<ObjectId> {
-        let mut items: Vec<(&str, &FileEntry)> = files
-            .iter()
-            .map(|(k, v)| (k.trim_matches('/'), v))
-            .filter(|(k, _)| !k.is_empty())
-            .collect();
-        items.sort_by(|a, b| a.0.cmp(b.0));
+        let mut normalized: BTreeMap<String, &FileEntry> = BTreeMap::new();
+
+        for (raw_path, entry) in files {
+            if raw_path.split(['/', '\\']).any(str::is_empty) {
+                return Err(CoreError::InvalidArgument(format!(
+                    "tree entry path '{raw_path}' contains empty path segment"
+                )));
+            }
+
+            let clean = validate_repo_rel_path(raw_path)?;
+
+            if normalized.insert(clean.clone(), entry).is_some() {
+                return Err(CoreError::InvalidArgument(format!(
+                    "duplicate normalized tree entry path '{clean}'"
+                )));
+            }
+        }
+
+        let items: Vec<(&str, &FileEntry)> =
+            normalized.iter().map(|(k, v)| (k.as_str(), *v)).collect();
 
         self.write_tree_from_slice(&items)
     }
 
     /// Recursively partitions a sorted `(rel_path, &FileEntry)` slice by directory prefix
-    /// without allocating intermediate `BTreeMap`s or suffix `String`s.
+    /// without allocating intermediate `BTreeMap`s or suffix `String`s, rejecting leaf-vs-directory
+    /// name collisions at every level.
     fn write_tree_from_slice(&self, items: &[(&str, &FileEntry)]) -> CoreResult<ObjectId> {
         let mut nodes = Vec::new();
+        let mut seen_names: BTreeSet<&str> = BTreeSet::new();
         let mut idx = 0usize;
 
         while idx < items.len() {
             let (rel_path, entry) = items[idx];
 
             if let Some((dir_name, _rest)) = rel_path.split_once('/') {
+                if dir_name.is_empty() {
+                    return Err(CoreError::InvalidArgument(format!(
+                        "tree entry path '{rel_path}' contains empty directory segment"
+                    )));
+                }
+
+                if !seen_names.insert(dir_name) {
+                    return Err(CoreError::InvalidArgument(format!(
+                        "tree path collision on '{dir_name}': cannot store both a file and a directory"
+                    )));
+                }
+
                 let mut end = idx;
                 let mut sub_items = Vec::new();
 
@@ -1035,6 +1159,12 @@ impl GitBackend {
                 });
                 idx = end;
             } else {
+                if !seen_names.insert(rel_path) {
+                    return Err(CoreError::InvalidArgument(format!(
+                        "tree path collision on '{rel_path}': cannot store both a file and a directory"
+                    )));
+                }
+
                 nodes.push(GitTreeNode {
                     mode: entry.entry_mode(),
                     name: rel_path.to_string(),
@@ -1496,7 +1626,7 @@ impl GitBackend {
         } else {
             &self.common_git_dir
         };
-        let ref_path = base_dir.join(ref_name);
+        let ref_path = join_rel_segments(base_dir, ref_name);
 
         if ref_path.is_file() {
             let raw = fs::read_to_string(&ref_path).map_err(|source| CoreError::Io {
@@ -1578,7 +1708,7 @@ impl GitBackend {
     /// or [`CoreError::Io`] if writing the ref fails.
     pub fn update_ref(&self, ref_name: &str, commit_id: &ObjectId) -> CoreResult<()> {
         validate_ref_name(ref_name)?;
-        let ref_path = self.common_git_dir.join(ref_name);
+        let ref_path = join_rel_segments(&self.common_git_dir, ref_name);
         let content = format!("{}\n", commit_id.as_str());
         atomic_write_file(&ref_path, content.as_bytes())
     }
@@ -1591,7 +1721,7 @@ impl GitBackend {
         }
 
         let refs_root = self.common_git_dir.join("refs");
-        let ref_path = self.common_git_dir.join(ref_name);
+        let ref_path = join_rel_segments(&self.common_git_dir, ref_name);
         let _ = fs::remove_file(&ref_path);
 
         let mut parent_opt = ref_path.parent();
@@ -1949,7 +2079,7 @@ impl GitBackend {
             let expanded = if let Some(rest) = configured.strip_prefix("~/") {
                 std::env::var("HOME")
                     .or_else(|_| std::env::var("USERPROFILE"))
-                    .map(|h| PathBuf::from(h).join(rest))
+                    .map(|h| join_rel_segments(Path::new(&h), rest))
                     .unwrap_or_else(|_| PathBuf::from(&configured))
             } else {
                 PathBuf::from(&configured)
@@ -2423,7 +2553,7 @@ mod tests {
         git.update_ref("refs/remotes/origin/main", &initial)
             .expect("origin main");
         atomic_write_file(
-            &git.common_git_dir().join("refs/remotes/origin/HEAD"),
+            &join_rel_segments(git.common_git_dir(), "refs/remotes/origin/HEAD"),
             b"ref: refs/remotes/origin/main\n",
         )
         .expect("write origin/HEAD");
@@ -2508,5 +2638,156 @@ mod tests {
             discovered.resolve_head_commit().expect("resolve"),
             Some(head)
         );
+    }
+
+    #[test]
+    fn validate_tree_entry_name_rejects_ntfs_ads_and_colons() {
+        let dummy_tree =
+            ObjectId::from_hex("1111111111111111111111111111111111111111").expect("oid");
+
+        assert!(validate_tree_entry_name(&dummy_tree, "lib.rs").is_ok());
+        assert!(validate_tree_entry_name(&dummy_tree, ".git::$INDEX_ALLOCATION").is_err());
+        assert!(validate_tree_entry_name(&dummy_tree, ".git:$I30:$INDEX_ALLOCATION").is_err());
+        assert!(validate_tree_entry_name(&dummy_tree, ".tessera:stream").is_err());
+        assert!(validate_tree_entry_name(&dummy_tree, "git~1:stream").is_err());
+        assert!(validate_tree_entry_name(&dummy_tree, "file.txt:Zone.Identifier").is_err());
+    }
+
+    #[test]
+    fn discover_env_fallback_supports_relative_dot_and_canonical_sandbox_prefixes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo_dir = tmp.path().join("repo");
+        fs::create_dir_all(&repo_dir).expect("mkdir repo");
+        let repo_git = GitBackend::init_or_open(&repo_dir).expect("init repo");
+        fs::create_dir_all(repo_git.common_git_dir().join("tessera")).expect("mkdir tessera");
+
+        let ws_dir = tmp.path().join("external-ws");
+        let ws_sub = ws_dir.join("nested").join("pkg");
+        let outside_dir = tmp.path().join("outside");
+        fs::create_dir_all(&ws_sub).expect("mkdir ws_sub");
+        fs::create_dir_all(&outside_dir).expect("mkdir outside");
+
+        let repo_str = repo_dir.display().to_string();
+        let ws_str = ws_dir.display().to_string();
+        let ws_canon_str = ws_dir
+            .canonicalize()
+            .expect("canon ws")
+            .display()
+            .to_string();
+
+        let discovered_sub = GitBackend::discover_with_context(
+            Path::new("."),
+            Some(&ws_sub),
+            Some(&repo_str),
+            Some(&ws_str),
+        )
+        .expect("discover relative '.' inside TES_WORKSPACE");
+        assert_eq!(discovered_sub.repo_root(), repo_dir.as_path());
+
+        let discovered_canon = GitBackend::discover_with_context(
+            Path::new("."),
+            Some(&ws_dir),
+            Some(&repo_str),
+            Some(&ws_canon_str),
+        )
+        .expect("discover relative '.' with canonicalized TES_WORKSPACE");
+        assert_eq!(discovered_canon.repo_root(), repo_dir.as_path());
+
+        let outside_res = GitBackend::discover_with_context(
+            Path::new("."),
+            Some(&outside_dir),
+            Some(&repo_str),
+            Some(&ws_str),
+        );
+        assert!(matches!(outside_res, Err(CoreError::RepoNotFound(_))));
+
+        // Verify canonicalized sandbox paths inside `.tessera/workspaces` match non-canonical repo_root.
+        let sandbox_dir = repo_dir
+            .join(".tessera")
+            .join("workspaces")
+            .join("agent-alpha");
+        fs::create_dir_all(sandbox_dir.join(".tessera")).expect("mkdir sandbox .tessera");
+        fs::write(sandbox_dir.join(".tessera").join("repo_root"), &repo_str)
+            .expect("write repo_root");
+
+        let canon_sandbox = sandbox_dir.canonicalize().expect("canon sandbox");
+        assert_eq!(
+            is_valid_sandbox_repo_root(&canon_sandbox, Some(&repo_dir)),
+            Some(repo_dir.clone())
+        );
+
+        // Verify `.tessera/tmp` blocks an enclosing host `TES_WORKSPACE` while allowing a nested one.
+        let host_ws = tmp.path().join("host-sandbox");
+        let nested_tmp = host_ws.join(".tessera").join("tmp").join("job-1");
+        let nested_ws = nested_tmp.join("inner-ws");
+        let nested_sub = nested_ws.join("pkg");
+        fs::create_dir_all(&nested_sub).expect("mkdir nested_sub");
+
+        let host_ws_str = host_ws.display().to_string();
+        let nested_ws_str = nested_ws.display().to_string();
+
+        let blocked_host = GitBackend::discover_with_context(
+            Path::new("."),
+            Some(&nested_sub),
+            Some(&repo_str),
+            Some(&host_ws_str),
+        );
+        assert!(matches!(blocked_host, Err(CoreError::RepoNotFound(_))));
+
+        let allowed_nested = GitBackend::discover_with_context(
+            Path::new("."),
+            Some(&nested_sub),
+            Some(&repo_str),
+            Some(&nested_ws_str),
+        )
+        .expect("nested TES_WORKSPACE inside .tessera/tmp should resolve");
+        assert_eq!(allowed_nested.repo_root(), repo_dir.as_path());
+    }
+
+    #[test]
+    fn write_tree_from_map_rejects_empty_segments_and_leaf_directory_collisions() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let git = GitBackend::init_or_open(tmp.path()).expect("init git");
+        let blob = git.write_blob(b"hello\n").expect("write blob");
+
+        let mut empty_seg = BTreeMap::new();
+        empty_seg.insert("a//b".to_string(), FileEntry::regular(blob, false));
+        assert!(matches!(
+            git.write_tree_from_map(&empty_seg),
+            Err(CoreError::InvalidArgument(_))
+        ));
+
+        let mut dup_norm = BTreeMap::new();
+        dup_norm.insert("a/b".to_string(), FileEntry::regular(blob, false));
+        dup_norm.insert("./a/b".to_string(), FileEntry::regular(blob, false));
+        assert!(matches!(
+            git.write_tree_from_map(&dup_norm),
+            Err(CoreError::InvalidArgument(_))
+        ));
+
+        let mut direct_collision = BTreeMap::new();
+        direct_collision.insert("foo".to_string(), FileEntry::regular(blob, false));
+        direct_collision.insert("foo/bar".to_string(), FileEntry::regular(blob, false));
+        assert!(matches!(
+            git.write_tree_from_map(&direct_collision),
+            Err(CoreError::InvalidArgument(_))
+        ));
+
+        let mut non_adjacent_collision = BTreeMap::new();
+        non_adjacent_collision.insert("foo".to_string(), FileEntry::regular(blob, false));
+        non_adjacent_collision.insert("foo-extra".to_string(), FileEntry::regular(blob, false));
+        non_adjacent_collision.insert("foo/bar".to_string(), FileEntry::regular(blob, false));
+        assert!(matches!(
+            git.write_tree_from_map(&non_adjacent_collision),
+            Err(CoreError::InvalidArgument(_))
+        ));
+
+        let mut nested_collision = BTreeMap::new();
+        nested_collision.insert("a/b".to_string(), FileEntry::regular(blob, false));
+        nested_collision.insert("a/b/c".to_string(), FileEntry::regular(blob, false));
+        assert!(matches!(
+            git.write_tree_from_map(&nested_collision),
+            Err(CoreError::InvalidArgument(_))
+        ));
     }
 }
