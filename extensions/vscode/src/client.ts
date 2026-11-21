@@ -203,6 +203,65 @@ export interface StashEntry {
 }
 
 /**
+ * Options passed to `tes gc`.
+ */
+export interface GcOptions {
+  readonly dryRun?: boolean;
+  readonly keepMerged?: boolean;
+  readonly staleDays?: number;
+  readonly pruneCaches?: boolean;
+  readonly allRepos?: boolean;
+}
+
+/**
+ * Structured report returned by `tes gc --json`.
+ */
+export interface GcReport {
+  readonly dry_run: boolean;
+  readonly compacted_operations: number;
+  readonly pruned_sandboxes: readonly string[];
+  readonly pruned_merged_sandboxes?: readonly string[];
+  readonly pruned_stale_sandboxes?: readonly string[];
+  readonly pruned_verify_sandboxes?: readonly string[];
+  readonly pruned_agent_workspaces?: readonly string[];
+  readonly pruned_tmp_dirs?: readonly string[];
+  readonly pruned_sidecars: readonly string[];
+  readonly pruned_dead_leases: readonly string[];
+  readonly pruned_stat_caches?: number;
+  readonly pruned_locks?: number;
+  readonly pruned_session_slots?: number;
+  readonly pruned_stale_view_branches?: readonly string[];
+  readonly pruned_caches?: readonly string[];
+  readonly pruned_global_repos?: readonly string[];
+  readonly skipped_active_sandboxes: readonly string[];
+  readonly reclaimed_bytes?: number;
+}
+
+/**
+ * Individual diagnostic check entry returned inside `tes doctor --json`.
+ */
+export interface DoctorCheck {
+  readonly id: string;
+  readonly name: string;
+  readonly status: string;
+  readonly summary: string;
+  readonly details?: Readonly<Record<string, unknown>>;
+}
+
+/**
+ * Structured diagnostic report returned by `tes doctor --json`.
+ */
+export interface DoctorReport {
+  readonly ok: boolean;
+  readonly summary: {
+    readonly pass: number;
+    readonly warn: number;
+    readonly fail: number;
+  };
+  readonly checks: readonly DoctorCheck[];
+}
+
+/**
  * Combined repository snapshot used by all visual views and webviews.
  */
 export interface WorkspaceStateSnapshot {
@@ -531,7 +590,8 @@ export function resolveRepoRoot(workspaceFolderPath: string): string {
           normalizedCurr.includes("/tessera/workspaces/") ||
           normalizedCurr.includes("/tessera-workspaces") ||
           normalizedCurr.includes("/.git/tessera/") ||
-          normalizedCurr.includes("/.tessera/workspaces/");
+          normalizedCurr.includes("/.tessera/workspaces/") ||
+          normalizedCurr.includes("/.tessera/sandboxes/");
 
         if (
           isSandboxPath &&
@@ -1242,6 +1302,69 @@ export class CliClient {
     }
 
     await this.runRaw(["restore", "-b", trimmed, "."]);
+  }
+
+  /**
+   * Executes `tes gc --json` to compact ephemeral operations and prune orphaned or stale
+   * sandboxes, caches, and dead port leases.
+   *
+   * Error conditions: Throws `Error` if `tes` exits non-zero, times out, or returns invalid JSON.
+   *
+   * @param options Optional garbage collection mode flags (`dryRun`, `keepMerged`, `staleDays`, `pruneCaches`, `allRepos`).
+   * @returns The structured `GcReport` returned by the CLI.
+   */
+  public async runGc(options?: GcOptions): Promise<GcReport> {
+    const args: string[] = ["gc"];
+
+    if (options?.dryRun) {
+      args.push("--dry-run");
+    }
+
+    if (options?.keepMerged) {
+      args.push("--keep-merged");
+    }
+
+    if (
+      options?.staleDays !== undefined &&
+      Number.isInteger(options.staleDays) &&
+      options.staleDays >= 0
+    ) {
+      args.push("--stale", String(options.staleDays));
+    }
+
+    if (options?.pruneCaches) {
+      args.push("--prune-caches");
+    }
+
+    if (options?.allRepos) {
+      args.push("--all");
+    }
+
+    return this.runJson<GcReport>(args, undefined, LONG_OPERATION_TIMEOUT_MS);
+  }
+
+  /**
+   * Executes `tes doctor --json` and returns the structured diagnostic report, preserving
+   * valid JSON output even when `tes doctor` exits with status 1 due to failing health checks.
+   *
+   * Error conditions: Throws `Error` if spawning fails or output is not valid diagnostic JSON.
+   *
+   * @returns The parsed `DoctorReport`.
+   */
+  public async runDoctor(): Promise<DoctorReport> {
+    try {
+      return await this.runJson<DoctorReport>(["doctor"]);
+    } catch (err: unknown) {
+      if (typeof err === "object" && err !== null && "stdout" in err) {
+        const stdout = (err as { readonly stdout?: unknown }).stdout;
+
+        if (typeof stdout === "string" && stdout.trim().startsWith("{")) {
+          return JSON.parse(stdout) as DoctorReport;
+        }
+      }
+
+      throw err;
+    }
   }
 
   /**
