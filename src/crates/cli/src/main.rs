@@ -10,6 +10,9 @@ pub mod doctor;
 pub mod env_hooks;
 pub mod mcp;
 pub mod output;
+pub mod upgrade;
+
+use std::ffi::OsString;
 
 use args::{Cli, Commands};
 use commands::branch::{BranchArgs, SwitchArgs, run_branch, run_switch};
@@ -26,6 +29,44 @@ use commands::push_pull::{PushArgs, run_pull, run_push};
 use doctor::run_doctor;
 use env_hooks::{EnvOptions, run_env};
 use output::CliContext;
+use upgrade::{UpgradeOptions, cleanup_stale_windows_backup, run_upgrade};
+
+/// Rewrites top-level `--upgrade` / `--update` shorthand flags (before any subcommand) into the
+/// `upgrade` subcommand while leaving post-subcommand flags like `tes add --update` untouched.
+pub(crate) fn normalize_cli_args<I>(args: I) -> Vec<OsString>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut out: Vec<OsString> = args.into_iter().collect();
+    let mut i = 1usize;
+
+    while i < out.len() {
+        let Some(token) = out[i].to_str() else {
+            break;
+        };
+
+        if matches!(token, "--json" | "-P" | "--no-pager" | "--paginate")
+            || token.starts_with("--repo=")
+            || (token.starts_with("-C") && token.len() > 2)
+        {
+            i += 1;
+            continue;
+        }
+
+        if matches!(token, "-C" | "--repo") {
+            i += 2;
+            continue;
+        }
+
+        if matches!(token, "--upgrade" | "--update") {
+            out[i] = OsString::from("upgrade");
+        }
+
+        break;
+    }
+
+    out
+}
 
 /// Entrypoint for the `tes` CLI and built-in MCP server.
 fn main() -> anyhow::Result<()> {
@@ -44,7 +85,9 @@ fn main() -> anyhow::Result<()> {
 
 /// Executes the parsed `tes` CLI command or built-in MCP server.
 fn run_cli() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    cleanup_stale_windows_backup();
+
+    let cli = Cli::parse_from(normalize_cli_args(std::env::args_os()));
     let cwd = match &cli.repo {
         Some(p) => p.clone(),
         None => std::env::current_dir()?,
@@ -64,6 +107,18 @@ fn run_cli() -> anyhow::Result<()> {
             local,
         } => run_init(&ctx, path, branch, harness, local),
         Commands::Doctor => run_doctor(&ctx.cwd, ctx.json, ctx.no_pager, ctx.paginate),
+        Commands::Upgrade {
+            check,
+            version,
+            force,
+        } => run_upgrade(
+            &ctx,
+            UpgradeOptions {
+                check,
+                version,
+                force,
+            },
+        ),
         Commands::Status {
             short,
             porcelain,
@@ -370,11 +425,62 @@ mod tests {
     use crate::args::{AgentCommands, Cli, Commands, StashCommands};
     use crate::commands::branch::glob_matches;
     use crate::commands::ops::extract_hook_file_paths;
+    use crate::normalize_cli_args;
     use crate::output::{resolve_pager_command, resolve_user_pathspecs};
 
     #[test]
     fn clap_command_tree_passes_debug_assert() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn upgrade_subcommand_aliases_and_shorthand_flags_parse() {
+        let to_os = |slice: &[&str]| {
+            slice
+                .iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>()
+        };
+
+        for args in [
+            &["tes", "upgrade", "--check"][..],
+            &["tes", "update", "--check"][..],
+            &["tes", "self-update", "--check"][..],
+            &["tes", "--upgrade", "--check"][..],
+            &["tes", "--update", "--check"][..],
+            &["tes", "--json", "--upgrade", "--check"][..],
+        ] {
+            let parsed = Cli::try_parse_from(normalize_cli_args(to_os(args))).unwrap();
+            assert!(matches!(
+                parsed.command,
+                Commands::Upgrade {
+                    check: true,
+                    version: None,
+                    force: false
+                }
+            ));
+        }
+
+        let pinned = Cli::try_parse_from(normalize_cli_args(to_os(&[
+            "tes",
+            "--update",
+            "--version",
+            "0.0.3",
+            "--force",
+        ])))
+        .unwrap();
+        assert!(matches!(
+            pinned.command,
+            Commands::Upgrade {
+                check: false,
+                version: Some(ref v),
+                force: true
+            } if v == "0.0.3"
+        ));
+
+        // Post-subcommand `--update` flags must not be rewritten into `upgrade`.
+        let passthrough = normalize_cli_args(to_os(&["tes", "add", "--update"]));
+        assert_eq!(passthrough, to_os(&["tes", "add", "--update"]));
     }
 
     #[test]

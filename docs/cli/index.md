@@ -34,6 +34,7 @@ The `tes` CLI provides commands for initializing repositories, coordinating mult
 | [tes agent](/cli/agent) (`session`) | Spawn, list, focus (`tes session focus <id>`), exec, close, or clear sessions |
 | [tes config](/cli/config) | View or update repository configuration settings and trust (`tessera.toml`) |
 | [tes doctor](/cli/doctor) | Run repository health, config trust, filesystem CoW, hook, and session diagnostics |
+| [tes upgrade](/cli/upgrade) (`update`) | Check for (`--check`) or install the latest Tessera CLI release in place with SHA-256 verification |
 | [tes mcp](/cli/mcp) | Start the built-in Model Context Protocol (MCP) JSON-RPC 2.0 server over `stdio` |
 
 ---
