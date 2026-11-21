@@ -1,6 +1,6 @@
 # Sandboxes
 
-Tessera creates Copy-on-Write branch sandboxes that reuse your existing dependencies, preserve your untracked `.env*` secrets and `.gitignore`d files, and assign each branch its own port (`localhost:3100`, `localhost:3200`) and local database slot.
+Tessera creates Copy-on-Write branch sandboxes that reuse your existing dependencies, preserve your untracked `.env*` secrets and `.gitignore`d files, assign each branch its own `TES_PORT` slot (`3100`, `3200`; enable full dev-server `PORT` isolation via `tes config set port_isolation true`, which defaults to `false`), and isolate locally configured test database URLs.
 
 ## Running Commands
 
@@ -78,29 +78,41 @@ When `tes exec` runs:
 
 ## Dependency Caches
 
-Tessera clones and synchronizes dependency and build caches across major ecosystems:
+Tessera clones and synchronizes default dependency and build caches across major ecosystems (`cow_cache_dirs`):
 
-| Ecosystem | Cached Directories |
-|-----------|--------------------|
-| **JavaScript / TypeScript** | `node_modules`, `.pnpm-store`, `.next`, `.nuxt`, `.svelte-kit`, `.turbo`, `.parcel-cache`, `.vite` |
-| **Rust** | `target` (plus shared `CARGO_TARGET_DIR` support) |
-| **Python** | `.venv`, `venv`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `.tox` |
-| **Go / PHP / Ruby** | `vendor`, `.bundle` |
+| Ecosystem | Default Cached Directories |
+|-----------|----------------------------|
+| **JavaScript / TypeScript** | `node_modules`, `.pnpm-store`, `.turbo`, `.next`, `.nuxt`, `.svelte-kit`, `dist`, `build` |
+| **Rust** | `target` (plus `CARGO_TARGET_DIR` when `Cargo.toml` is present) |
+| **Python** | `.venv`, `venv`, `__pycache__`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache` |
+| **Go / PHP / Ruby** | `vendor` |
 | **Elixir / Erlang** | `_build`, `deps` |
-| **JVM / Swift / C++** | `.gradle`, `build`, `.build`, `cmake-build-debug`, `cmake-build-release` |
-| **Zig / .NET / Dart** | `.zig-cache`, `zig-out`, `bin`, `obj`, `.dart_tool` |
+| **JVM / Swift / C++** | `.gradle`, `.build`, `cmake-build-debug`, `cmake-build-release` |
+| **Zig / Dart** | `.zig-cache`, `zig-out`, `.dart_tool` |
+
+To add extra project-specific cache folders (such as `.nx`, `.vite`, or `.tox`), run `tes config add-cache-dir <dir...>`.
 
 > **Tip:** If you run `npm install` in your project root *after* a branch sandbox was already created, Tessera syncs the newly installed `node_modules` into the branch sandbox on the next `tes exec` run.
 
-## Environment Variables
+## Environment Variables and Database Isolation
 
 Each session slot (`1`, `2`, `3`, ...) receives non-overlapping environment variables:
 
 | Variable | Slot 1 | Slot 2 | Description |
 |----------|--------|--------|-------------|
-| `TES_PORT` (`PORT` when `port_isolation = true`) | `3100` | `3200` | Calculated as `base_port + (slot * port_stride)` |
+| `TES_PORT` | `3100` | `3200` | Always exported; calculated as `base_port + (slot * port_stride)` |
+| `PORT` (plus framework vars) | `3100` | `3200` | Exported when `port_isolation = true` or `TES_PORT_ISOLATION=1` (defaults to `false`) |
 | `TES_BRANCH` | `feat/pricing` | `feat/faq` | Target branch name for the session |
-| `TES_DB_NAME` | `tessera_slot_1` | `tessera_slot_2` | Isolated database name for integration tests |
-| `DATABASE_URL` | `sqlite:///.../tessera_slot_1.db` | `sqlite:///.../tessera_slot_2.db` | Isolated database connection URL |
+| `TES_DB_NAME` | `test_slot_1` | `test_slot_2` | Isolated database name identifier for integration tests |
+| `DATABASE_URL` / `TEST_DATABASE_URL` | `.../<db>_slot_1` | `.../<db>_slot_2` | Suffixed only when a local network database URL is already configured |
 
-To customize `base_port`, `port_stride`, `port_isolation`, or custom environment variable templates, see the [Configuration Guide](/guides/configuration).
+### How `DATABASE_URL` Isolation Works
+
+Tessera does **not** fabricate a fake `DATABASE_URL` or SQLite URL when none is configured:
+
+- **Local network databases**: If `DATABASE_URL` or `TEST_DATABASE_URL` is set in the environment or in `.env.development.local`, `.env.local`, `.env.development`, or `.env` and points to a local database host (`localhost`, `127.0.0.1`, `[::1]`, `0.0.0.0`, `host.docker.internal`, or `*.localhost`), Tessera appends `_slot_<N>` to the database name (for example, `postgres://localhost:5432/myapp` becomes `postgres://localhost:5432/myapp_slot_1`), preserving query parameters and fragments and avoiding double-suffixing.
+- **SQLite, file-based, and remote/cloud databases**: File-based URLs (`sqlite:`, `sqlite3:`, `sqlite+*:`, `file:`, `duckdb:`, `*.db`, `*.sqlite*`, `:memory:`), Redis/HTTP/WebSocket URLs, and remote or cloud database URLs (such as Neon, Supabase, or RDS) are left completely untouched.
+
+> **Platform Note:** Environment variable isolation works across macOS, Linux, BSD, and Windows. Executable CLI port-wrapper shims (`TES_SHIM_BIN`, used when `port_isolation = true`) are POSIX-only (macOS, Linux, BSD, and WSL).
+
+To customize `base_port`, `port_stride`, `port_isolation`, `cow_cache_dirs`, or custom environment variable templates, see the [Configuration Guide](/guides/configuration).

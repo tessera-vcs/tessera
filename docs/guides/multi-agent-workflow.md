@@ -36,6 +36,8 @@ When two agents work on the **same branch** (for example, both editing on `main`
 - **Vue and Svelte Components**: Concurrent edits to `<script setup>`, `<template>`, and `<style scoped>` blocks merge cleanly.
 - **Manifests and Lockfiles**: Concurrent additions to `package.json`, `Cargo.toml`, and `Cargo.lock` are merged structurally.
 
+> **Dirty Claim Auto-Isolation (`auto_isolate_dirty_claims`):** By default (`auto_isolate_dirty_claims = true`), if a fresh session runs `tes claim` *without* `--branch` on a file that already has uncommitted changes from you or another session, Tessera automatically isolates that new session onto `agent/<session_id>` so it does not mix edits into in-progress work. To collaborate directly on the same branch, pass `--branch <branch>` explicitly (for example, `tes claim --branch main --intent "..." src/currency.ts`), or disable auto-isolation with `tes config set auto_isolate_dirty_claims false`.
+
 ### Separate Branches
 
 When you ask Agent 1 to work on `feat/pricing` and Agent 2 to work on `feat/faq`, both agents may touch shared files like `src/App.vue` or `index.html` at the same time.

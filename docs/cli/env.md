@@ -22,7 +22,22 @@ tes env [options]
 
 ## Description
 
-The `env` command configures your shell so each terminal tab displays its active Tessera branch (`(tes:<branch>)`) in the prompt, enables `<TAB>` completion for subcommands, branches, and checkpoints, and routes commands in switched terminals to the active branch's Copy-on-Write sandbox.
+The `env` command configures your shell so each terminal tab displays its active Tessera branch (`(tes:<branch>)`) in the prompt, syncs session environment variables (`TES_BRANCH`, `TES_PORT`, `TES_WORKSPACE`, `TES_REPO_ROOT`, plus `PORT` and framework port variables when `port_isolation = true`), and enables dynamic `<TAB>` completion and automatic sandbox command routing where supported by the shell.
+
+### Per-Shell Capabilities
+
+| Shell | Prompt & Env Sync | Dynamic `<TAB>` Completion | Automatic Branch Sandbox Command Routing |
+| ----- | ----------------- | -------------------------- | ---------------------------------------- |
+| **Zsh** (`--zsh`) | Yes | Yes | Yes (`preexec` / `precmd`) |
+| **Bash** (`--bash`) | Yes | Yes | Yes (`DEBUG` trap / `PROMPT_COMMAND`) |
+| **Fish** (`--fish`) | Yes | Yes | Yes (`fish_preexec` / `fish_prompt`) |
+| **PowerShell** (`--pwsh`) | Yes | Yes | No (use `tes exec [-b <branch>] -- <cmd>`) |
+| **POSIX `sh` / `dash` / `ksh` / `mksh` / `oksh` / `yash`** (`--sh`) | Yes | No | No (use `tes exec [-b <branch>] -- <cmd>`) |
+| **`tcsh` / BSD `csh`** (`--tcsh`) | Yes | No | No (use `tes exec [-b <branch>] -- <cmd>`) |
+| **Nushell** (`--nu`) | Yes | No | No (use `tes exec [-b <branch>] -- <cmd>`) |
+| **Elvish** (`--elvish`) | Yes | No | No (use `tes exec [-b <branch>] -- <cmd>`) |
+
+> **Platform Note:** Environment variable syncing (`TES_BRANCH`, `TES_PORT`, and `PORT` when `port_isolation = true`) works cross-platform across macOS, Linux, BSD, and Windows. Executable CLI port-wrapper shims (`TES_SHIM_BIN`) are POSIX-only (macOS, Linux, BSD, and WSL).
 
 Even without `tes env` installed in your shell profile, Tessera automatically isolates terminal tabs across macOS, Linux, FreeBSD, OpenBSD, and Windows using terminal session environment variables (`TERM_SESSION_ID`, `ITERM_SESSION_ID`, `TMUX_PANE`, `ZELLIJ_PANE_ID`, `WEZTERM_PANE`, `KITTY_WINDOW_ID`, `GHOSTTY_SURFACE_ID`, `ALACRITTY_WINDOW_ID`, `GNOME_TERMINAL_SCREEN`, `KONSOLE_DBUS_SESSION`, `TILIX_ID`, `WT_SESSION`), POSIX session leader (`getsid(0)`), and Windows console/process tree tracking.
 

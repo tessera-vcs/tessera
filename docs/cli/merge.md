@@ -13,6 +13,7 @@ tes merge [branches_or_sessions...] [options]
 - `--into <BRANCH>` - Target branch to merge into (defaults to the active session's branch or `main`).
 - `-m, --message <MSG>` - Commit message for the merge commit.
 - `--verify <CMD>` - Verification command to run before finalizing the merge.
+- `--dry-run` - Preview the full semantic merge in memory (reporting files that would change and any conflicts that would occur) without advancing branch refs, modifying working-tree files, or recording an operation log entry.
 - `--keep-open` - Keep agent sessions open after merging.
 - `--co-author [=<NAME <EMAIL>>]` - Append a `Co-authored-by:` trailer to the merge commit (defaults to configured `co_author_trailer` when passed without a value; repeatable).
 - `--no-co-author` - Omit `Co-authored-by:` trailers even if `co_author = true` in repository config.
@@ -31,6 +32,9 @@ Merge commits record your active Git/system user as the commit `Author` (or `--a
 ```bash:no-line-numbers
 # commit the current session onto its target branch
 tes merge -m "feat(pricing): add pricing calculator"
+
+# preview a multi-branch merge without mutating refs or the working tree
+tes merge feat/pricing feat/faq --into main --dry-run
 
 # merge two feature branches into main
 tes merge feat/pricing feat/faq --into main -m "feat: add pricing and faq"

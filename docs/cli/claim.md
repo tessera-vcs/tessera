@@ -21,6 +21,8 @@ AI agents run `tes claim` before modifying files. The command records the starti
 
 If `--branch` does not exist yet and `--from <base-branch>` is passed, Tessera forks the new branch from `<base-branch>` and stages the base branch's baseline for claimed files so IDE tools read and edit the parent branch's state.
 
+When `--branch` is omitted and any claimed file already has uncommitted changes from the user or another session, Tessera automatically isolates the fresh session onto `agent/<session_id>` (controlled by `auto_isolate_dirty_claims = true` by default). Pass `--branch <branch>` explicitly (for example, `tes claim --branch main ...`) when same-branch collaboration is intended, or disable auto-isolation via `tes config set auto_isolate_dirty_claims false`.
+
 ## Examples
 
 ```bash:no-line-numbers

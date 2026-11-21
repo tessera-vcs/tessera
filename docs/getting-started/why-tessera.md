@@ -20,15 +20,15 @@ Tessera lets multiple AI agents and terminal tabs work in the **same repository 
 
 When an agent claims a branch like `feat/pricing`, Tessera isolates that session inside `.git/tessera/` without changing `.git/HEAD` for the rest of your workspace. Concurrent agents can edit `src/App.vue` on their own branches in `~/acme-web` at the same time without touching each other's uncommitted files.
 
-When you want to build, test, or preview a branch, `tes exec -b feat/pricing -- npm run dev` executes inside a Copy-on-Write sandbox. It clones your existing `node_modules`, `target`, or `.venv` directories (including monorepo workspace symlinks), preserves your untracked `.env*` secrets and `.gitignore`d local files (such as local SQLite databases or `.dev.vars`), and assigns each branch its own port (`localhost:3100`, `localhost:3200`) and local database slot so you can run multiple branches side by side.
+When you want to build, test, or preview a branch, `tes exec -b feat/pricing -- npm run dev` executes inside a Copy-on-Write sandbox. It clones your existing `node_modules`, `target`, or `.venv` directories (including monorepo workspace symlinks), preserves your untracked `.env*` secrets and `.gitignore`d local files (such as local SQLite databases or `.dev.vars`), assigns each branch its own `TES_PORT` slot (`3100`, `3200`; enable full dev-server `PORT` isolation and POSIX port shims with `tes config set port_isolation true`, which defaults to `false`), and isolates locally configured `DATABASE_URL` / `TEST_DATABASE_URL` database names with `_slot_<N>` so you can run multiple branches side by side.
 
 ## Structural Merging Across Code, Configs, and Lockfiles
 
-When you run `tes merge feat/pricing feat/faq --into main`, Tessera merges changes at the syntax-tree level rather than line by line:
+When you run `tes merge feat/pricing feat/faq --into main`, Tessera merges changes using language-aware parsers and format-preserving drivers with fail-safe fallbacks:
 
-- **Source code**: Parses modules with Tree-sitter to merge functions, class methods, imports, and JSX/Vue templates.
-- **Manifests and lockfiles**: Merges JSON, TOML, `Cargo.lock`, `pnpm-lock.yaml`, `yarn.lock`, and `poetry.lock` blocks by key and stanza.
-- **Universal block structure**: Recognizes braced blocks (`{ ... }`), HTML/XML tags, indentation-scoped blocks (YAML, Python), keyword-delimited blocks (`def ... end`, `if ... fi`), and `[section]` stanzas so compatible additions merge across any language or configuration format.
+- **Tree-sitter AST merging (6 grammars + SFCs)**: Uses Tree-sitter grammars for **Rust** (`.rs`), **TypeScript** (`.ts`, `.mts`, `.cts`), **TSX** (`.tsx`), **JavaScript / JSX** (`.js`, `.jsx`, `.mjs`, `.cjs`), **Python** (`.py`, `.pyi`), and **Go** (`.go`), plus `<script>` blocks in **Vue** and **Svelte** single-file components (SFCs), to merge functions, class and `impl` methods, imports, and signatures structurally.
+- **Format-preserving manifest and lockfile drivers**: Structurally merges `Cargo.toml`, `Cargo.lock`, `*.toml`, and `*.json` (including `package.json`) by key and stanza while preserving formatting and flagging conflicting scalar values cleanly.
+- **Fail-safe fallback and binary/symlink/submodule safety**: Other languages and text formats fall back to structural and strict line 3-way diff3 merging. Binary files, tracked symbolic links (`120000`), and Git submodule gitlinks (`160000`) are never text-merged blindly and instead preserve modes or record first-class conflicts when both sides diverge.
 
 ## Editing on the Same Branch
 

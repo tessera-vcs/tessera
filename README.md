@@ -35,11 +35,14 @@ tes init
 tes env --install
 ```
 
-`tes init` sets up `.git/tessera` and installs rules for your AI coding editor so agents coordinate automatically. `tes env --install` adds `(tes:<branch>)` to your shell prompt.
+`tes init` sets up `.git/tessera`, installs Git sync hooks (`.git/hooks/post-commit`, `post-merge`, and `post-checkout`), and installs AI editor rules (Antigravity by default, plus auto-detected Claude Code, Cursor, Windsurf, Kiro, OpenCode, Codex, and VS Code, or specify `--harness all|<list>`). Pass `tes init --local` on mixed teams to add installed rule files to `.git/info/exclude`. `tes env --install` adds `(tes:<branch>)` to your shell prompt.
 
 ### 3. Work Across Branches
 
 ```bash
+# Optional: enable automatic dev-server port isolation (defaults to false)
+tes config set port_isolation true
+
 # Terminal 1: switch to feat/pricing and run tests
 tes switch feat/pricing
 npm test
@@ -53,6 +56,8 @@ npm run dev
 # Merge both branches into main when done
 tes merge feat/pricing feat/faq --into main -m "feat: add pricing and faq"
 ```
+
+> **Note:** `port_isolation` defaults to `false`. Enable it with `tes config set port_isolation true` (or `TES_PORT_ISOLATION=1`) whenever you run concurrent dev servers on separate branches.
 
 ## Documentation
 
@@ -80,7 +85,7 @@ npm --prefix docs run docs:build   # Build static documentation site
 
 Tessera is organized into three main workspaces:
 
-- [`src/`](./src) - Rust workspace containing the `tes` CLI (`crates/cli`) and core libraries (`crates/core`, `crates/git-backend`, `crates/oplog`, `crates/merge`, `crates/workspace`, `crates/agent`, `crates/mcp`).
+- [`src/`](./src) - Rust workspace containing the 5 crates: `crates/core` (Git backend, models, lock-free operation log), `crates/merge` (Tree-sitter AST merging and manifest drivers), `crates/workspace` (Copy-on-Write sandboxes and environment isolation), `crates/agent` (session coordinator, hooks, and watchers), and `crates/cli` (the `tes` CLI and built-in MCP server).
 - [`extensions/vscode/`](./extensions/vscode) - Extension for VS Code and VS Code-based editors (Antigravity, Cursor, Windsurf, Kiro, VSCodium) providing live branch switching, multi-agent line attribution, 2D Branch Graph, and conflict resolution.
 - [`docs/`](./docs) - VitePress documentation site and machine-readable agent bundles (`agents.txt`, `llms.txt`, `llms-full.txt`).
 

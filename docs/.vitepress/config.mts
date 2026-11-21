@@ -118,8 +118,9 @@ const HOME_WORK_IN_PARALLEL_MARKDOWN = [
   '### 2. Per-Terminal Branches',
   '',
   '```bash',
-  '# Enable (tes:<branch>) in your shell prompt',
+  '# Enable (tes:<branch>) in your shell prompt and opt into dev-server port isolation',
   'tes env --install',
+  'tes config set port_isolation true',
   '',
   '# Terminal 1: run feat/pricing on port 3100',
   'tes switch feat/pricing',
@@ -170,6 +171,7 @@ function toAgentMarkdown(rawMd: string, relativePath: string): string {
 
 const ORDERED_DOC_PATHS = [
   'index.md',
+  'tldr.md',
   'getting-started/index.md',
   'getting-started/why-tessera.md',
   'getting-started/installation.md',
@@ -206,8 +208,15 @@ const ORDERED_DOC_PATHS = [
   'cli/resolve.md',
   'cli/checkpoint.md',
   'cli/restore.md',
+  'cli/oplog.md',
   'cli/undo.md',
-  'cli/config.md'
+  'cli/sync.md',
+  'cli/gc.md',
+  'cli/watch.md',
+  'cli/agent.md',
+  'cli/config.md',
+  'cli/doctor.md',
+  'cli/mcp.md'
 ]
 
 /**
@@ -259,24 +268,51 @@ export default defineConfig({
       {
         name: 'raw-static-files',
         configureServer(server) {
+          const publicDir = path.resolve(docsRoot, 'public')
+
           server.middlewares.use((req, res, next) => {
             if (!req.url || (req.method !== 'GET' && req.method !== 'HEAD')) {
               next()
               return
             }
 
-            const pathname = decodeURIComponent(req.url.split('?')[0])
+            let pathname: string
+
+            try {
+              pathname = decodeURIComponent(req.url.split('?')[0])
+            } catch {
+              res.statusCode = 400
+              res.end('Bad Request')
+              return
+            }
+
+            if (pathname.includes('\0')) {
+              res.statusCode = 400
+              res.end('Bad Request')
+              return
+            }
 
             if (/\.(txt|sh|ps1)$/i.test(pathname)) {
-              const publicFile = path.join(docsRoot, 'public', pathname.replace(/^\/+/, ''))
+              const relativePath = pathname.replace(/^\/+/, '')
+              const candidatePath = path.resolve(publicDir, relativePath)
+              const withinPublicDir =
+                candidatePath !== publicDir && candidatePath.startsWith(publicDir + path.sep)
 
-              if (fs.existsSync(publicFile) && fs.statSync(publicFile).isFile()) {
-                const body = fs.readFileSync(publicFile, 'utf-8')
-                res.statusCode = 200
-                res.setHeader('Content-Type', 'text/plain; charset=utf-8')
-                res.setHeader('Cache-Control', 'no-cache')
-                res.end(req.method === 'HEAD' ? undefined : body)
-                return
+              if (withinPublicDir && fs.existsSync(candidatePath)) {
+                const realPublicDir = fs.realpathSync(publicDir)
+                const realCandidate = fs.realpathSync(candidatePath)
+
+                if (
+                  realCandidate.startsWith(realPublicDir + path.sep) &&
+                  fs.statSync(realCandidate).isFile()
+                ) {
+                  const body = fs.readFileSync(realCandidate, 'utf-8')
+                  res.statusCode = 200
+                  res.setHeader('Content-Type', 'text/plain; charset=utf-8')
+                  res.setHeader('Cache-Control', 'no-cache')
+                  res.end(req.method === 'HEAD' ? undefined : body)
+                  return
+                }
               }
             }
 
@@ -315,7 +351,7 @@ export default defineConfig({
   },
 
   buildEnd(siteConfig) {
-    for (const relPath of [...ORDERED_DOC_PATHS, 'tldr.md']) {
+    for (const relPath of ORDERED_DOC_PATHS) {
       const absPath = path.join(docsRoot, relPath)
 
       if (!fs.existsSync(absPath)) {
@@ -412,8 +448,15 @@ export default defineConfig({
             { text: 'tes resolve', link: '/cli/resolve' },
             { text: 'tes checkpoint', link: '/cli/checkpoint' },
             { text: 'tes restore', link: '/cli/restore' },
+            { text: 'tes oplog', link: '/cli/oplog' },
             { text: 'tes undo', link: '/cli/undo' },
-            { text: 'tes config', link: '/cli/config' }
+            { text: 'tes sync', link: '/cli/sync' },
+            { text: 'tes gc', link: '/cli/gc' },
+            { text: 'tes watch', link: '/cli/watch' },
+            { text: 'tes agent', link: '/cli/agent' },
+            { text: 'tes config', link: '/cli/config' },
+            { text: 'tes doctor', link: '/cli/doctor' },
+            { text: 'tes mcp', link: '/cli/mcp' }
           ]
         }
       ],

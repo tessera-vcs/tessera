@@ -70,7 +70,23 @@ Run `tes env --install` once to configure your shell profiles (`~/.zshrc`, `~/.b
 tes env --install
 ```
 
-Open a new terminal tab (or reload your shell profile) to activate the prompt indicator and `<TAB>` auto-completion for branch names, commit SHAs, and checkpoints.
+Open a new terminal tab (or reload your shell profile) to activate the prompt indicator, environment variable sync, and tab completion.
+
+### Shell Capabilities
+
+| Shell | Prompt & Env Sync | Dynamic `<TAB>` Completion | Automatic Branch Sandbox Command Routing |
+| ----- | ----------------- | -------------------------- | ---------------------------------------- |
+| **Zsh** (`--zsh`) | Yes | Yes | Yes (`preexec` / `precmd`) |
+| **Bash** (`--bash`) | Yes | Yes | Yes (`DEBUG` trap / `PROMPT_COMMAND`) |
+| **Fish** (`--fish`) | Yes | Yes | Yes (`fish_preexec` / `fish_prompt`) |
+| **PowerShell** (`--pwsh`) | Yes | Yes | Use `tes exec [-b <branch>] -- <cmd>` |
+| **POSIX `sh` / `dash` / `ksh` / `mksh` / `oksh` / `yash`** (`--sh`) | Yes | No | Use `tes exec [-b <branch>] -- <cmd>` |
+| **`tcsh` / BSD `csh`** (`--tcsh`) | Yes | No | Use `tes exec [-b <branch>] -- <cmd>` |
+| **Nushell** (`--nu`) | Yes | No | Use `tes exec [-b <branch>] -- <cmd>` |
+| **Elvish** (`--elvish`) | Yes | No | Use `tes exec [-b <branch>] -- <cmd>` |
+
+> [!INFO]
+> Environment variables (`TES_PORT`, `PORT` when `port_isolation = true`, `TES_BRANCH`, `TES_DB_NAME`, and locally configured `DATABASE_URL`) work cross-platform across macOS, Linux, BSD, and Windows. Executable CLI port-wrapper shims (`TES_SHIM_BIN`) are POSIX-only (macOS, Linux, BSD, and WSL).
 
 ### Manual Shell Setup
 
@@ -133,7 +149,7 @@ Inside any project directory, run:
 tes init
 ```
 
-By default, `tes init` auto-detects which AI coding tools you use and generates their instruction files and hooks. To target a specific editor, pass `--harness`:
+By default, `tes init` installs `.agents/rules/tessera.md` (Antigravity), Git sync hooks (`.git/hooks/post-commit`, `post-merge`, and `post-checkout`), and auto-detected integrations for Claude Code, Cursor, Windsurf, Kiro, OpenCode, Codex, and VS Code when their repository files or environment variables are present. To target specific editors or install all of them, pass `--harness`:
 
 ```bash:no-line-numbers
 tes init --harness antigravity
@@ -145,6 +161,13 @@ tes init --harness opencode
 tes init --harness codex
 tes init --harness vscode
 tes init --harness all
+```
+
+On mixed teams where not every contributor uses Tessera, pass `--local` so installed agent rule and harness files are added to `.git/info/exclude` instead of appearing as untracked files in `git status`:
+
+```bash:no-line-numbers
+tes init --local
+tes init --local --harness claude,cursor
 ```
 
 ## Uninstalling Tessera

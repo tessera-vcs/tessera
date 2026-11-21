@@ -24,10 +24,12 @@ Open two AI agent tabs and give both a prompt that modifies `formatCurrency`:
 
 ## How It Works
 
-1. Both agents claim `src/currency.ts` against the same starting commit on `main`.
+1. Both agents claim `src/currency.ts` against the same starting commit on `main` using `--branch main` (`tes claim --branch main --intent "..." src/currency.ts`).
 2. Agent 1 writes its edit and runs `tes hook post-tool --path src/currency.ts`.
 3. Agent 2 writes its edit and runs `tes hook post-tool --path src/currency.ts`.
 4. Tessera parses the base version and both agents' versions using Tree-sitter and merges the parameter list and function body automatically.
+
+> **Note:** Because `auto_isolate_dirty_claims` defaults to `true`, omitting `--branch` on `tes claim` when `src/currency.ts` already has uncommitted edits automatically isolates the second session onto `agent/<session_id>`. Passing `--branch main` explicitly opts into same-branch collaboration (or set `auto_isolate_dirty_claims = false` in `tessera.toml` / via `tes config set auto_isolate_dirty_claims false`).
 
 ## Merged Result
 

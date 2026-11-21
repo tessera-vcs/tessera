@@ -28,7 +28,7 @@ tes switch feat/pricing-tiers --from feat/pricing
 
 In a switched terminal tab:
 - Your shell prompt displays `(tes:feat/pricing)` so you always see which branch that tab is on.
-- Commands you run in that terminal (`npm test`, `npm run build`, `npm run dev`, `cargo test`) execute inside that branch's Copy-on-Write sandbox while your terminal prompt stays in your project folder.
+- In Zsh, Bash, and Fish, commands you run in that terminal (`npm test`, `npm run build`, `npm run dev`, `cargo test`) execute automatically inside that branch's Copy-on-Write sandbox while your terminal prompt stays in your project folder (in other shells, run `tes exec -- <command>`).
 - Other open terminals and your code editor remain untouched.
 
 ## Switching the Editor Branch

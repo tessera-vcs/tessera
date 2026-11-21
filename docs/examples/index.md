@@ -19,7 +19,11 @@ tes env --install
 
 ### Switch Terminals to Different Branches
 
+Enable `port_isolation` (defaults to `false`; or set `TES_PORT_ISOLATION=1`) when running dev servers side by side on separate branches:
+
 ```bash:no-line-numbers
+tes config set port_isolation true
+
 # Terminal 1
 tes switch feat/pricing
 npm run dev
