@@ -1,10 +1,10 @@
 //! End-to-end integration tests for multi-agent coordination, 3-way AST reconciliation,
 //! Copy-on-Write branch sandboxes, MCP JSON-RPC stdio transport, and multi-shell hooks.
 
+use agent::{Coordinator, ResolveStrategy, handle_post_tool_hook, handle_pre_tool_hook};
+use core::ConflictKind;
 use std::fs;
 use std::process::Command;
-use agent::{handle_post_tool_hook, handle_pre_tool_hook, Coordinator, ResolveStrategy};
-use core::ConflictKind;
 
 /// Verifies that `init_repo_with_options` installs either scoped or universal AI harness hooks and Git hooks.
 #[test]
@@ -20,9 +20,11 @@ fn init_installs_all_harness_discovery_and_hook_files() {
         ".git/hooks/post-checkout",
     ] {
         assert!(tmp_default.path().join(expected).is_file());
-        assert!(default_report
-            .harness_files_installed
-            .contains(&expected.to_string()));
+        assert!(
+            default_report
+                .harness_files_installed
+                .contains(&expected.to_string())
+        );
     }
     assert!(!tmp_default.path().join(".mcp.json").exists());
     assert!(!tmp_default.path().join("AGENTS.md").exists());
@@ -50,7 +52,11 @@ fn init_installs_all_harness_discovery_and_hook_files() {
             tmp.path().join(expected).is_file(),
             "missing bootstrap file: {expected}"
         );
-        assert!(report.harness_files_installed.contains(&expected.to_string()));
+        assert!(
+            report
+                .harness_files_installed
+                .contains(&expected.to_string())
+        );
     }
 }
 
@@ -710,7 +716,8 @@ fn peer_session_merging_early_does_not_wipe_in_flight_claimed_session_baseline()
 
     let final_ts = fs::read_to_string(&app_path).expect("read final app.ts");
     assert!(
-        final_ts.contains("decimals: number = 2") && final_ts.contains("locale: string = \"en-US\""),
+        final_ts.contains("decimals: number = 2")
+            && final_ts.contains("locale: string = \"en-US\""),
         "expected both decimals and locale parameters in merged app.ts, got:\n{final_ts}"
     );
 }
@@ -847,7 +854,8 @@ fn concurrent_sessions_on_different_branches_and_uncoordinated_writes_merge_clea
     assert!(decimals_str.contains("decimals: number = 2"));
     assert!(!decimals_str.contains("locale: string = \"en-US\""));
 
-    let main_before_merge = fs::read_to_string(&app_path).expect("read main app.ts before branch merge");
+    let main_before_merge =
+        fs::read_to_string(&app_path).expect("read main app.ts before branch merge");
     assert_eq!(main_before_merge, base_ts);
     let git_status_main = Command::new("git")
         .current_dir(tmp.path())
@@ -960,7 +968,13 @@ fn restore_and_dynamic_tab_completion_e2e() {
     fs::write(&app_path, v2).expect("write v2");
     handle_post_tool_hook(&coord, "agent-v2", "app.ts").expect("post-tool v2");
     let m_v2 = coord
-        .merge_agents_with_message(&["agent-v2".to_string()], Some("main"), None, false, Some("feat: v2"))
+        .merge_agents_with_message(
+            &["agent-v2".to_string()],
+            Some("main"),
+            None,
+            false,
+            Some("feat: v2"),
+        )
         .expect("merge v2");
     assert_ne!(m_v2.merged_commit_id, c1);
     assert_eq!(fs::read_to_string(&app_path).expect("read v2"), v2);
@@ -1156,7 +1170,8 @@ document.querySelector('#app').innerHTML = `
     fs::write(&main_js_path, theme_main_js).expect("write theme main.js");
     handle_post_tool_hook(&coord, "antigravity-theme", "src/main.js").expect("post-tool main.js");
     fs::write(&style_css_path, theme_style_css).expect("write theme style.css");
-    handle_post_tool_hook(&coord, "antigravity-theme", "src/style.css").expect("post-tool style.css");
+    handle_post_tool_hook(&coord, "antigravity-theme", "src/style.css")
+        .expect("post-tool style.css");
 
     // Agent 2 edits `src/main.js` and `src/style.css` in place on top of Agent 1's files on disk.
     let combined_main_js_on_disk = r#"import './style.css'
@@ -1175,10 +1190,14 @@ document.querySelector('#app').innerHTML = `
 "#;
     let combined_style_css_on_disk = ":root {\n  color: #213547;\n  background-color: #ffffff;\n}\n.card {\n  padding: 2em;\n}\n.theme-toggle {\n  border: 1px solid #646cff;\n}\n.counter-controls {\n  display: flex;\n  gap: 8px;\n}\n";
 
-    fs::write(&main_js_path, combined_main_js_on_disk).expect("write counter main.js on top of theme");
-    handle_post_tool_hook(&coord, "antigravity-counter", "src/main.js").expect("post-tool counter main.js");
-    fs::write(&style_css_path, combined_style_css_on_disk).expect("write counter style.css on top of theme");
-    handle_post_tool_hook(&coord, "antigravity-counter", "src/style.css").expect("post-tool counter style.css");
+    fs::write(&main_js_path, combined_main_js_on_disk)
+        .expect("write counter main.js on top of theme");
+    handle_post_tool_hook(&coord, "antigravity-counter", "src/main.js")
+        .expect("post-tool counter main.js");
+    fs::write(&style_css_path, combined_style_css_on_disk)
+        .expect("write counter style.css on top of theme");
+    handle_post_tool_hook(&coord, "antigravity-counter", "src/style.css")
+        .expect("post-tool counter style.css");
 
     let m_theme = coord
         .merge_agents_with_message(
@@ -1293,7 +1312,9 @@ fn seamless_branch_switching_cherry_pick_range_diff_and_path_stash_e2e() {
     coord
         .switch_editor_branch("feat/ui")
         .expect("switch_editor_branch feat/ui");
-    coord.sync_all_agents().expect("sync_all_agents after checkout");
+    coord
+        .sync_all_agents()
+        .expect("sync_all_agents after checkout");
     let cur = coord
         .oplog()
         .load_current_reconciled()
@@ -1485,7 +1506,12 @@ fn linux_bsd_terminal_sessions_and_all_shell_env_hooks_e2e() {
 
     let fake_home = root.join("fake-home");
     fs::create_dir_all(fake_home.join(".config/fish")).expect("mkdir fish");
-    for rc in [".zshrc", ".profile", ".kshrc", ".mkshrc", ".tcshrc", ".cshrc"] {
+    fs::create_dir_all(fake_home.join(".config/elvish")).expect("mkdir elvish");
+    fs::create_dir_all(fake_home.join(".config/nushell")).expect("mkdir nushell");
+
+    for rc in [
+        ".zshrc", ".bashrc", ".profile", ".kshrc", ".mkshrc", ".tcshrc", ".cshrc",
+    ] {
         fs::write(fake_home.join(rc), "# existing profile\n").expect("write rc");
     }
 
@@ -1506,11 +1532,38 @@ fn linux_bsd_terminal_sessions_and_all_shell_env_hooks_e2e() {
         ".tcshrc",
         ".cshrc",
         ".config/fish/config.fish",
+        ".config/elvish/rc.elv",
     ] {
         let content = fs::read_to_string(fake_home.join(rc)).expect("read configured rc");
         assert!(
             content.contains("tes env"),
             "{rc} should contain `tes env` hook after `tes env --install`: {content}"
+        );
+    }
+
+    let nu_cfg =
+        fs::read_to_string(fake_home.join(".config/nushell/config.nu")).expect("read config.nu");
+    assert!(
+        nu_cfg.contains("tessera/init.nu"),
+        "config.nu should source cached init.nu: {nu_cfg}"
+    );
+    assert!(fake_home.join(".cache/tessera/init.nu").is_file());
+
+    #[cfg(any(target_os = "macos", windows))]
+    {
+        let fresh_home = root.join("fresh-home-no-bashrc");
+        fs::create_dir_all(&fresh_home).expect("mkdir fresh home");
+        let fresh_install = Command::new(tes_bin)
+            .current_dir(root)
+            .env("HOME", &fresh_home)
+            .env("SHELL", "/bin/zsh")
+            .args(["env", "--install", "--json"])
+            .output()
+            .expect("tes env --install fresh home");
+        assert!(fresh_install.status.success());
+        assert!(
+            !fresh_home.join(".bashrc").exists(),
+            "tes env --install must not create absent ~/.bashrc on macOS/Windows"
         );
     }
 }
@@ -1559,10 +1612,7 @@ fn security_trust_gate_shell_escaping_and_path_confinement_e2e() {
     assert!(trust_out.status.success());
 
     let trusted_cfg = coord.oplog().load_config().expect("load trusted config");
-    assert_eq!(
-        trusted_cfg.verify_command.as_deref(),
-        Some("echo pwned")
-    );
+    assert_eq!(trusted_cfg.verify_command.as_deref(), Some("echo pwned"));
     assert_eq!(
         trusted_cfg.custom_env.get("APP_ENV").map(String::as_str),
         Some("staging")
@@ -1582,7 +1632,11 @@ fn security_trust_gate_shell_escaping_and_path_confinement_e2e() {
 
     // Verify path traversal and flag injection are rejected at the Coordinator boundary.
     assert!(handle_post_tool_hook(&coord, "agent-sec", "../../etc/passwd").is_err());
-    assert!(coord.switch_branch("agent-sec", "--upload-pack=evil").is_err());
+    assert!(
+        coord
+            .switch_branch("agent-sec", "--upload-pack=evil")
+            .is_err()
+    );
     assert!(coord.switch_branch("agent-sec", "../evil").is_err());
 }
 
@@ -1881,8 +1935,14 @@ serde = "1.0"
 
     // Agent 1 (`claude-backend`) & Agent 2 (`cursor-auth`) claim `src/api.rs` and `Cargo.toml` on `main`.
     for (agent_id, intent) in [
-        ("claude-backend", "Add create_order endpoint and uuid dependency"),
-        ("cursor-auth", "Add verify_bearer_token helper and sha2 dependency"),
+        (
+            "claude-backend",
+            "Add create_order endpoint and uuid dependency",
+        ),
+        (
+            "cursor-auth",
+            "Add verify_bearer_token helper and sha2 dependency",
+        ),
     ] {
         let out = Command::new(tes_bin)
             .current_dir(root)
@@ -2071,10 +2131,12 @@ sha2 = "0.10"
     assert!(post2_cargo.status.success());
 
     // Verify both Agent 1 and Agent 2 changes are live on disk on `main` right now!
-    let reconciled_api = fs::read_to_string(root.join("src/api.rs")).expect("read reconciled api.rs");
+    let reconciled_api =
+        fs::read_to_string(root.join("src/api.rs")).expect("read reconciled api.rs");
     assert!(reconciled_api.contains("pub fn create_order"));
     assert!(reconciled_api.contains("pub fn verify_bearer_token"));
-    let reconciled_cargo = fs::read_to_string(root.join("Cargo.toml")).expect("read reconciled Cargo.toml");
+    let reconciled_cargo =
+        fs::read_to_string(root.join("Cargo.toml")).expect("read reconciled Cargo.toml");
     assert!(reconciled_cargo.contains("uuid = \"1.10\""));
     assert!(reconciled_cargo.contains("sha2 = \"0.10\""));
 
@@ -2172,7 +2234,8 @@ export function formatMetric(val: number): string {
     return `${val.toLocaleString()} ops/s`;
 }
 "#;
-    fs::write(root.join("src/Dashboard.vue"), analytics_vue).expect("analytics write Dashboard.vue");
+    fs::write(root.join("src/Dashboard.vue"), analytics_vue)
+        .expect("analytics write Dashboard.vue");
     assert!(
         Command::new(tes_bin)
             .current_dir(root)
@@ -2217,7 +2280,14 @@ export function formatMetric(val: number): string {
         .current_dir(root)
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
-        .args(["hook", "post-tool", "--session", "claude-backend", "--path", ".env"])
+        .args([
+            "hook",
+            "post-tool",
+            "--session",
+            "claude-backend",
+            "--path",
+            ".env",
+        ])
         .output();
 
     let mut mcp_child = Command::new(tes_bin)
@@ -2258,8 +2328,16 @@ export function formatMetric(val: number): string {
 
     // Commit each branch (`feat/ui-redesign`, `feat/analytics`, and `main`) and AST-merge all branches into `main`.
     for (agent_id, branch_name, msg) in [
-        ("antigravity-ui", "feat/ui-redesign", "feat(ui): add summary banner and formatDate"),
-        ("codex-analytics", "feat/analytics", "feat(analytics): add analytics card and formatMetric"),
+        (
+            "antigravity-ui",
+            "feat/ui-redesign",
+            "feat(ui): add summary banner and formatDate",
+        ),
+        (
+            "codex-analytics",
+            "feat/analytics",
+            "feat(analytics): add analytics card and formatMetric",
+        ),
     ] {
         let c_out = Command::new(tes_bin)
             .current_dir(root)
@@ -2352,11 +2430,13 @@ export function formatMetric(val: number): string {
     assert!(final_cargo.contains("uuid = \"1.10\""));
     assert!(final_cargo.contains("sha2 = \"0.10\""));
 
-    let final_format = fs::read_to_string(root.join("src/Format.ts")).expect("read final Format.ts");
+    let final_format =
+        fs::read_to_string(root.join("src/Format.ts")).expect("read final Format.ts");
     assert!(final_format.contains("export function formatDate"));
     assert!(final_format.contains("export function formatMetric"));
 
-    let final_vue = fs::read_to_string(root.join("src/Dashboard.vue")).expect("read final Dashboard.vue");
+    let final_vue =
+        fs::read_to_string(root.join("src/Dashboard.vue")).expect("read final Dashboard.vue");
     assert!(final_vue.contains("summary-banner"));
     assert!(final_vue.contains("Real-time feed"));
     assert!(final_vue.contains(".analytics-card"));
@@ -2373,8 +2453,14 @@ export function formatMetric(val: number): string {
         .resolve_head_commit()
         .expect("resolve head")
         .expect("head commit");
-    let head_commit = coord.git().read_commit(&head_cid).expect("read head commit");
-    let head_tree = coord.git().read_tree_to_map(&head_commit.tree_id).expect("read head tree");
+    let head_commit = coord
+        .git()
+        .read_commit(&head_cid)
+        .expect("read head commit");
+    let head_tree = coord
+        .git()
+        .read_tree_to_map(&head_commit.tree_id)
+        .expect("read head tree");
     assert!(
         !head_tree.contains_key(".env"),
         ".env secret file must never be committed into the Git tree"
@@ -2497,7 +2583,12 @@ fn cli_git_familiar_flags_log_diff_status_commit_amend_and_branch_e2e() {
     let amend_out = Command::new(tes_bin)
         .current_dir(root)
         .env("TES_SESSION_ID", "agent-docs")
-        .args(["commit", "--amend", "-m", "docs(guide): add examples section"])
+        .args([
+            "commit",
+            "--amend",
+            "-m",
+            "docs(guide): add examples section",
+        ])
         .output()
         .expect("tes commit --amend");
     assert!(amend_out.status.success());
@@ -2528,8 +2619,7 @@ fn cli_git_familiar_flags_log_diff_status_commit_amend_and_branch_e2e() {
     assert!(branch_v.status.success());
     let branch_v_str = String::from_utf8_lossy(&branch_v.stdout);
     assert!(
-        branch_v_str.contains("main")
-            && branch_v_str.contains("docs(guide): add examples section"),
+        branch_v_str.contains("main") && branch_v_str.contains("docs(guide): add examples section"),
         "expected branch -v to include branch name and commit subject, got:\n{branch_v_str}"
     );
 }
@@ -2632,7 +2722,7 @@ fn security_audit_hardening_invariants_e2e() {
     let mut mcp_child = Command::new(tes_bin)
         .current_dir(&root)
         .args(["mcp"])
-        .stdin( std::process::Stdio::piped())
+        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .spawn()
         .expect("spawn tes mcp");
@@ -2645,7 +2735,8 @@ fn security_audit_hardening_invariants_e2e() {
     let mcp_stdout = String::from_utf8_lossy(&mcp_out.stdout);
     assert!(
         mcp_stdout.contains("\"isError\":true")
-            && mcp_stdout.contains("arbitrary verification shell commands are not permitted over MCP"),
+            && mcp_stdout
+                .contains("arbitrary verification shell commands are not permitted over MCP"),
         "expected MCP merge tool to reject arbitrary verify command, got: {mcp_stdout}"
     );
 
@@ -2721,7 +2812,264 @@ fn security_audit_hardening_invariants_e2e() {
     );
 }
 
+/// Verifies hardened MCP JSON-RPC 2.0 server compliance, all 22 tools, resources, prompts,
+/// fixed `restore` argument ordering, per-connection session isolation, and protocol error codes.
+#[test]
+fn mcp_hardened_protocol_22_tools_resources_prompts_and_session_isolation_e2e() {
+    use std::io::Write;
+    use std::process::Stdio;
 
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    fs::write(root.join("app.rs"), "pub fn ver() -> i32 { 1 }\n").expect("write app.rs");
 
+    let tes_bin = env!("CARGO_BIN_EXE_tes");
+    let init_out = Command::new(tes_bin)
+        .current_dir(root)
+        .env("GIT_AUTHOR_NAME", "MCP Test")
+        .env("GIT_AUTHOR_EMAIL", "mcp@example.com")
+        .env("GIT_COMMITTER_NAME", "MCP Test")
+        .env("GIT_COMMITTER_EMAIL", "mcp@example.com")
+        .args(["init", "--json"])
+        .output()
+        .expect("tes init");
+    assert!(init_out.status.success());
 
+    // Seed an active AI agent session on `main` so we can verify MCP NEVER hijacks it.
+    let seed_claim = Command::new(tes_bin)
+        .current_dir(root)
+        .env("ANTIGRAVITY_CONVERSATION_ID", "existing-ai-peer")
+        .args(["claim", "--intent", "Existing AI peer", "app.rs"])
+        .output()
+        .expect("seed existing AI peer");
+    assert!(seed_claim.status.success());
 
+    let run_mcp_session = |requests: &[&str]| -> Vec<serde_json::Value> {
+        let mut child = Command::new(tes_bin)
+            .current_dir(root)
+            .arg("mcp")
+            .env("GIT_AUTHOR_NAME", "MCP Test")
+            .env("GIT_AUTHOR_EMAIL", "mcp@example.com")
+            .env("GIT_COMMITTER_NAME", "MCP Test")
+            .env("GIT_COMMITTER_EMAIL", "mcp@example.com")
+            .env_remove("TES_SESSION_ID")
+            .env_remove("ANTIGRAVITY_CONVERSATION_ID")
+            .env_remove("ANTIGRAVITY_AGENT")
+            .env_remove("CLAUDE_SESSION_ID")
+            .env_remove("CLAUDECODE")
+            .env_remove("CURSOR_SESSION_ID")
+            .env_remove("CURSOR_TRACE_ID")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn tes mcp");
+
+        {
+            let stdin = child.stdin.as_mut().expect("stdin");
+
+            for req in requests {
+                writeln!(stdin, "{req}").expect("write mcp req");
+            }
+        }
+
+        let out = child.wait_with_output().expect("wait tes mcp");
+        assert!(
+            out.status.success(),
+            "tes mcp failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).expect("valid JSON-RPC line"))
+            .collect()
+    };
+
+    // Session 1: protocol compliance, 22 tools, resources, prompts, slash-branch claim, commit, diff, log, oplog, doctor, config.
+    let responses = run_mcp_session(&[
+        // Malformed JSON -> -32700 Parse error (server must keep running!)
+        "{not valid json",
+        // Invalid JSON-RPC request -> -32600
+        r#"{"jsonrpc":"1.0","id":10,"method":"ping"}"#,
+        // Client response without `method` -> ignored (produces no output line)
+        r#"{"jsonrpc":"2.0","id":99,"result":{}}"#,
+        // Initialize with 2025-03-26 negotiation
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}"#,
+        // Notification (no `id`) -> no output line
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        // List all 22 tools
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
+        // Unknown tool -> -32602
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"does_not_exist","arguments":{}}}"#,
+        // Claim a slash branch without explicit agent_id (must NOT hijack `antigravity-existing-ai-peer` or fail with slash in session ID!)
+        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"claim","arguments":{"branch":"feat/mcp-slash","intent":"Slash branch task","symbols":["app.rs"]}}}"#,
+        // Inspect new tools: doctor, config, diff, log, oplog, agent
+        r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"doctor","arguments":{}}}"#,
+        r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"config","arguments":{"action":"show"}}}"#,
+        r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"diff","arguments":{"range":"HEAD..HEAD"}}}"#,
+        r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"log","arguments":{"limit":5}}}"#,
+        r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"oplog","arguments":{"limit":5}}}"#,
+        r#"{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"agent","arguments":{"action":"list"}}}"#,
+        // Invalid resolve strategy & missing content & unknown branch action
+        r#"{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"resolve","arguments":{"path":"app.rs","strategy":"invalid"}}}"#,
+        r#"{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"resolve","arguments":{"path":"app.rs","strategy":"content"}}}"#,
+        r#"{"jsonrpc":"2.0","id":14,"method":"tools/call","params":{"name":"branch","arguments":{"action":"explode"}}}"#,
+        // Resources & Prompts
+        r#"{"jsonrpc":"2.0","id":15,"method":"resources/list","params":{}}"#,
+        r#"{"jsonrpc":"2.0","id":16,"method":"resources/read","params":{"uri":"tessera://radar"}}"#,
+        r#"{"jsonrpc":"2.0","id":17,"method":"prompts/list","params":{}}"#,
+        r#"{"jsonrpc":"2.0","id":18,"method":"prompts/get","params":{"name":"resolve-conflicts","arguments":{}}}"#,
+    ]);
+
+    assert_eq!(responses[0]["error"]["code"], -32700, "{:?}", responses[0]);
+    assert_eq!(responses[1]["error"]["code"], -32600, "{:?}", responses[1]);
+
+    let init_resp = responses.iter().find(|r| r["id"] == 1).expect("init resp");
+    assert_eq!(init_resp["result"]["protocolVersion"], "2025-03-26");
+    assert!(init_resp["result"]["capabilities"]["resources"].is_object());
+    assert!(init_resp["result"]["capabilities"]["prompts"].is_object());
+
+    let tools_resp = responses.iter().find(|r| r["id"] == 2).expect("tools/list");
+    let tools_arr = tools_resp["result"]["tools"]
+        .as_array()
+        .expect("tools array");
+    assert_eq!(tools_arr.len(), 22, "expected 22 MCP tools");
+
+    let unknown_tool = responses
+        .iter()
+        .find(|r| r["id"] == 3)
+        .expect("unknown tool");
+    assert_eq!(unknown_tool["error"]["code"], -32602);
+
+    let claim_resp = responses.iter().find(|r| r["id"] == 4).expect("claim resp");
+    assert_eq!(claim_resp["result"]["isError"], false, "{claim_resp}");
+    let claim_payload: serde_json::Value = serde_json::from_str(
+        claim_resp["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text"),
+    )
+    .expect("claim payload");
+    let mcp_sid_1 = claim_payload["agent_id"]
+        .as_str()
+        .expect("agent_id")
+        .to_string();
+    assert!(
+        mcp_sid_1.starts_with("mcp-") && !mcp_sid_1.contains('/'),
+        "expected safe per-connection mcp-<pid>-<hex> session ID, got: {mcp_sid_1}"
+    );
+    assert_ne!(
+        mcp_sid_1, "antigravity-existing-ai-peer",
+        "MCP server must never hijack an active AI agent's session ID"
+    );
+
+    for check_id in [5, 6, 7, 8, 9, 11] {
+        let resp = responses
+            .iter()
+            .find(|r| r["id"] == check_id)
+            .expect("tool resp");
+        assert_eq!(
+            resp["result"]["isError"], false,
+            "tool id={check_id}: {resp}"
+        );
+    }
+
+    for err_id in [12, 13, 14] {
+        let resp = responses
+            .iter()
+            .find(|r| r["id"] == err_id)
+            .expect("error tool resp");
+        assert_eq!(resp["result"]["isError"], true, "tool id={err_id}: {resp}");
+    }
+
+    let res_list = responses
+        .iter()
+        .find(|r| r["id"] == 15)
+        .expect("resources/list");
+    assert_eq!(
+        res_list["result"]["resources"].as_array().map(Vec::len),
+        Some(3)
+    );
+    let res_read = responses
+        .iter()
+        .find(|r| r["id"] == 16)
+        .expect("resources/read");
+    assert!(
+        res_read["result"]["contents"][0]["text"]
+            .as_str()
+            .is_some_and(|t| t.contains("existing-ai-peer"))
+    );
+    let prompts_list = responses
+        .iter()
+        .find(|r| r["id"] == 17)
+        .expect("prompts/list");
+    assert_eq!(
+        prompts_list["result"]["prompts"][0]["name"],
+        "resolve-conflicts"
+    );
+    let prompt_get = responses
+        .iter()
+        .find(|r| r["id"] == 18)
+        .expect("prompts/get");
+    assert!(
+        prompt_get["result"]["messages"][0]["content"]["text"]
+            .as_str()
+            .is_some_and(|t| !t.is_empty())
+    );
+
+    // Session 2: must get a distinct session ID, commit a change on `main`, and verify `restore`
+    // passes `(branch, source)` in the CORRECT argument order!
+    let responses_2_claim = run_mcp_session(&[
+        r#"{"jsonrpc":"2.0","id":20,"method":"tools/call","params":{"name":"claim","arguments":{"branch":"main","intent":"Bump ver to 2","symbols":["app.rs"]}}}"#,
+    ]);
+
+    let claim2: serde_json::Value = serde_json::from_str(
+        responses_2_claim[0]["result"]["content"][0]["text"]
+            .as_str()
+            .expect("claim2 text"),
+    )
+    .expect("claim2 json");
+    let mcp_sid_2 = claim2["agent_id"].as_str().expect("mcp_sid_2").to_string();
+    assert_ne!(
+        mcp_sid_1, mcp_sid_2,
+        "distinct MCP connections must receive distinct session IDs"
+    );
+
+    fs::write(root.join("app.rs"), "pub fn ver() -> i32 { 2 }\n").expect("write v2");
+    let post_hook = Command::new(tes_bin)
+        .current_dir(root)
+        .args([
+            "hook",
+            "post-tool",
+            "--session",
+            &mcp_sid_2,
+            "--path",
+            "app.rs",
+        ])
+        .output()
+        .expect("post-tool mcp_sid_2");
+    assert!(post_hook.status.success());
+
+    let commit_req = format!(
+        r#"{{"jsonrpc":"2.0","id":21,"method":"tools/call","params":{{"name":"commit","arguments":{{"agent_id":"{mcp_sid_2}","branch":"main","message":"feat: bump ver to 2"}}}}}}"#
+    );
+    let restore_req = format!(
+        r#"{{"jsonrpc":"2.0","id":22,"method":"tools/call","params":{{"name":"restore","arguments":{{"agent_id":"{mcp_sid_2}","branch":"main","revision":"HEAD~1"}}}}}}"#
+    );
+    let responses_2 = run_mcp_session(&[&commit_req, &restore_req]);
+
+    assert_eq!(
+        responses_2[0]["result"]["isError"], false,
+        "{:?}",
+        responses_2[0]
+    );
+    assert_eq!(
+        responses_2[1]["result"]["isError"], false,
+        "MCP restore with branch + revision must succeed with fixed arg order: {:?}",
+        responses_2[1]
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("app.rs")).expect("read restored app.rs"),
+        "pub fn ver() -> i32 { 1 }\n",
+        "MCP restore(branch=main, revision=HEAD~1) must restore v1"
+    );
+}

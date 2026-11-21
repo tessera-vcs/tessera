@@ -141,55 +141,117 @@ pub fn atomic_write_file_relaxed(target_path: &Path, bytes: &[u8]) -> CoreResult
     atomic_write_file_inner(target_path, bytes, false)
 }
 
-/// Updates an existing working-tree file in-place using `O_NOFOLLOW` on Unix so file-watcher
-/// inodes (`kqueue` / `inotify`) are preserved while atomically preventing TOCTOU symlink races,
-/// falling back to [`atomic_write_file_relaxed`] when creating a new file.
+/// Atomically replaces a working-tree file via sibling temporary file and `fs::rename`,
+/// refusing to follow or overwrite symbolic links and preserving existing file permissions.
+///
+/// Unlike in-place `O_TRUNC`, atomic rename guarantees readers, compilers, and concurrent
+/// sessions never observe a transient zero-byte or half-written file, and prevents mutating
+/// unrelated hardlink targets.
 ///
 /// # Errors
 /// Returns [`CoreError::InvalidArgument`] if `target_path` is a symbolic link, or [`CoreError::Io`]
 /// if writing fails.
 pub fn write_working_tree_file_safe(target_path: &Path, bytes: &[u8]) -> CoreResult<()> {
-    if let Ok(meta) = fs::symlink_metadata(target_path) {
-        if meta.file_type().is_symlink() {
-            return Err(CoreError::InvalidArgument(format!(
-                "refusing to overwrite symbolic link at '{}'",
-                target_path.display()
-            )));
-        }
+    let existing_perms = match fs::symlink_metadata(target_path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(CoreError::InvalidArgument(format!(
+                    "refusing to overwrite symbolic link at '{}'",
+                    target_path.display()
+                )));
+            }
 
+            Some(meta.permissions())
+        }
+        Err(_) => None,
+    };
+
+    let parent = target_path.parent().ok_or_else(|| CoreError::Io {
+        path: target_path.display().to_string(),
+        source: std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "target path has no parent directory",
+        ),
+    })?;
+
+    fs::create_dir_all(parent).map_err(|source| CoreError::Io {
+        path: parent.display().to_string(),
+        source,
+    })?;
+
+    let seq = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let file_name = target_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("state");
+    let tmp_name = format!(".{file_name}.tmp.{pid}.{seq}");
+    let tmp_path = parent.join(tmp_name);
+
+    {
+        let mut file = File::create(&tmp_path).map_err(|source| CoreError::Io {
+            path: tmp_path.display().to_string(),
+            source,
+        })?;
+
+        file.write_all(bytes).map_err(|source| CoreError::Io {
+            path: tmp_path.display().to_string(),
+            source,
+        })?;
+    }
+
+    if let Some(perms) = existing_perms {
         #[cfg(unix)]
         {
-            use std::os::unix::fs::OpenOptionsExt;
+            use std::os::unix::fs::PermissionsExt;
+            let mode = perms.mode();
 
-            match fs::OpenOptions::new()
-                .write(true)
-                .truncate(true)
-                .create(false)
-                .custom_flags(libc::O_NOFOLLOW)
-                .open(target_path)
-            {
-                Ok(mut f) => {
-                    return f.write_all(bytes).map_err(|source| CoreError::Io {
-                        path: target_path.display().to_string(),
-                        source,
-                    });
-                }
-                Err(err) if err.raw_os_error() == Some(libc::ELOOP) => {
-                    return Err(CoreError::InvalidArgument(format!(
-                        "refusing to follow symbolic link at '{}'",
-                        target_path.display()
-                    )));
-                }
-                Err(_) => {}
+            if (mode & 0o200) != 0 {
+                let _ = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(mode));
             }
+        }
+
+        #[cfg(not(unix))]
+        let _ = perms;
+    }
+
+    fs::rename(&tmp_path, target_path).map_err(|source| {
+        let _ = fs::remove_file(&tmp_path);
+        CoreError::Io {
+            path: target_path.display().to_string(),
+            source,
+        }
+    })
+}
+
+/// Returns `true` if a single path segment matches `.git`, `.tessera`, or an NTFS short-name /
+/// trailing-dot/space alias that could target repository internals on case-insensitive filesystems.
+fn is_forbidden_vcs_segment(seg: &str) -> bool {
+    let trimmed = seg.trim_end_matches(['.', ' ']);
+
+    if trimmed.eq_ignore_ascii_case(".git") || trimmed.eq_ignore_ascii_case(".tessera") {
+        return true;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+
+    if let Some(rest) = lower.strip_prefix("git~") {
+        if !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()) {
+            return true;
         }
     }
 
-    atomic_write_file_relaxed(target_path, bytes)
+    if let Some(rest) = lower.strip_prefix("tesser~") {
+        if !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()) {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// Validates and normalizes a repository-relative path, rejecting traversal (`..`),
-/// `.git` and `.tessera` directory access, NUL bytes, and Windows drive prefixes.
+/// `.git` and `.tessera` directory access (including NTFS aliases), NUL bytes, and Windows drive prefixes.
 ///
 /// # Errors
 /// Returns [`CoreError::InvalidArgument`] if `raw` is empty or contains forbidden components.
@@ -201,13 +263,17 @@ pub fn validate_repo_rel_path(raw: &str) -> CoreResult<String> {
     }
 
     let unified = raw.replace('\\', "/");
-    let mut trimmed = unified.trim();
+    let mut trimmed = unified.as_str();
 
     while let Some(rest) = trimmed.strip_prefix("./") {
         trimmed = rest;
     }
 
-    if trimmed.starts_with('/') || trimmed.contains(':') {
+    let has_windows_drive = trimmed.len() >= 2
+        && trimmed.as_bytes()[0].is_ascii_alphabetic()
+        && trimmed.as_bytes()[1] == b':';
+
+    if trimmed.starts_with('/') || has_windows_drive {
         return Err(CoreError::InvalidArgument(format!(
             "path '{raw}' must be repository-relative"
         )));
@@ -220,11 +286,7 @@ pub fn validate_repo_rel_path(raw: &str) -> CoreResult<String> {
             continue;
         }
 
-        if seg == ".."
-            || seg.eq_ignore_ascii_case(".git")
-            || seg.eq_ignore_ascii_case(".tessera")
-            || seg.eq_ignore_ascii_case("git~1")
-        {
+        if seg == ".." || is_forbidden_vcs_segment(seg) {
             return Err(CoreError::InvalidArgument(format!(
                 "path '{raw}' contains forbidden component '{seg}'"
             )));
@@ -267,6 +329,15 @@ pub fn resolve_confined_repo_path(
 
     let candidate_rel = if Path::new(trimmed).is_absolute() {
         let input_path = Path::new(trimmed);
+
+        if Path::new(trimmed)
+            .components()
+            .any(|c| matches!(c, Component::ParentDir))
+        {
+            return Err(CoreError::InvalidArgument(format!(
+                "path '{raw_path}' contains forbidden traversal component"
+            )));
+        }
 
         if let Ok(stripped) = input_path.strip_prefix(repo_root) {
             stripped.to_string_lossy().replace('\\', "/")
@@ -385,6 +456,7 @@ pub fn validate_safe_identifier(kind: &str, id: &str) -> CoreResult<()> {
 /// Returns [`CoreError::InvalidArgument`] if `name` violates ref naming invariants.
 pub fn validate_ref_name(name: &str) -> CoreResult<()> {
     if name.is_empty()
+        || name == "@"
         || name.len() > 255
         || name.starts_with('-')
         || name.starts_with('/')
@@ -406,8 +478,7 @@ pub fn validate_ref_name(name: &str) -> CoreResult<()> {
             || byte == 0x7f
             || matches!(
                 byte,
-                b'~'
-                    | b'^'
+                b'~' | b'^'
                     | b':'
                     | b'?'
                     | b'*'
@@ -777,6 +848,8 @@ pub enum EntryMode {
     Symlink,
     /// Subdirectory tree (`040000`).
     Directory,
+    /// Git submodule commit reference (`160000`).
+    Gitlink,
 }
 
 impl EntryMode {
@@ -787,6 +860,7 @@ impl EntryMode {
             Self::ExecutableFile => "100755",
             Self::Symlink => "120000",
             Self::Directory => "40000",
+            Self::Gitlink => "160000",
         }
     }
 
@@ -796,10 +870,11 @@ impl EntryMode {
     /// Returns [`CoreError::InvalidGitObject`] if `mode` is not a recognized Git tree mode.
     pub fn from_git_octal(mode: &str) -> CoreResult<Self> {
         match mode {
-            "100644" | "0100644" => Ok(Self::NormalFile),
+            "100644" | "0100644" | "100664" | "0100664" => Ok(Self::NormalFile),
             "100755" | "0100755" => Ok(Self::ExecutableFile),
             "120000" | "0120000" => Ok(Self::Symlink),
             "40000" | "040000" => Ok(Self::Directory),
+            "160000" | "0160000" => Ok(Self::Gitlink),
             other => Err(CoreError::InvalidGitObject {
                 id: String::new(),
                 reason: format!("unrecognized git tree mode '{other}'"),
@@ -808,13 +883,95 @@ impl EntryMode {
     }
 }
 
-/// Flat representation of a file blob in a materialized tree map.
+/// Non-directory Git tree entry kind stored inside a flattened [`FileEntry`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum FileEntryKind {
+    /// Regular file (`100644` or `100755`).
+    #[default]
+    Regular,
+    /// Symbolic link (`120000`).
+    Symlink,
+    /// Git submodule commit reference (`160000`).
+    Gitlink,
+}
+
+/// Flat representation of a leaf entry (regular file, symlink, or submodule gitlink) in a materialized tree map.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct FileEntry {
-    /// SHA-1 Git blob ID.
+    /// SHA-1 Git blob ID (or target commit ID when `kind == FileEntryKind::Gitlink`).
     pub blob_id: ObjectId,
-    /// Executable bit (`100755` vs `100644`).
+    /// Executable bit (`100755` vs `100644`, meaningful only for `FileEntryKind::Regular`).
     pub executable: bool,
+    /// Distinguishes regular files from symbolic links (`120000`) and submodule gitlinks (`160000`).
+    #[serde(default)]
+    pub kind: FileEntryKind,
+}
+
+impl FileEntry {
+    /// Constructs a regular file entry (`100644` or `100755`).
+    #[must_use]
+    pub fn regular(blob_id: ObjectId, executable: bool) -> Self {
+        Self {
+            blob_id,
+            executable,
+            kind: FileEntryKind::Regular,
+        }
+    }
+
+    /// Constructs a [`FileEntry`] from a non-directory [`EntryMode`].
+    #[must_use]
+    pub fn from_mode(blob_id: ObjectId, mode: EntryMode) -> Self {
+        match mode {
+            EntryMode::ExecutableFile => Self {
+                blob_id,
+                executable: true,
+                kind: FileEntryKind::Regular,
+            },
+            EntryMode::Symlink => Self {
+                blob_id,
+                executable: false,
+                kind: FileEntryKind::Symlink,
+            },
+            EntryMode::Gitlink => Self {
+                blob_id,
+                executable: false,
+                kind: FileEntryKind::Gitlink,
+            },
+            EntryMode::NormalFile | EntryMode::Directory => Self {
+                blob_id,
+                executable: false,
+                kind: FileEntryKind::Regular,
+            },
+        }
+    }
+
+    /// Returns the canonical Git [`EntryMode`] for this entry.
+    #[must_use]
+    pub fn entry_mode(&self) -> EntryMode {
+        match self.kind {
+            FileEntryKind::Symlink => EntryMode::Symlink,
+            FileEntryKind::Gitlink => EntryMode::Gitlink,
+            FileEntryKind::Regular => {
+                if self.executable {
+                    EntryMode::ExecutableFile
+                } else {
+                    EntryMode::NormalFile
+                }
+            }
+        }
+    }
+
+    /// Returns `true` if this entry represents a tracked Git symbolic link (`120000`).
+    #[must_use]
+    pub fn is_symlink(&self) -> bool {
+        self.kind == FileEntryKind::Symlink
+    }
+
+    /// Returns `true` if this entry represents a Git submodule gitlink (`160000`).
+    #[must_use]
+    pub fn is_gitlink(&self) -> bool {
+        self.kind == FileEntryKind::Gitlink
+    }
 }
 
 /// Classification of a first-class conflict in `.git/tessera/conflicts/`.
@@ -826,6 +983,10 @@ pub enum ConflictKind {
     TextHunk,
     /// One side deleted a file while the other side modified it (and no rename match was found).
     DeleteModify,
+    /// Divergent modifications to a binary file that cannot be text-merged.
+    Binary,
+    /// One side holds a regular file at a path where the other side holds a directory subtree.
+    FileDirectory,
     /// Merge succeeded structurally, but the speculative verification gate (`--verify`) failed compilation.
     SemanticBuild,
 }
@@ -835,7 +996,7 @@ pub enum ConflictKind {
 pub struct ConflictRecord {
     /// Deterministic Blake3 identifier of this conflict.
     pub id: ConflictId,
-    /// Repository-relative path of the conflicted file (or `<build>` for `SemanticBuild`).
+    /// Repository-relative path of the conflicted file (or `<speculative-verify>` for `SemanticBuild`).
     pub path: String,
     /// Scoped AST symbol name (e.g., `fn verify_jwt` or `impl AuthService`) if applicable.
     pub symbol: Option<String>,
@@ -858,18 +1019,25 @@ pub struct ConflictRecord {
 }
 
 impl ConflictRecord {
-    /// Computes a deterministic [`ConflictId`] from the path, symbol, and participating blob IDs.
+    /// Computes a deterministic [`ConflictId`] from the length-framed path, symbol, and participating blob IDs.
     pub fn compute_id(
         path: &str,
         symbol: Option<&str>,
         merge: &Merge<Option<ObjectId>>,
     ) -> ConflictId {
         let mut hasher = blake3::Hasher::new();
+        hasher.update(&(path.len() as u64).to_le_bytes());
         hasher.update(path.as_bytes());
 
-        if let Some(sym) = symbol {
-            hasher.update(b"::");
-            hasher.update(sym.as_bytes());
+        match symbol {
+            Some(sym) => {
+                hasher.update(&[1u8]);
+                hasher.update(&(sym.len() as u64).to_le_bytes());
+                hasher.update(sym.as_bytes());
+            }
+            None => {
+                hasher.update(&[0u8]);
+            }
         }
 
         for r in &merge.removes {
@@ -1034,17 +1202,9 @@ impl AgentMetadata {
         mode_source: &BTreeMap<String, FileEntry>,
     ) {
         for (rel_path, blob_id) in &self.own_blobs {
-            let executable = mode_source
-                .get(rel_path)
-                .or_else(|| tree.get(rel_path))
-                .is_some_and(|e| e.executable);
-            tree.insert(
-                rel_path.clone(),
-                FileEntry {
-                    blob_id: *blob_id,
-                    executable,
-                },
-            );
+            let source_entry = mode_source.get(rel_path).or_else(|| tree.get(rel_path));
+            let mode = source_entry.map_or(EntryMode::NormalFile, FileEntry::entry_mode);
+            tree.insert(rel_path.clone(), FileEntry::from_mode(*blob_id, mode));
         }
 
         for rel_path in &self.deleted_paths {
@@ -1176,8 +1336,6 @@ impl Default for RepoConfig {
                 "venv/bin".to_string(),
                 "node_modules/.bin".to_string(),
                 "vendor/bin".to_string(),
-                "bin".to_string(),
-                ".bin".to_string(),
             ],
             package_globs: vec![
                 "crates/*".to_string(),
@@ -1186,7 +1344,7 @@ impl Default for RepoConfig {
                 "services/*".to_string(),
             ],
             verify_command: None,
-            watch_interval_ms: 25,
+            watch_interval_ms: 75,
             watch_timeout_secs: 90,
             co_author: false,
             co_author_trailer: "Tessera <noreply@tessera.getlunaris.dev>".to_string(),

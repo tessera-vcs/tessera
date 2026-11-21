@@ -8,13 +8,11 @@ pub mod env;
 pub mod snapshot;
 
 pub use cow::{
-    clone_path_cow, create_cow_workspace, materialize_tree_to_dir, sanitize_build_cache,
-    sync_missing_cow_caches, CowStrategy,
+    CowStrategy, clone_path_cow, create_cow_workspace, materialize_tree_to_dir,
+    materialize_tree_to_dir_with_baseline, sanitize_build_cache, sync_missing_cow_caches,
 };
 pub use env::{
-    build_agent_env, build_agent_env_with_config, ensure_polyglot_port_shims,
-    is_forbidden_custom_env_key, polyglot_port_env_vars, POLYGLOT_PORT_ENV_KEYS,
+    POLYGLOT_PORT_ENV_KEYS, build_agent_env, build_agent_env_with_config,
+    ensure_polyglot_port_shims, is_forbidden_custom_env_key, polyglot_port_env_vars,
 };
-pub use snapshot::{
-    is_ignored_or_secret_path, snapshot_working_dir, CachedStat, SnapshotOutcome,
-};
+pub use snapshot::{CachedStat, SnapshotOutcome, is_ignored_or_secret_path, snapshot_working_dir};

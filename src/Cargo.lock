@@ -20,7 +20,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror",
  "workspace",
 ]
 
@@ -197,8 +196,6 @@ dependencies = [
  "anyhow",
  "clap",
  "core",
- "merge",
- "serde",
  "serde_json",
  "tempfile",
  "workspace",
@@ -228,7 +225,6 @@ version = "0.0.2"
 dependencies = [
  "blake3",
  "flate2",
- "hex",
  "libc",
  "serde",
  "serde_json",
@@ -404,12 +400,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
-name = "hex"
-version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
-
-[[package]]
 name = "hybrid-array"
 version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -500,12 +490,10 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror",
  "toml",
  "tree-sitter",
  "tree-sitter-go",
  "tree-sitter-javascript",
- "tree-sitter-json",
  "tree-sitter-python",
  "tree-sitter-rust",
  "tree-sitter-typescript",
@@ -834,16 +822,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tree-sitter-json"
-version = "0.24.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4d727acca406c0020cffc6cf35516764f36c8e3dc4408e5ebe2cb35a947ec471"
-dependencies = [
- "cc",
- "tree-sitter-language",
-]
-
-[[package]]
 name = "tree-sitter-language"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -948,7 +926,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror",
  "walkdir",
 ]
 

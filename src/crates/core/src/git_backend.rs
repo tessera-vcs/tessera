@@ -9,14 +9,14 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
 
+use flate2::Compression;
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
-use flate2::Compression;
 use sha1::{Digest, Sha1};
 
 use crate::model::{
-    atomic_write_file, atomic_write_file_relaxed, now_millis, validate_ref_name,
-    validate_repo_rel_path, CoreError, CoreResult, EntryMode, FileEntry, ObjectId,
+    CoreError, CoreResult, EntryMode, FileEntry, ObjectId, atomic_write_file,
+    atomic_write_file_relaxed, now_millis, validate_ref_name, validate_repo_rel_path,
 };
 
 /// Maximum decompressed Git object payload size (64 MiB) to prevent memory exhaustion on corrupt objects.
@@ -62,6 +62,8 @@ impl CatFileBatchProcess {
     /// Spawns a new `git --git-dir <git_dir> cat-file --batch` child process with piped stdio.
     fn spawn(git_dir: &Path) -> Option<Self> {
         let mut child = Command::new("git")
+            .env_remove("GIT_OBJECT_DIRECTORY")
+            .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
             .arg("--git-dir")
             .arg(git_dir)
             .args(["cat-file", "--batch"])
@@ -153,7 +155,7 @@ struct GitObjectCache {
     batch: Option<CatFileBatchProcess>,
 }
 
-/// Lock-free bridge to a colocated `.git` directory.
+/// Lock-free bridge to a colocated `.git` directory (including linked worktrees and submodules).
 ///
 /// Reads and writes native Git objects (`blob`, `tree`, `commit`) directly in `.git/objects`
 /// without ever acquiring `.git/index.lock`.
@@ -161,6 +163,7 @@ struct GitObjectCache {
 pub struct GitBackend {
     repo_root: PathBuf,
     git_dir: PathBuf,
+    common_git_dir: PathBuf,
     cache: Arc<Mutex<GitObjectCache>>,
 }
 
@@ -169,8 +172,70 @@ impl fmt::Debug for GitBackend {
         f.debug_struct("GitBackend")
             .field("repo_root", &self.repo_root)
             .field("git_dir", &self.git_dir)
+            .field("common_git_dir", &self.common_git_dir)
             .finish()
     }
+}
+
+/// Resolves `.git` at `repo_dir` into `(git_dir, common_git_dir)`.
+///
+/// Supports standard repositories (`.git/` directory), linked Git worktrees (`.git` file with
+/// `gitdir:` plus `<git_dir>/commondir`), and Git submodules (`.git` file with `gitdir:`).
+#[must_use]
+pub fn resolve_dot_git(repo_dir: &Path) -> Option<(PathBuf, PathBuf)> {
+    let dot_git = repo_dir.join(".git");
+
+    if dot_git.is_dir() {
+        return Some((dot_git.clone(), dot_git));
+    }
+
+    if !dot_git.is_file() {
+        return None;
+    }
+
+    let raw = fs::read_to_string(&dot_git).ok()?;
+    let target_str = raw.trim().strip_prefix("gitdir:")?.trim();
+
+    if target_str.is_empty() {
+        return None;
+    }
+
+    let raw_target = PathBuf::from(target_str);
+    let git_dir = if raw_target.is_absolute() {
+        raw_target
+    } else {
+        repo_dir.join(raw_target)
+    };
+
+    if !git_dir.is_dir() {
+        return None;
+    }
+
+    let commondir_file = git_dir.join("commondir");
+    let common_git_dir = if commondir_file.is_file() {
+        if let Ok(common_raw) = fs::read_to_string(&commondir_file) {
+            let trimmed = common_raw.trim();
+
+            if !trimmed.is_empty() {
+                let p = PathBuf::from(trimmed);
+                let resolved = if p.is_absolute() { p } else { git_dir.join(p) };
+
+                if resolved.is_dir() {
+                    resolved
+                } else {
+                    git_dir.clone()
+                }
+            } else {
+                git_dir.clone()
+            }
+        } else {
+            git_dir.clone()
+        }
+    } else {
+        git_dir.clone()
+    };
+
+    Some((git_dir, common_git_dir))
 }
 
 /// Compares two Git tree entry names according to Git's canonical sort order, where
@@ -212,15 +277,22 @@ fn cmp_git_tree_entry_names(
 
 /// Validates that a single Git tree entry name cannot escape its directory or target `.git` / `.tessera`.
 fn validate_tree_entry_name(tree_id: &ObjectId, name: &str) -> CoreResult<()> {
+    let trimmed = name.trim_end_matches(['.', ' ']);
+    let lower = trimmed.to_ascii_lowercase();
+    let is_short_alias = lower
+        .strip_prefix("git~")
+        .or_else(|| lower.strip_prefix("tesser~"))
+        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()));
+
     if name.is_empty()
         || name == "."
         || name == ".."
         || name.contains('/')
         || name.contains('\\')
         || name.contains('\0')
-        || name.eq_ignore_ascii_case(".git")
-        || name.eq_ignore_ascii_case(".tessera")
-        || name.eq_ignore_ascii_case("git~1")
+        || trimmed.eq_ignore_ascii_case(".git")
+        || trimmed.eq_ignore_ascii_case(".tessera")
+        || is_short_alias
     {
         return Err(CoreError::InvalidGitObject {
             id: tree_id.to_string(),
@@ -229,6 +301,98 @@ fn validate_tree_entry_name(tree_id: &ObjectId, name: &str) -> CoreResult<()> {
     }
 
     Ok(())
+}
+
+/// Returns `true` if `slug_path` resides directly inside one of the authorized Tessera external
+/// sandbox base directories for the active user and `target_root`.
+fn is_authorized_sandbox_parent(slug_path: &Path, target_root: &Path) -> bool {
+    let Some(base_dir) = slug_path.parent() else {
+        return false;
+    };
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: `libc::geteuid()` is a pure POSIX syscall with no arguments or memory dereferences.
+        let uid = unsafe { libc::geteuid() };
+
+        if let Ok(meta) = fs::symlink_metadata(slug_path) {
+            if meta.file_type().is_symlink() || meta.uid() != uid {
+                return false;
+            }
+        }
+    }
+
+    let mut allowed_bases: Vec<PathBuf> = Vec::new();
+
+    if let Some(parent) = target_root.parent() {
+        allowed_bases.push(parent.join("tessera-workspaces"));
+    }
+
+    if let Ok(canon_root) = target_root.canonicalize() {
+        if let Some(parent) = canon_root.parent() {
+            allowed_bases.push(parent.join("tessera-workspaces"));
+        }
+    }
+
+    if cfg!(target_os = "macos") {
+        if let Ok(home) = std::env::var("HOME") {
+            allowed_bases.push(
+                PathBuf::from(home)
+                    .join("Library")
+                    .join("Caches")
+                    .join("tessera")
+                    .join("workspaces"),
+            );
+        }
+    } else if cfg!(windows) {
+        if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+            if !local_app_data.trim().is_empty() {
+                allowed_bases.push(
+                    PathBuf::from(local_app_data)
+                        .join("tessera")
+                        .join("workspaces"),
+                );
+            }
+        }
+
+        allowed_bases.push(std::env::temp_dir().join("tessera-workspaces"));
+    } else {
+        // SAFETY: `libc::geteuid()` is a pure POSIX syscall with no arguments or memory dereferences.
+        #[cfg(unix)]
+        let uid = unsafe { libc::geteuid() };
+        #[cfg(not(unix))]
+        let uid = 0u32;
+
+        if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
+            if !xdg.trim().is_empty() {
+                allowed_bases.push(PathBuf::from(xdg).join("tessera").join("workspaces"));
+            }
+        }
+
+        if let Ok(home) = std::env::var("HOME") {
+            if !home.trim().is_empty() {
+                allowed_bases.push(
+                    PathBuf::from(home)
+                        .join(".cache")
+                        .join("tessera")
+                        .join("workspaces"),
+                );
+            }
+        }
+
+        allowed_bases.push(PathBuf::from("/var/tmp").join(format!("tessera-workspaces-{uid}")));
+        allowed_bases.push(std::env::temp_dir().join(format!("tessera-workspaces-{uid}")));
+    }
+
+    let canon_base = base_dir.canonicalize().ok();
+
+    allowed_bases.iter().any(|allowed| {
+        base_dir == allowed
+            || canon_base
+                .as_ref()
+                .is_some_and(|cb| allowed.canonicalize().ok().as_ref() == Some(cb))
+    })
 }
 
 /// Verifies that `sandbox_dir/.tessera/repo_root` is a non-symlink file inside a legitimate
@@ -255,7 +419,13 @@ pub fn is_valid_sandbox_repo_root(
     let target = fs::read_to_string(&repo_link).ok()?;
     let target_root = PathBuf::from(target.trim());
 
-    if !target_root.is_absolute() || !target_root.join(".git").join("tessera").is_dir() {
+    if !target_root.is_absolute() {
+        return None;
+    }
+
+    let (_, common_git_dir) = resolve_dot_git(&target_root)?;
+
+    if !common_git_dir.join("tessera").is_dir() {
         return None;
     }
 
@@ -270,7 +440,7 @@ pub fn is_valid_sandbox_repo_root(
     }
 
     let is_inside_repo = sandbox_dir.starts_with(target_root.join(".tessera").join("workspaces"))
-        || sandbox_dir.starts_with(target_root.join(".git").join("tessera"));
+        || sandbox_dir.starts_with(common_git_dir.join("tessera"));
 
     if is_inside_repo {
         return Some(target_root);
@@ -282,7 +452,13 @@ pub fn is_valid_sandbox_repo_root(
         return None;
     }
 
-    let slug_dir = parent.parent()?.file_name()?.to_str()?;
+    let slug_path = parent.parent()?;
+
+    if !is_authorized_sandbox_parent(slug_path, &target_root) {
+        return None;
+    }
+
+    let slug_dir = slug_path.file_name()?.to_str()?;
     let raw_hash = blake3::hash(target_root.display().to_string().as_bytes()).to_hex();
     let expected_suffix = format!("-{}", &raw_hash[..32]);
 
@@ -303,28 +479,33 @@ pub fn is_valid_sandbox_repo_root(
 }
 
 impl GitBackend {
-    /// Constructs a [`GitBackend`] handle for `(repo_root, git_dir)` with an initialized cache.
-    fn with_paths(repo_root: PathBuf, git_dir: PathBuf) -> Self {
+    /// Constructs a [`GitBackend`] handle for `(repo_root, git_dir, common_git_dir)` with an initialized cache.
+    fn with_paths(repo_root: PathBuf, git_dir: PathBuf, common_git_dir: PathBuf) -> Self {
         Self {
             repo_root,
             git_dir,
+            common_git_dir,
             cache: Arc::new(Mutex::new(GitObjectCache::default())),
         }
     }
 
     /// Discovers a Git repository starting at `start_dir` (walking upward if needed) and returns
-    /// a [`GitBackend`] handle.
+    /// a [`GitBackend`] handle. Supports standard `.git` directories, linked worktrees, and submodules.
     ///
     /// # Errors
-    /// Returns [`CoreError::RepoNotFound`] if no `.git` directory exists in `start_dir` or its ancestors.
+    /// Returns [`CoreError::RepoNotFound`] if no `.git` directory or pointer exists in `start_dir` or its ancestors.
     pub fn discover(start_dir: &Path) -> CoreResult<Self> {
-        let mut curr = start_dir.to_path_buf();
+        let mut curr = if start_dir.is_absolute() {
+            start_dir.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(start_dir))
+                .unwrap_or_else(|_| start_dir.to_path_buf())
+        };
 
         loop {
-            let dot_git = curr.join(".git");
-
-            if dot_git.is_dir() {
-                return Ok(Self::with_paths(curr, dot_git));
+            if let Some((git_dir, common_git_dir)) = resolve_dot_git(&curr) {
+                return Ok(Self::with_paths(curr, git_dir, common_git_dir));
             }
 
             if curr.file_name().and_then(|s| s.to_str()) == Some("tmp")
@@ -338,10 +519,8 @@ impl GitBackend {
             }
 
             if let Some(target_root) = is_valid_sandbox_repo_root(&curr, None) {
-                let target_git = target_root.join(".git");
-
-                if target_git.is_dir() {
-                    return Ok(Self::with_paths(target_root, target_git));
+                if let Some((target_git, target_common)) = resolve_dot_git(&target_root) {
+                    return Ok(Self::with_paths(target_root, target_git, target_common));
                 }
             }
 
@@ -352,13 +531,11 @@ impl GitBackend {
                 ) {
                     let ws_path = PathBuf::from(env_ws.trim());
                     let target_root = PathBuf::from(env_root.trim());
-                    let target_git = target_root.join(".git");
 
-                    if !ws_path.as_os_str().is_empty()
-                        && start_dir.starts_with(&ws_path)
-                        && target_git.is_dir()
-                    {
-                        return Ok(Self::with_paths(target_root, target_git));
+                    if !ws_path.as_os_str().is_empty() && start_dir.starts_with(&ws_path) {
+                        if let Some((target_git, target_common)) = resolve_dot_git(&target_root) {
+                            return Ok(Self::with_paths(target_root, target_git, target_common));
+                        }
                     }
                 }
 
@@ -373,37 +550,38 @@ impl GitBackend {
     /// # Errors
     /// Returns [`CoreError::Io`] or [`CoreError::InvalidGitObject`] if initialization fails.
     pub fn init_or_open(repo_root: &Path) -> CoreResult<Self> {
-        let git_dir = repo_root.join(".git");
+        let (git_dir, common_git_dir) = if let Some(resolved) = resolve_dot_git(repo_root) {
+            resolved
+        } else {
+            let dot_git = repo_root.join(".git");
+            fs::create_dir_all(dot_git.join("objects/info")).map_err(|source| CoreError::Io {
+                path: dot_git.display().to_string(),
+                source,
+            })?;
+            fs::create_dir_all(dot_git.join("objects/pack")).map_err(|source| CoreError::Io {
+                path: dot_git.display().to_string(),
+                source,
+            })?;
+            fs::create_dir_all(dot_git.join("refs/heads")).map_err(|source| CoreError::Io {
+                path: dot_git.display().to_string(),
+                source,
+            })?;
+            fs::create_dir_all(dot_git.join("refs/tags")).map_err(|source| CoreError::Io {
+                path: dot_git.display().to_string(),
+                source,
+            })?;
 
-        if !git_dir.exists() {
-            fs::create_dir_all(git_dir.join("objects/info")).map_err(|source| CoreError::Io {
-                path: git_dir.display().to_string(),
-                source,
-            })?;
-            fs::create_dir_all(git_dir.join("objects/pack")).map_err(|source| CoreError::Io {
-                path: git_dir.display().to_string(),
-                source,
-            })?;
-            fs::create_dir_all(git_dir.join("refs/heads")).map_err(|source| CoreError::Io {
-                path: git_dir.display().to_string(),
-                source,
-            })?;
-            fs::create_dir_all(git_dir.join("refs/tags")).map_err(|source| CoreError::Io {
-                path: git_dir.display().to_string(),
-                source,
-            })?;
+            atomic_write_file(&dot_git.join("HEAD"), b"ref: refs/heads/main\n")?;
+            (dot_git.clone(), dot_git)
+        };
 
-            atomic_write_file(&git_dir.join("HEAD"), b"ref: refs/heads/main\n")?;
-        }
-
-        let backend = Self::with_paths(repo_root.to_path_buf(), git_dir);
+        let backend = Self::with_paths(repo_root.to_path_buf(), git_dir, common_git_dir);
 
         // Ensure at least one commit exists so agents always have a valid base commit.
         if backend.resolve_head_commit()?.is_none() {
             let empty_tree = backend.write_tree_from_map(&BTreeMap::new())?;
             let author = backend.resolve_git_author();
-            let root_commit =
-                backend.write_commit(&empty_tree, &[], &author, "Initial commit")?;
+            let root_commit = backend.write_commit(&empty_tree, &[], &author, "Initial commit")?;
             let branch = backend
                 .current_branch_name()
                 .unwrap_or_else(|_| "main".to_string());
@@ -419,15 +597,23 @@ impl GitBackend {
         &self.repo_root
     }
 
-    /// Returns the `.git` directory path.
+    /// Returns the per-worktree `.git` directory path (`HEAD`, `index`, `FETCH_HEAD`).
     pub fn git_dir(&self) -> &Path {
         &self.git_dir
+    }
+
+    /// Returns the shared Git common directory (`objects`, `refs`, `packed-refs`, `config`, `tessera`).
+    ///
+    /// Equal to [`Self::git_dir`] for standard repositories and submodules; points to the main
+    /// repository's `.git` directory for linked Git worktrees.
+    pub fn common_git_dir(&self) -> &Path {
+        &self.common_git_dir
     }
 
     /// Computes the loose object filesystem path `.git/objects/<2-hex>/<38-hex>` for `id`.
     fn loose_object_path(&self, id: &ObjectId) -> PathBuf {
         let hex_str = id.as_str();
-        self.git_dir
+        self.common_git_dir
             .join("objects")
             .join(&hex_str[..2])
             .join(&hex_str[2..])
@@ -483,66 +669,80 @@ impl GitBackend {
     pub fn read_raw_object(&self, id: &ObjectId) -> CoreResult<(String, Vec<u8>)> {
         let path = self.loose_object_path(id);
 
-        if path.exists() {
-            let compressed = fs::read(&path).map_err(|source| CoreError::Io {
-                path: path.display().to_string(),
-                source,
-            })?;
-            let mut decoder = ZlibDecoder::new(&compressed[..]).take(MAX_GIT_OBJECT_BYTES + 64);
-            let mut decompressed = Vec::new();
-            decoder
-                .read_to_end(&mut decompressed)
-                .map_err(|source| CoreError::Io {
+        match fs::read(&path) {
+            Ok(compressed) => {
+                let limit = MAX_GIT_OBJECT_BYTES + 64;
+                let mut decoder = ZlibDecoder::new(&compressed[..]).take(limit + 1);
+                let mut decompressed = Vec::new();
+                decoder
+                    .read_to_end(&mut decompressed)
+                    .map_err(|source| CoreError::Io {
+                        path: path.display().to_string(),
+                        source,
+                    })?;
+
+                if (decompressed.len() as u64) > limit {
+                    return Err(CoreError::InvalidGitObject {
+                        id: id.to_string(),
+                        reason: "decompressed git object exceeds maximum size limit".to_string(),
+                    });
+                }
+
+                let nul_pos = decompressed.iter().position(|&b| b == 0).ok_or_else(|| {
+                    CoreError::InvalidGitObject {
+                        id: id.to_string(),
+                        reason: "missing NUL byte in object header".to_string(),
+                    }
+                })?;
+                let header = std::str::from_utf8(&decompressed[..nul_pos]).map_err(|e| {
+                    CoreError::InvalidGitObject {
+                        id: id.to_string(),
+                        reason: e.to_string(),
+                    }
+                })?;
+                let mut header_parts = header.split_whitespace();
+                let kind = header_parts
+                    .next()
+                    .ok_or_else(|| CoreError::InvalidGitObject {
+                        id: id.to_string(),
+                        reason: "missing object kind in header".to_string(),
+                    })?
+                    .to_string();
+
+                let size_str = header_parts
+                    .next()
+                    .ok_or_else(|| CoreError::InvalidGitObject {
+                        id: id.to_string(),
+                        reason: "missing object size in header".to_string(),
+                    })?;
+                let expected_size =
+                    size_str
+                        .parse::<usize>()
+                        .map_err(|e| CoreError::InvalidGitObject {
+                            id: id.to_string(),
+                            reason: format!("invalid object size '{size_str}': {e}"),
+                        })?;
+                let actual_size = decompressed.len() - (nul_pos + 1);
+
+                if expected_size != actual_size {
+                    return Err(CoreError::InvalidGitObject {
+                        id: id.to_string(),
+                        reason: format!(
+                            "header size {expected_size} does not match payload size {actual_size}"
+                        ),
+                    });
+                }
+
+                decompressed.drain(..=nul_pos);
+                return Ok((kind, decompressed));
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(CoreError::Io {
                     path: path.display().to_string(),
                     source,
-                })?;
-
-            if (decompressed.len() as u64) > MAX_GIT_OBJECT_BYTES + 64 {
-                return Err(CoreError::InvalidGitObject {
-                    id: id.to_string(),
-                    reason: "decompressed git object exceeds maximum size limit".to_string(),
                 });
             }
-
-            let nul_pos = decompressed
-                .iter()
-                .position(|&b| b == 0)
-                .ok_or_else(|| CoreError::InvalidGitObject {
-                    id: id.to_string(),
-                    reason: "missing NUL byte in object header".to_string(),
-                })?;
-            let header = std::str::from_utf8(&decompressed[..nul_pos]).map_err(|e| {
-                CoreError::InvalidGitObject {
-                    id: id.to_string(),
-                    reason: e.to_string(),
-                }
-            })?;
-            let mut header_parts = header.split_whitespace();
-            let kind = header_parts
-                .next()
-                .ok_or_else(|| CoreError::InvalidGitObject {
-                    id: id.to_string(),
-                    reason: "missing object kind in header".to_string(),
-                })?
-                .to_string();
-
-            if let Some(size_str) = header_parts.next() {
-                if let Ok(expected_size) = size_str.parse::<usize>() {
-                    let actual_size = decompressed.len() - (nul_pos + 1);
-
-                    if expected_size != actual_size {
-                        return Err(CoreError::InvalidGitObject {
-                            id: id.to_string(),
-                            reason: format!(
-                                "header size {expected_size} does not match payload size {actual_size}"
-                            ),
-                        });
-                    }
-                }
-            }
-
-            decompressed.drain(..=nul_pos);
-            return Ok((kind, decompressed));
         }
 
         if let Ok(mut guard) = self.cache.lock() {
@@ -565,6 +765,8 @@ impl GitBackend {
 
         // Fallback if persistent batch pipe was reset.
         let type_out = Command::new("git")
+            .env_remove("GIT_OBJECT_DIRECTORY")
+            .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
             .arg("--git-dir")
             .arg(&self.git_dir)
             .args(["cat-file", "-t", id.as_str()])
@@ -581,6 +783,8 @@ impl GitBackend {
         let kind = String::from_utf8_lossy(&type_out.stdout).trim().to_string();
 
         let mut child = Command::new("git")
+            .env_remove("GIT_OBJECT_DIRECTORY")
+            .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
             .arg("--git-dir")
             .arg(&self.git_dir)
             .args(["cat-file", &kind, id.as_str()])
@@ -722,30 +926,27 @@ impl GitBackend {
         let mut pos = 0usize;
 
         while pos < body.len() {
-            let space_offset = body[pos..]
-                .iter()
-                .position(|&b| b == b' ')
-                .ok_or_else(|| CoreError::InvalidGitObject {
+            let space_offset = body[pos..].iter().position(|&b| b == b' ').ok_or_else(|| {
+                CoreError::InvalidGitObject {
                     id: tree_id.to_string(),
                     reason: "missing space in tree entry".to_string(),
-                })?;
-            let mode_str =
-                std::str::from_utf8(&body[pos..pos + space_offset]).map_err(|e| {
-                    CoreError::InvalidGitObject {
-                        id: tree_id.to_string(),
-                        reason: e.to_string(),
-                    }
-                })?;
+                }
+            })?;
+            let mode_str = std::str::from_utf8(&body[pos..pos + space_offset]).map_err(|e| {
+                CoreError::InvalidGitObject {
+                    id: tree_id.to_string(),
+                    reason: e.to_string(),
+                }
+            })?;
             let mode = EntryMode::from_git_octal(mode_str)?;
             pos += space_offset + 1;
 
-            let nul_offset = body[pos..]
-                .iter()
-                .position(|&b| b == 0)
-                .ok_or_else(|| CoreError::InvalidGitObject {
+            let nul_offset = body[pos..].iter().position(|&b| b == 0).ok_or_else(|| {
+                CoreError::InvalidGitObject {
                     id: tree_id.to_string(),
                     reason: "missing NUL after tree entry name".to_string(),
-                })?;
+                }
+            })?;
             let name = std::str::from_utf8(&body[pos..pos + nul_offset])
                 .map_err(|e| CoreError::InvalidGitObject {
                     id: tree_id.to_string(),
@@ -790,15 +991,13 @@ impl GitBackend {
     ///
     /// # Errors
     /// Returns [`CoreError`] if writing any tree object fails.
-    pub fn write_tree_from_map(
-        &self,
-        files: &BTreeMap<String, FileEntry>,
-    ) -> CoreResult<ObjectId> {
-        let items: Vec<(&str, &FileEntry)> = files
+    pub fn write_tree_from_map(&self, files: &BTreeMap<String, FileEntry>) -> CoreResult<ObjectId> {
+        let mut items: Vec<(&str, &FileEntry)> = files
             .iter()
             .map(|(k, v)| (k.trim_matches('/'), v))
             .filter(|(k, _)| !k.is_empty())
             .collect();
+        items.sort_by(|a, b| a.0.cmp(b.0));
 
         self.write_tree_from_slice(&items)
     }
@@ -836,13 +1035,8 @@ impl GitBackend {
                 });
                 idx = end;
             } else {
-                let mode = if entry.executable {
-                    EntryMode::ExecutableFile
-                } else {
-                    EntryMode::NormalFile
-                };
                 nodes.push(GitTreeNode {
-                    mode,
+                    mode: entry.entry_mode(),
                     name: rel_path.to_string(),
                     id: entry.blob_id,
                 });
@@ -877,14 +1071,7 @@ impl GitBackend {
             if is_last {
                 return match found.mode {
                     EntryMode::Directory => Ok(None),
-                    EntryMode::ExecutableFile => Ok(Some(FileEntry {
-                        blob_id: found.id,
-                        executable: true,
-                    })),
-                    EntryMode::NormalFile | EntryMode::Symlink => Ok(Some(FileEntry {
-                        blob_id: found.id,
-                        executable: false,
-                    })),
+                    other => Ok(Some(FileEntry::from_mode(found.id, other))),
                 };
             }
 
@@ -912,18 +1099,24 @@ impl GitBackend {
             return Ok(*root_tree_id);
         }
 
-        let mut clean_updates: Vec<(&str, &Option<FileEntry>)> = Vec::with_capacity(updates.len());
+        let mut normalized_updates: Vec<(String, &Option<FileEntry>)> =
+            Vec::with_capacity(updates.len());
 
         for (raw_path, entry_opt) in updates {
             let trimmed = raw_path.trim_matches('/');
 
             if !trimmed.is_empty() {
-                let _ = validate_repo_rel_path(trimmed)?;
-                clean_updates.push((trimmed, entry_opt));
+                let clean = validate_repo_rel_path(trimmed)?;
+                normalized_updates.push((clean, entry_opt));
             }
         }
 
-        clean_updates.sort_by(|a, b| a.0.cmp(b.0));
+        normalized_updates.sort_by(|a, b| a.0.cmp(&b.0));
+        let clean_updates: Vec<(&str, &Option<FileEntry>)> = normalized_updates
+            .iter()
+            .map(|(p, e)| (p.as_str(), *e))
+            .collect();
+
         self.update_tree_slice(Some(root_tree_id), &clean_updates)?
             .map(Ok)
             .unwrap_or_else(|| self.write_tree_nodes(Vec::new()))
@@ -978,7 +1171,10 @@ impl GitBackend {
                             id: new_sub_id,
                         },
                     );
-                } else {
+                } else if existing
+                    .get(dir_name)
+                    .is_some_and(|n| n.mode == EntryMode::Directory)
+                {
                     existing.remove(dir_name);
                 }
 
@@ -986,15 +1182,10 @@ impl GitBackend {
             } else {
                 match entry_opt {
                     Some(entry) => {
-                        let mode = if entry.executable {
-                            EntryMode::ExecutableFile
-                        } else {
-                            EntryMode::NormalFile
-                        };
                         existing.insert(
                             rel_path.to_string(),
                             GitTreeNode {
-                                mode,
+                                mode: entry.entry_mode(),
                                 name: rel_path.to_string(),
                                 id: entry.blob_id,
                             },
@@ -1021,16 +1212,13 @@ impl GitBackend {
     ///
     /// # Errors
     /// Returns [`CoreError`] if any referenced tree object is unreadable.
-    pub fn read_tree_to_map(
-        &self,
-        tree_id: &ObjectId,
-    ) -> CoreResult<BTreeMap<String, FileEntry>> {
+    pub fn read_tree_to_map(&self, tree_id: &ObjectId) -> CoreResult<BTreeMap<String, FileEntry>> {
         let mut out = BTreeMap::new();
         self.collect_tree_recursive(tree_id, "", &mut out)?;
         Ok(out)
     }
 
-    /// Recursively traverses `tree_id` under `prefix` and populates `out` with leaf file entries.
+    /// Recursively traverses `tree_id` under `prefix` and populates `out` with leaf entries.
     fn collect_tree_recursive(
         &self,
         tree_id: &ObjectId,
@@ -1048,23 +1236,8 @@ impl GitBackend {
                 EntryMode::Directory => {
                     self.collect_tree_recursive(&node.id, &rel_path, out)?;
                 }
-                EntryMode::ExecutableFile => {
-                    out.insert(
-                        rel_path,
-                        FileEntry {
-                            blob_id: node.id,
-                            executable: true,
-                        },
-                    );
-                }
-                EntryMode::NormalFile | EntryMode::Symlink => {
-                    out.insert(
-                        rel_path,
-                        FileEntry {
-                            blob_id: node.id,
-                            executable: false,
-                        },
-                    );
+                other => {
+                    out.insert(rel_path, FileEntry::from_mode(node.id, other));
                 }
             }
         }
@@ -1074,8 +1247,11 @@ impl GitBackend {
 
     /// Writes a native Git `commit` object and returns its [`ObjectId`].
     ///
+    /// Honors `commit.gpgsign = true` by delegating lock-free commit creation to `git commit-tree -S`
+    /// without touching `.git/index`.
+    ///
     /// # Errors
-    /// Returns [`CoreError::Io`] if writing the commit object fails.
+    /// Returns [`CoreError::Io`] or [`CoreError::InvalidGitObject`] if writing or signing the commit fails.
     pub fn write_commit(
         &self,
         tree_id: &ObjectId,
@@ -1092,6 +1268,18 @@ impl GitBackend {
             Some(idx) => raw_clean[..=idx].trim(),
             None => raw_clean.trim(),
         };
+
+        if self
+            .git_config_value("commit.gpgsign")
+            .is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "yes" | "1"))
+        {
+            if let Some(signed_oid) =
+                self.try_write_signed_commit(tree_id, parents, clean_author, secs, message)?
+            {
+                return Ok(signed_oid);
+            }
+        }
+
         let mut body = String::new();
         body.push_str(&format!("tree {}\n", tree_id.as_str()));
 
@@ -1105,6 +1293,81 @@ impl GitBackend {
         body.push('\n');
 
         self.write_raw_object("commit", body.as_bytes())
+    }
+
+    /// Creates a GPG/SSH-signed commit object via `git commit-tree -S` without touching `.git/index`.
+    fn try_write_signed_commit(
+        &self,
+        tree_id: &ObjectId,
+        parents: &[ObjectId],
+        clean_author: &str,
+        secs: u64,
+        message: &str,
+    ) -> CoreResult<Option<ObjectId>> {
+        let (author_name, author_email) = match clean_author.split_once('<') {
+            Some((name_part, rest)) => (
+                name_part.trim().to_string(),
+                rest.trim_end_matches('>').trim().to_string(),
+            ),
+            None => (clean_author.to_string(), "developer@localhost".to_string()),
+        };
+
+        let mut cmd = Command::new("git");
+        cmd.env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .env("GIT_AUTHOR_NAME", &author_name)
+            .env("GIT_AUTHOR_EMAIL", &author_email)
+            .env("GIT_AUTHOR_DATE", format!("{secs} +0000"))
+            .env("GIT_COMMITTER_NAME", &author_name)
+            .env("GIT_COMMITTER_EMAIL", &author_email)
+            .env("GIT_COMMITTER_DATE", format!("{secs} +0000"))
+            .arg("--git-dir")
+            .arg(&self.git_dir)
+            .arg("commit-tree")
+            .arg("-S")
+            .arg(tree_id.as_str());
+
+        for parent in parents {
+            cmd.arg("-p").arg(parent.as_str());
+        }
+
+        let mut child = cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|source| CoreError::Io {
+                path: "git commit-tree -S".to_string(),
+                source,
+            })?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            let mut payload = message.trim_end().to_string();
+            payload.push('\n');
+            stdin
+                .write_all(payload.as_bytes())
+                .map_err(|source| CoreError::Io {
+                    path: "git commit-tree -S stdin".to_string(),
+                    source,
+                })?;
+        }
+
+        let out = child.wait_with_output().map_err(|source| CoreError::Io {
+            path: "git commit-tree -S".to_string(),
+            source,
+        })?;
+
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            return Err(CoreError::InvalidGitObject {
+                id: tree_id.to_string(),
+                reason: format!("commit signing failed (commit.gpgsign=true): {stderr}"),
+            });
+        }
+
+        let hex = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        Ok(Some(ObjectId::from_hex(&hex)?))
     }
 
     /// Reads and parses a native Git `commit` object by its [`ObjectId`].
@@ -1173,7 +1436,7 @@ impl GitBackend {
     /// Reads the symbolic branch name pointed to by `.git/HEAD` (e.g. `"main"`).
     ///
     /// # Errors
-    /// Returns [`CoreError::Io`] if `.git/HEAD` cannot be read.
+    /// Returns [`CoreError::Io`] if `.git/HEAD` cannot be read, or [`CoreError::NotFound`] if `HEAD` is detached.
     pub fn current_branch_name(&self) -> CoreResult<String> {
         let head_path = self.git_dir.join("HEAD");
         let content = fs::read_to_string(&head_path).map_err(|source| CoreError::Io {
@@ -1188,21 +1451,52 @@ impl GitBackend {
             }
         }
 
-        Ok("main".to_string())
+        Err(CoreError::NotFound(
+            "HEAD is detached or does not point to a local branch".to_string(),
+        ))
+    }
+
+    /// Returns `true` if `.git/HEAD` points directly to a commit SHA rather than a symbolic branch ref.
+    #[must_use]
+    pub fn is_detached_head(&self) -> bool {
+        let head_path = self.git_dir.join("HEAD");
+        fs::read_to_string(&head_path)
+            .map(|raw| !raw.trim().starts_with("ref: "))
+            .unwrap_or(false)
     }
 
     /// Resolves a Git reference (such as `"refs/heads/main"`) to its [`ObjectId`],
-    /// checking both loose refs and `.git/packed-refs`.
+    /// checking both loose refs and `.git/packed-refs` with bounded symbolic-ref indirection.
     ///
     /// # Errors
     /// Returns [`CoreError::InvalidArgument`] if `ref_name` is unsafe, or
-    /// [`CoreError::InvalidGitObject`] if a ref file contains malformed hex.
+    /// [`CoreError::InvalidGitObject`] if a ref file contains malformed hex or a symref cycle.
     pub fn resolve_ref(&self, ref_name: &str) -> CoreResult<Option<ObjectId>> {
-        if ref_name != "HEAD" && ref_name != "FETCH_HEAD" {
+        self.resolve_ref_inner(ref_name, 0)
+    }
+
+    /// Internal recursive reference resolver with symref loop protection.
+    fn resolve_ref_inner(&self, ref_name: &str, depth: usize) -> CoreResult<Option<ObjectId>> {
+        if depth > 16 {
+            return Err(CoreError::InvalidGitObject {
+                id: ref_name.to_string(),
+                reason: "symbolic ref cycle detected".to_string(),
+            });
+        }
+
+        let is_per_worktree =
+            matches!(ref_name, "HEAD" | "FETCH_HEAD" | "ORIG_HEAD" | "MERGE_HEAD");
+
+        if !is_per_worktree {
             validate_ref_name(ref_name)?;
         }
 
-        let ref_path = self.git_dir.join(ref_name);
+        let base_dir = if is_per_worktree {
+            &self.git_dir
+        } else {
+            &self.common_git_dir
+        };
+        let ref_path = base_dir.join(ref_name);
 
         if ref_path.is_file() {
             let raw = fs::read_to_string(&ref_path).map_err(|source| CoreError::Io {
@@ -1211,14 +1505,24 @@ impl GitBackend {
             })?;
             let trimmed = raw.trim();
 
+            if ref_name == "FETCH_HEAD" {
+                let first_token = trimmed.split_whitespace().next().unwrap_or("");
+
+                if first_token.is_empty() {
+                    return Ok(None);
+                }
+
+                return Ok(Some(ObjectId::from_hex(first_token)?));
+            }
+
             if let Some(target_ref) = trimmed.strip_prefix("ref: ") {
-                return self.resolve_ref(target_ref.trim());
+                return self.resolve_ref_inner(target_ref.trim(), depth + 1);
             }
 
             return Ok(Some(ObjectId::from_hex(trimmed)?));
         }
 
-        let packed_refs = self.git_dir.join("packed-refs");
+        let packed_refs = self.common_git_dir.join("packed-refs");
 
         if packed_refs.is_file() {
             let raw = fs::read_to_string(&packed_refs).map_err(|source| CoreError::Io {
@@ -1274,32 +1578,76 @@ impl GitBackend {
     /// or [`CoreError::Io`] if writing the ref fails.
     pub fn update_ref(&self, ref_name: &str, commit_id: &ObjectId) -> CoreResult<()> {
         validate_ref_name(ref_name)?;
-        let ref_path = self.git_dir.join(ref_name);
+        let ref_path = self.common_git_dir.join(ref_name);
         let content = format!("{}\n", commit_id.as_str());
         atomic_write_file(&ref_path, content.as_bytes())
     }
 
-    /// Removes a loose or packed Git reference if it exists and passes reference validation.
+    /// Removes a loose or packed Git reference if it exists and passes reference validation,
+    /// preserving `packed-refs` peeled-tag integrity and pruning empty loose ref parent directories.
     pub fn delete_ref(&self, ref_name: &str) {
         if validate_ref_name(ref_name).is_err() {
             return;
         }
 
-        let ref_path = self.git_dir.join(ref_name);
-        let _ = fs::remove_file(ref_path);
+        let refs_root = self.common_git_dir.join("refs");
+        let ref_path = self.common_git_dir.join(ref_name);
+        let _ = fs::remove_file(&ref_path);
 
-        let packed_refs = self.git_dir.join("packed-refs");
+        let mut parent_opt = ref_path.parent();
+
+        while let Some(parent) = parent_opt {
+            if parent == refs_root || !parent.starts_with(&refs_root) {
+                break;
+            }
+
+            if fs::remove_dir(parent).is_err() {
+                break;
+            }
+
+            parent_opt = parent.parent();
+        }
+
+        let packed_refs = self.common_git_dir.join("packed-refs");
 
         if packed_refs.is_file() {
+            let lock_path = self.common_git_dir.join("tessera").join("packed-refs.lock");
+            let lock_file = lock_path.parent().and_then(|p| {
+                let _ = fs::create_dir_all(p);
+                fs::OpenOptions::new()
+                    .create(true)
+                    .read(true)
+                    .write(true)
+                    .truncate(false)
+                    .open(&lock_path)
+                    .ok()
+            });
+
+            if let Some(ref f) = lock_file {
+                let _ = f.lock();
+            }
+
             if let Ok(raw) = fs::read_to_string(&packed_refs) {
                 let mut changed = false;
+                let mut skip_peeled = false;
                 let mut kept = String::with_capacity(raw.len());
 
                 for line in raw.lines() {
-                    if let Some((_, rname)) = line.split_once(' ') {
-                        if rname.trim() == ref_name {
-                            changed = true;
+                    if skip_peeled {
+                        skip_peeled = false;
+
+                        if line.starts_with('^') {
                             continue;
+                        }
+                    }
+
+                    if !line.starts_with('#') && !line.starts_with('^') {
+                        if let Some((_, rname)) = line.split_once(' ') {
+                            if rname.trim() == ref_name {
+                                changed = true;
+                                skip_peeled = true;
+                                continue;
+                            }
                         }
                     }
 
@@ -1322,25 +1670,45 @@ impl GitBackend {
         }
 
         let mut visited = BTreeSet::new();
-        let mut queue = vec![*descendant];
+        let mut queue = std::collections::VecDeque::new();
+        let mut hit_limit_or_error = false;
+        queue.push_back(*descendant);
 
-        while let Some(curr) = queue.pop() {
+        while let Some(curr) = queue.pop_front() {
             if &curr == ancestor {
                 return true;
             }
 
-            if !visited.insert(curr) || visited.len() > 4096 {
+            if visited.contains(&curr) {
                 continue;
             }
 
-            if let Ok(commit) = self.read_commit(&curr) {
-                for p in commit.parents {
-                    queue.push(p);
+            if visited.len() >= 4096 {
+                hit_limit_or_error = true;
+                break;
+            }
+
+            visited.insert(curr);
+
+            match self.read_commit(&curr) {
+                Ok(commit) => {
+                    for p in commit.parents {
+                        queue.push_back(p);
+                    }
+                }
+                Err(_) => {
+                    hit_limit_or_error = true;
                 }
             }
         }
 
+        if !hit_limit_or_error {
+            return false;
+        }
+
         Command::new("git")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
             .arg("--git-dir")
             .arg(&self.git_dir)
             .args([
@@ -1353,8 +1721,8 @@ impl GitBackend {
             .is_ok_and(|s| s.success())
     }
 
-    /// Finds the lowest common ancestor (merge-base) between commits `a` and `b` in the commit DAG
-    /// using an in-memory breadth-first traversal without spawning a child `git` process.
+    /// Finds the lowest common ancestor (merge-base) between commits `a` and `b` in the commit DAG,
+    /// falling back to `git merge-base` on deep or merge-heavy histories for exact LCA accuracy.
     #[must_use]
     pub fn find_merge_base(&self, a: &ObjectId, b: &ObjectId) -> Option<ObjectId> {
         if a == b {
@@ -1363,41 +1731,96 @@ impl GitBackend {
 
         let mut ancestors_a = BTreeSet::new();
         let mut queue_a = std::collections::VecDeque::new();
+        let mut complex_or_deep = false;
         queue_a.push_back(*a);
 
         while let Some(curr) = queue_a.pop_front() {
-            if !ancestors_a.insert(curr) || ancestors_a.len() > 4096 {
-                continue;
-            }
-
-            if let Ok(commit) = self.read_commit(&curr) {
-                for p in commit.parents {
-                    queue_a.push_back(p);
-                }
-            }
-        }
-
-        let mut visited_b = BTreeSet::new();
-        let mut queue_b = std::collections::VecDeque::new();
-        queue_b.push_back(*b);
-
-        while let Some(curr) = queue_b.pop_front() {
             if ancestors_a.contains(&curr) {
-                return Some(curr);
-            }
-
-            if !visited_b.insert(curr) || visited_b.len() > 4096 {
                 continue;
             }
 
-            if let Ok(commit) = self.read_commit(&curr) {
-                for p in commit.parents {
-                    queue_b.push_back(p);
+            if ancestors_a.len() >= 4096 {
+                complex_or_deep = true;
+                break;
+            }
+
+            ancestors_a.insert(curr);
+
+            match self.read_commit(&curr) {
+                Ok(commit) => {
+                    if commit.parents.len() > 1 {
+                        complex_or_deep = true;
+                    }
+
+                    for p in commit.parents {
+                        queue_a.push_back(p);
+                    }
+                }
+                Err(_) => {
+                    complex_or_deep = true;
                 }
             }
         }
 
-        None
+        if !complex_or_deep {
+            let mut visited_b = BTreeSet::new();
+            let mut queue_b = std::collections::VecDeque::new();
+            queue_b.push_back(*b);
+
+            while let Some(curr) = queue_b.pop_front() {
+                if ancestors_a.contains(&curr) {
+                    return Some(curr);
+                }
+
+                if visited_b.contains(&curr) {
+                    continue;
+                }
+
+                if visited_b.len() >= 4096 {
+                    complex_or_deep = true;
+                    break;
+                }
+
+                visited_b.insert(curr);
+
+                match self.read_commit(&curr) {
+                    Ok(commit) => {
+                        if commit.parents.len() > 1 {
+                            complex_or_deep = true;
+                            break;
+                        }
+
+                        for p in commit.parents {
+                            queue_b.push_back(p);
+                        }
+                    }
+                    Err(_) => {
+                        complex_or_deep = true;
+                        break;
+                    }
+                }
+            }
+
+            if !complex_or_deep {
+                return None;
+            }
+        }
+
+        let out = Command::new("git")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .arg("--git-dir")
+            .arg(&self.git_dir)
+            .args(["merge-base", a.as_str(), b.as_str()])
+            .output()
+            .ok()?;
+
+        if !out.status.success() {
+            return None;
+        }
+
+        let hex = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        ObjectId::from_hex(&hex).ok()
     }
 
     /// Updates `.git/HEAD` to point symbolically at `refs/heads/<branch>`.
@@ -1427,9 +1850,21 @@ impl GitBackend {
             .filter(|s| !sanitize_field(s).is_empty())
             .or_else(|| self.git_config_value("user.name"))
             .or_else(Self::os_user_full_name)
-            .or_else(|| std::env::var("USER").ok().filter(|s| !sanitize_field(s).is_empty()))
-            .or_else(|| std::env::var("LOGNAME").ok().filter(|s| !sanitize_field(s).is_empty()))
-            .or_else(|| std::env::var("USERNAME").ok().filter(|s| !sanitize_field(s).is_empty()))
+            .or_else(|| {
+                std::env::var("USER")
+                    .ok()
+                    .filter(|s| !sanitize_field(s).is_empty())
+            })
+            .or_else(|| {
+                std::env::var("LOGNAME")
+                    .ok()
+                    .filter(|s| !sanitize_field(s).is_empty())
+            })
+            .or_else(|| {
+                std::env::var("USERNAME")
+                    .ok()
+                    .filter(|s| !sanitize_field(s).is_empty())
+            })
             .unwrap_or_else(|| "Developer".to_string());
         let name = {
             let s = sanitize_field(&raw_name);
@@ -1444,7 +1879,11 @@ impl GitBackend {
             .ok()
             .filter(|s| !sanitize_field(s).is_empty())
             .or_else(|| self.git_config_value("user.email"))
-            .or_else(|| std::env::var("EMAIL").ok().filter(|s| !sanitize_field(s).is_empty()))
+            .or_else(|| {
+                std::env::var("EMAIL")
+                    .ok()
+                    .filter(|s| !sanitize_field(s).is_empty())
+            })
             .unwrap_or_else(|| format!("{}@localhost", name.to_lowercase().replace(' ', ".")));
         let email = {
             let s = sanitize_field(&raw_email);
@@ -1478,7 +1917,7 @@ impl GitBackend {
     }
 
     /// Queries a single configuration value from `.git/config` or global Git configuration.
-    fn git_config_value(&self, key: &str) -> Option<String> {
+    pub fn git_config_value(&self, key: &str) -> Option<String> {
         let out = Command::new("git")
             .env_remove("GIT_DIR")
             .env_remove("GIT_WORK_TREE")
@@ -1500,6 +1939,51 @@ impl GitBackend {
         } else {
             Some(trimmed.to_string())
         }
+    }
+
+    /// Resolves the user's global Git ignore file (`core.excludesFile`, `$XDG_CONFIG_HOME/git/ignore`,
+    /// or `~/.config/git/ignore`) if one exists on disk.
+    #[must_use]
+    pub fn global_excludes_file(&self) -> Option<PathBuf> {
+        if let Some(configured) = self.git_config_value("core.excludesFile") {
+            let expanded = if let Some(rest) = configured.strip_prefix("~/") {
+                std::env::var("HOME")
+                    .or_else(|_| std::env::var("USERPROFILE"))
+                    .map(|h| PathBuf::from(h).join(rest))
+                    .unwrap_or_else(|_| PathBuf::from(&configured))
+            } else {
+                PathBuf::from(&configured)
+            };
+
+            if expanded.is_file() {
+                return Some(expanded);
+            }
+        }
+
+        if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+            if !xdg.trim().is_empty() {
+                let cand = PathBuf::from(xdg).join("git").join("ignore");
+
+                if cand.is_file() {
+                    return Some(cand);
+                }
+            }
+        }
+
+        if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+            if !home.trim().is_empty() {
+                let cand = PathBuf::from(home)
+                    .join(".config")
+                    .join("git")
+                    .join("ignore");
+
+                if cand.is_file() {
+                    return Some(cand);
+                }
+            }
+        }
+
+        None
     }
 
     /// Synchronizes `.git/index` to match `tree_or_commit_id` (when `.git/index.lock` is not held)
@@ -1534,8 +2018,44 @@ impl GitBackend {
             .output();
     }
 
+    /// Peels an annotated Git `tag` object (possibly nested) down to its target commit [`ObjectId`].
+    fn peel_to_commit(&self, oid: ObjectId) -> CoreResult<ObjectId> {
+        let mut curr = oid;
+
+        for _ in 0..8 {
+            let (kind, body) = self.read_raw_object(&curr)?;
+
+            if kind == "commit" {
+                return Ok(curr);
+            }
+
+            if kind != "tag" {
+                return Err(CoreError::InvalidGitObject {
+                    id: curr.to_string(),
+                    reason: format!("expected commit or tag, found {kind}"),
+                });
+            }
+
+            let text = String::from_utf8_lossy(&body);
+            let target_hex = text
+                .lines()
+                .find_map(|l| l.strip_prefix("object "))
+                .map(str::trim)
+                .ok_or_else(|| CoreError::InvalidGitObject {
+                    id: curr.to_string(),
+                    reason: "annotated tag missing object header".to_string(),
+                })?;
+            curr = ObjectId::from_hex(target_hex)?;
+        }
+
+        Err(CoreError::InvalidGitObject {
+            id: oid.to_string(),
+            reason: "annotated tag indirection depth exceeded".to_string(),
+        })
+    }
+
     /// Resolves any Git revision expression (`HEAD`, `HEAD~1`, short commit SHA, branch name, or tag)
-    /// to its full 40-char commit [`ObjectId`].
+    /// to its full 40-char commit [`ObjectId`], peeling annotated tags to commits.
     ///
     /// # Errors
     /// Returns [`CoreError::InvalidArgument`] if `rev_spec` starts with `-` or is empty, or
@@ -1553,29 +2073,45 @@ impl GitBackend {
             )));
         }
 
-        if let Ok(Some(cid)) = self.resolve_ref(&format!("refs/heads/{trimmed}")) {
-            return Ok(cid);
+        if matches!(trimmed, "HEAD" | "FETCH_HEAD" | "ORIG_HEAD" | "MERGE_HEAD")
+            || trimmed.starts_with("refs/")
+        {
+            if let Ok(Some(oid)) = self.resolve_ref(trimmed) {
+                if let Ok(cid) = self.peel_to_commit(oid) {
+                    return Ok(cid);
+                }
+            }
         }
 
-        if let Ok(Some(cid)) = self.resolve_ref(&format!("refs/remotes/origin/{trimmed}")) {
-            return Ok(cid);
+        if let Ok(Some(oid)) = self.resolve_ref(&format!("refs/heads/{trimmed}")) {
+            if let Ok(cid) = self.peel_to_commit(oid) {
+                return Ok(cid);
+            }
         }
 
-        if let Ok(Some(cid)) = self.resolve_ref(&format!("refs/remotes/{trimmed}")) {
-            return Ok(cid);
+        if let Ok(Some(oid)) = self.resolve_ref(&format!("refs/tags/{trimmed}")) {
+            if let Ok(cid) = self.peel_to_commit(oid) {
+                return Ok(cid);
+            }
         }
 
-        if let Ok(Some(cid)) = self.resolve_ref(&format!("refs/tags/{trimmed}")) {
-            return Ok(cid);
+        if let Ok(Some(oid)) = self.resolve_ref(&format!("refs/remotes/{trimmed}")) {
+            if let Ok(cid) = self.peel_to_commit(oid) {
+                return Ok(cid);
+            }
         }
 
-        if let Ok(Some(cid)) = self.resolve_ref(trimmed) {
-            return Ok(cid);
+        if let Ok(Some(oid)) = self.resolve_ref(&format!("refs/remotes/origin/{trimmed}")) {
+            if let Ok(cid) = self.peel_to_commit(oid) {
+                return Ok(cid);
+            }
         }
 
         let spec_commit = format!("{trimmed}^{{commit}}");
 
         if let Ok(out) = Command::new("git")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
             .arg("--git-dir")
             .arg(&self.git_dir)
             .args(["rev-parse", "--verify", "--quiet", &spec_commit])
@@ -1752,22 +2288,18 @@ mod tests {
         let git = GitBackend::init_or_open(tmp.path()).expect("init git");
 
         let b1 = git.write_blob(b"fn alpha() {}\n").expect("write blob 1");
-        let b2 = git.write_blob(b"export const x = 42;\n").expect("write blob 2");
+        let b2 = git
+            .write_blob(b"export const x = 42;\n")
+            .expect("write blob 2");
 
         let mut files = BTreeMap::new();
         files.insert(
             "crates/core/src/lib.rs".to_string(),
-            FileEntry {
-                blob_id: b1,
-                executable: false,
-            },
+            FileEntry::regular(b1, false),
         );
         files.insert(
             "packages/web/index.ts".to_string(),
-            FileEntry {
-                blob_id: b2,
-                executable: false,
-            },
+            FileEntry::regular(b2, false),
         );
 
         let root_tree = git.write_tree_from_map(&files).expect("write tree");
@@ -1778,26 +2310,18 @@ mod tests {
         let single = git
             .read_tree_entry_at_path(&root_tree, "crates/core/src/lib.rs")
             .expect("single path lookup");
-        assert_eq!(
-            single,
-            Some(FileEntry {
-                blob_id: b1,
-                executable: false,
-            })
+        assert_eq!(single, Some(FileEntry::regular(b1, false)));
+        assert!(
+            git.read_tree_entry_at_path(&root_tree, "crates/core/src/missing.rs")
+                .expect("missing lookup")
+                .is_none()
         );
-        assert!(git
-            .read_tree_entry_at_path(&root_tree, "crates/core/src/missing.rs")
-            .expect("missing lookup")
-            .is_none());
 
         let b3 = git.write_blob(b"fn updated() {}\n").expect("write blob 3");
         let mut updates = BTreeMap::new();
         updates.insert(
             "crates/core/src/lib.rs".to_string(),
-            Some(FileEntry {
-                blob_id: b3,
-                executable: false,
-            }),
+            Some(FileEntry::regular(b3, false)),
         );
         updates.insert("packages/web/index.ts".to_string(), None);
 
@@ -1807,10 +2331,7 @@ mod tests {
         let mut expected_files = BTreeMap::new();
         expected_files.insert(
             "crates/core/src/lib.rs".to_string(),
-            FileEntry {
-                blob_id: b3,
-                executable: false,
-            },
+            FileEntry::regular(b3, false),
         );
         assert_eq!(
             git.read_tree_to_map(&updated_tree).expect("read updated"),
@@ -1849,5 +2370,143 @@ mod tests {
         assert!(git.resolve_revision("--output=/tmp/pwn").is_err());
         assert!(git.update_ref("refs/heads/../config", &head).is_err());
         assert!(git.set_head_branch("--bad-branch").is_err());
+    }
+
+    #[test]
+    fn preserves_symlinks_gitlinks_dir_to_file_and_head_resolution() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let git = GitBackend::init_or_open(tmp.path()).expect("init git");
+
+        let b1 = git.write_blob(b"hello\n").expect("blob");
+        let link_blob = git.write_blob(b"target/path").expect("link blob");
+        let sub_commit =
+            ObjectId::from_hex("1234567890abcdef1234567890abcdef12345678").expect("oid");
+
+        let mut files = BTreeMap::new();
+        files.insert("src/a.rs".to_string(), FileEntry::regular(b1, false));
+        files.insert(
+            "links/latest".to_string(),
+            FileEntry::from_mode(link_blob, EntryMode::Symlink),
+        );
+        files.insert(
+            "vendor/submod".to_string(),
+            FileEntry::from_mode(sub_commit, EntryMode::Gitlink),
+        );
+
+        let tree_id = git.write_tree_from_map(&files).expect("write tree");
+        let roundtrip = git.read_tree_to_map(&tree_id).expect("read tree");
+        assert_eq!(roundtrip, files);
+        assert!(roundtrip["links/latest"].is_symlink());
+        assert!(roundtrip["vendor/submod"].is_gitlink());
+
+        // Replace directory `src` (`src/a.rs`) with a regular file named `src`.
+        let mut dir_to_file = BTreeMap::new();
+        dir_to_file.insert("src".to_string(), Some(FileEntry::regular(b1, true)));
+        dir_to_file.insert("src/a.rs".to_string(), None);
+        let replaced_tree = git
+            .update_tree_entries(&tree_id, &dir_to_file)
+            .expect("replace dir with file");
+        let replaced_map = git.read_tree_to_map(&replaced_tree).expect("read replaced");
+        assert_eq!(replaced_map.get("src"), Some(&FileEntry::regular(b1, true)));
+        assert!(!replaced_map.contains_key("src/a.rs"));
+
+        // Verify resolve_revision("HEAD") prefers local HEAD over refs/remotes/origin/HEAD.
+        let initial = git
+            .resolve_head_commit()
+            .expect("head")
+            .expect("head exists");
+        let next_commit = git
+            .write_commit(&tree_id, &[initial], "Dev <dev@example.com>", "feat: next")
+            .expect("commit");
+        git.update_ref("refs/heads/main", &next_commit)
+            .expect("advance main");
+        git.update_ref("refs/remotes/origin/main", &initial)
+            .expect("origin main");
+        atomic_write_file(
+            &git.common_git_dir().join("refs/remotes/origin/HEAD"),
+            b"ref: refs/remotes/origin/main\n",
+        )
+        .expect("write origin/HEAD");
+
+        assert_eq!(
+            git.resolve_revision("HEAD").expect("resolve HEAD"),
+            next_commit
+        );
+
+        // Verify annotated tag peeling.
+        let tag_body = format!(
+            "object {}\ntype commit\ntag v1.0\ntagger Dev <dev@example.com> 1700000000 +0000\n\nrelease\n",
+            next_commit.as_str()
+        );
+        let tag_oid = git
+            .write_raw_object("tag", tag_body.as_bytes())
+            .expect("write tag");
+        git.update_ref("refs/tags/v1.0", &tag_oid)
+            .expect("update tag");
+        assert_eq!(
+            git.resolve_revision("v1.0").expect("resolve annotated tag"),
+            next_commit
+        );
+
+        // Verify packed-refs peeled line removal.
+        let packed_content = format!(
+            "# pack-refs with: peeled fully-peeled sorted\n{} refs/heads/keep\n{} refs/tags/v1.0\n^{}\n",
+            initial.as_str(),
+            tag_oid.as_str(),
+            next_commit.as_str()
+        );
+        atomic_write_file(
+            &git.common_git_dir().join("packed-refs"),
+            packed_content.as_bytes(),
+        )
+        .expect("write packed-refs");
+        git.delete_ref("refs/tags/v1.0");
+        let after_packed =
+            fs::read_to_string(git.common_git_dir().join("packed-refs")).expect("read packed-refs");
+        assert!(!after_packed.contains("refs/tags/v1.0"));
+        assert!(!after_packed.contains(&format!("^{}", next_commit.as_str())));
+        assert!(after_packed.contains("refs/heads/keep"));
+    }
+
+    #[test]
+    fn discovers_git_worktree_pointer_files_and_rejects_detached_branch_lie() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let main_dir = tmp.path().join("main-repo");
+        fs::create_dir_all(&main_dir).expect("mkdir main");
+        let main_git = GitBackend::init_or_open(&main_dir).expect("init main");
+        let head = main_git
+            .resolve_head_commit()
+            .expect("head")
+            .expect("commit");
+
+        let wt_git_dir = main_git.git_dir().join("worktrees").join("wt1");
+        fs::create_dir_all(&wt_git_dir).expect("mkdir wt gitdir");
+        atomic_write_file(&wt_git_dir.join("commondir"), b"../..\n").expect("commondir");
+        atomic_write_file(
+            &wt_git_dir.join("HEAD"),
+            format!("{}\n", head.as_str()).as_bytes(),
+        )
+        .expect("detached HEAD");
+
+        let wt_dir = tmp.path().join("wt1");
+        fs::create_dir_all(&wt_dir).expect("mkdir wt");
+        atomic_write_file(
+            &wt_dir.join(".git"),
+            format!("gitdir: {}\n", wt_git_dir.display()).as_bytes(),
+        )
+        .expect("write .git pointer");
+
+        let discovered = GitBackend::discover(&wt_dir).expect("discover worktree");
+        assert_eq!(discovered.git_dir(), wt_git_dir.as_path());
+        assert_eq!(
+            discovered.common_git_dir().canonicalize().ok(),
+            main_git.git_dir().canonicalize().ok()
+        );
+        assert!(discovered.is_detached_head());
+        assert!(discovered.current_branch_name().is_err());
+        assert_eq!(
+            discovered.resolve_head_commit().expect("resolve"),
+            Some(head)
+        );
     }
 }

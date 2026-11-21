@@ -10,13 +10,13 @@ pub mod text_merge;
 pub mod tree_merge;
 
 pub use ast_merge::{
-    diff_modified_symbols, extract_ast_symbols, merge_ast_union, merge_file_3way, AstLanguage,
-    AstMergeOutcome, AstSymbol,
+    AstLanguage, AstMergeOutcome, AstSymbol, diff_modified_symbols, extract_ast_symbols,
+    merge_ast_union, merge_file_3way,
 };
 pub use drivers::{
-    merge_cargo_lock_3way, merge_json_3way, merge_toml_3way, try_merge_with_driver,
-    DriverMergeOutcome, MigrationResequence,
+    DriverMergeOutcome, MigrationResequence, merge_cargo_lock_3way, merge_json_3way,
+    merge_toml_3way, try_merge_with_driver,
 };
-pub use rename::{content_similarity_bps, detect_renames, RenameMatch};
-pub use text_merge::{attribute_agent_hunks, merge_text_3way, unified_diff, TextMergeOutcome};
-pub use tree_merge::{merge_trees_3way, TreeMergeOutcome};
+pub use rename::{RenameMatch, content_similarity_bps, detect_renames};
+pub use text_merge::{TextMergeOutcome, attribute_agent_hunks, merge_text_3way, unified_diff};
+pub use tree_merge::{TreeMergeOutcome, merge_trees_3way};

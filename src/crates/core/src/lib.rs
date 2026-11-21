@@ -11,13 +11,14 @@ pub mod model;
 pub mod oplog;
 
 pub use git_backend::{
-    is_valid_sandbox_repo_root, CommitGraphNode, GitBackend, GitCommit, GitTreeNode,
+    CommitGraphNode, GitBackend, GitCommit, GitTreeNode, is_valid_sandbox_repo_root,
+    resolve_dot_git,
 };
 pub use model::{
-    atomic_write_file, atomic_write_file_relaxed, now_millis, resolve_confined_repo_path,
-    validate_hex_id, validate_ref_name, validate_repo_rel_path, validate_safe_identifier,
-    write_working_tree_file_safe, AgentMetadata, ChangeId, ConflictId, ConflictKind,
-    ConflictRecord, CoreError, CoreResult, EntryMode, FileEntry, Merge, ObjectId, OpId, RepoConfig,
-    SessionWaypoint, StashEntry,
+    AgentMetadata, ChangeId, ConflictId, ConflictKind, ConflictRecord, CoreError, CoreResult,
+    EntryMode, FileEntry, FileEntryKind, Merge, ObjectId, OpId, RepoConfig, SessionWaypoint,
+    StashEntry, atomic_write_file, atomic_write_file_relaxed, now_millis,
+    resolve_confined_repo_path, validate_hex_id, validate_ref_name, validate_repo_rel_path,
+    validate_safe_identifier, write_working_tree_file_safe,
 };
 pub use oplog::{OpLogStore, Operation, View};

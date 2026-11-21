@@ -1,19 +1,21 @@
 //! Full 3-way repository tree merging with `O(1)` unchanged subtree skipping,
-//! cross-directory rename routing, and sequential migration collision re-sequencing.
+//! cross-directory rename routing, binary/symlink/gitlink/file-dir safety,
+//! and sequential migration collision re-sequencing.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use core::{
-    now_millis, ConflictKind, ConflictRecord, CoreResult, EntryMode, FileEntry, GitBackend,
-    GitTreeNode, Merge, ObjectId,
+    ConflictKind, ConflictRecord, CoreResult, EntryMode, FileEntry, GitBackend, GitTreeNode, Merge,
+    ObjectId, now_millis,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::ast_merge::merge_file_3way;
 use crate::drivers::{
-    format_resequenced_filename, is_migration_dir, parse_numeric_prefix, MigrationResequence,
+    MigrationResequence, format_resequenced_filename, is_migration_dir, is_migration_file,
+    parse_numeric_prefix,
 };
-use crate::rename::{detect_renames, RenameMatch};
+use crate::rename::{RenameMatch, detect_renames};
 
 /// Result of a full 3-way repository tree merge.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,7 +41,8 @@ pub struct TreeMergeOutcome {
 /// Combines:
 /// - `O(1)` directory-subtree and blob-hash fast-pathing for untouched subtrees and files;
 /// - Cross-directory / cross-package rename detection and AST edit routing;
-/// - Sequential migration collision re-sequencing;
+/// - Sequential migration collision re-sequencing (preserving paired `.up`/`.down` files and order);
+/// - Binary, symbolic link (`120000`), submodule gitlink (`160000`), and file-vs-directory safety;
 /// - Manifest & lockfile merge drivers (`Cargo.toml`, `Cargo.lock`, `package.json`);
 /// - Tree-sitter structural 3-way AST merging and first-class [`ConflictRecord`] generation.
 ///
@@ -131,37 +134,110 @@ pub fn merge_trees_3way(
 
     let mut renames_applied = Vec::new();
     let mut migrations_resequenced = Vec::new();
+    let mut conflicts = Vec::new();
 
-    // Detect cross-package file moves on `left` and route `right`'s modifications.
+    // Detect renames on BOTH sides against the original unmutated maps first.
     let left_renames = find_side_renames(git, &base_files, &left_files)?;
-    for rm in left_renames {
-        if let Some(base_old) = base_files.get(&rm.old_path) {
-            if let Some(right_old) = right_files.remove(&rm.old_path) {
-                // Route right's state of `old_path` to `new_path` if right didn't independently create `new_path`.
-                right_files.entry(rm.new_path.clone()).or_insert(right_old);
-                // Anchor base at `new_path` so the path-level pass runs a 3-way AST merge at `new_path`!
-                let _ = base_old;
-                renames_applied.push(rm);
-            }
-        }
-    }
-
-    // Detect cross-package file moves on `right` and route `left`'s modifications.
     let right_renames = find_side_renames(git, &base_files, &right_files)?;
-    for rm in right_renames {
-        if base_files.contains_key(&rm.old_path) {
-            if let Some(left_old) = left_files.remove(&rm.old_path) {
-                left_files.entry(rm.new_path.clone()).or_insert(left_old);
-                renames_applied.push(rm);
+
+    let left_by_old: BTreeMap<String, RenameMatch> = left_renames
+        .into_iter()
+        .map(|rm| (rm.old_path.clone(), rm))
+        .collect();
+    let right_by_old: BTreeMap<String, RenameMatch> = right_renames
+        .into_iter()
+        .map(|rm| (rm.old_path.clone(), rm))
+        .collect();
+
+    let mut effective_base = base_files.clone();
+    let mut handled_old_paths: BTreeSet<String> = BTreeSet::new();
+
+    for (old_path, l_rm) in &left_by_old {
+        if let Some(r_rm) = right_by_old.get(old_path) {
+            handled_old_paths.insert(old_path.clone());
+
+            if l_rm.new_path == r_rm.new_path {
+                if let Some(orig_entry) = effective_base.remove(old_path) {
+                    effective_base.insert(l_rm.new_path.clone(), orig_entry);
+                }
+
+                renames_applied.push(l_rm.clone());
+            } else {
+                // Rename/rename (1-to-2) conflict: preserve both destination files and record a conflict.
+                let base_oid = base_files.get(old_path).map(|e| e.blob_id);
+                let left_oid = left_files.get(&l_rm.new_path).map(|e| e.blob_id);
+                let right_oid = right_files.get(&r_rm.new_path).map(|e| e.blob_id);
+                let blob_merge = Merge {
+                    removes: vec![base_oid],
+                    adds: vec![left_oid, right_oid],
+                };
+                let symbol = Some("rename/rename".to_string());
+                let cid = ConflictRecord::compute_id(old_path, symbol.as_deref(), &blob_merge);
+                let mut intents = BTreeMap::new();
+                intents.insert(left_agent_id.to_string(), left_intent.to_string());
+                intents.insert(right_agent_id.to_string(), right_intent.to_string());
+
+                conflicts.push(ConflictRecord {
+                    id: cid,
+                    path: old_path.clone(),
+                    symbol,
+                    kind: ConflictKind::DeleteModify,
+                    merge: blob_merge,
+                    agent_intents: intents,
+                    base_snippet: format!("original path: {old_path}"),
+                    left_snippet: format!("renamed to: {}", l_rm.new_path),
+                    right_snippet: format!("renamed to: {}", r_rm.new_path),
+                    diagnostics: None,
+                    created_at_ms: now_millis(),
+                });
+                effective_base.remove(old_path);
             }
         }
     }
 
-    // Build an effective base map that includes moved base entries at their new destination paths.
-    let mut effective_base = base_files.clone();
-    for rm in &renames_applied {
-        if let Some(orig_entry) = effective_base.remove(&rm.old_path) {
-            effective_base.insert(rm.new_path.clone(), orig_entry);
+    for (old_path, rm) in &left_by_old {
+        if handled_old_paths.contains(old_path) {
+            continue;
+        }
+
+        // Guard against rename/add collision: do not drop right's edits to old_path if right already created new_path.
+        if right_files.contains_key(&rm.new_path) {
+            continue;
+        }
+
+        if base_files.contains_key(old_path) {
+            if let Some(right_old) = right_files.remove(old_path) {
+                right_files.insert(rm.new_path.clone(), right_old);
+
+                if let Some(orig_entry) = effective_base.remove(old_path) {
+                    effective_base.insert(rm.new_path.clone(), orig_entry);
+                }
+
+                renames_applied.push(rm.clone());
+            }
+        }
+    }
+
+    for (old_path, rm) in &right_by_old {
+        if handled_old_paths.contains(old_path) {
+            continue;
+        }
+
+        // Guard against rename/add collision: do not drop left's edits to old_path if left already created new_path.
+        if left_files.contains_key(&rm.new_path) {
+            continue;
+        }
+
+        if base_files.contains_key(old_path) {
+            if let Some(left_old) = left_files.remove(old_path) {
+                left_files.insert(rm.new_path.clone(), left_old);
+
+                if let Some(orig_entry) = effective_base.remove(old_path) {
+                    effective_base.insert(rm.new_path.clone(), orig_entry);
+                }
+
+                renames_applied.push(rm.clone());
+            }
         }
     }
 
@@ -173,6 +249,7 @@ pub fn merge_trees_3way(
     );
 
     let mut all_paths = BTreeSet::new();
+
     for p in effective_base
         .keys()
         .chain(left_files.keys())
@@ -182,7 +259,6 @@ pub fn merge_trees_3way(
     }
 
     let mut merged_files = BTreeMap::new();
-    let mut conflicts = Vec::new();
 
     let left_label = format!("{left_agent_id} ({left_intent})");
     let right_label = format!("{right_agent_id} ({right_intent})");
@@ -193,17 +269,53 @@ pub fn merge_trees_3way(
         let r_entry = right_files.get(&path).cloned();
 
         let alg_merge = Merge::from_3way(b_entry.clone(), l_entry.clone(), r_entry.clone());
+
         if let Some(resolved_opt) = alg_merge.as_resolved() {
             if let Some(entry) = resolved_opt {
                 merged_files.insert(path, entry.clone());
             }
+
             continue;
         }
 
-        // Unresolved algebraic entry: either both modified/added `path` with different blobs,
+        // Unresolved algebraic entry: either both modified/added `path` with different entries,
         // or one deleted while the other modified.
         match (&b_entry, &l_entry, &r_entry) {
             (_, Some(le), Some(re)) => {
+                if le.is_symlink()
+                    || re.is_symlink()
+                    || le.is_gitlink()
+                    || re.is_gitlink()
+                    || b_entry
+                        .as_ref()
+                        .is_some_and(|e| e.is_symlink() || e.is_gitlink())
+                {
+                    merged_files.insert(path.clone(), le.clone());
+                    let blob_merge = Merge {
+                        removes: vec![b_entry.as_ref().map(|e| e.blob_id)],
+                        adds: vec![Some(le.blob_id), Some(re.blob_id)],
+                    };
+                    let cid = ConflictRecord::compute_id(&path, None, &blob_merge);
+                    let mut intents = BTreeMap::new();
+                    intents.insert(left_agent_id.to_string(), left_intent.to_string());
+                    intents.insert(right_agent_id.to_string(), right_intent.to_string());
+
+                    conflicts.push(ConflictRecord {
+                        id: cid,
+                        path,
+                        symbol: None,
+                        kind: ConflictKind::Binary,
+                        merge: blob_merge,
+                        agent_intents: intents,
+                        base_snippet: format_special_entry_snippet(git, b_entry.as_ref())?,
+                        left_snippet: format_special_entry_snippet(git, Some(le))?,
+                        right_snippet: format_special_entry_snippet(git, Some(re))?,
+                        diagnostics: None,
+                        created_at_ms: now_millis(),
+                    });
+                    continue;
+                }
+
                 let base_exec = b_entry.as_ref().is_some_and(|e| e.executable);
                 let merged_exec = Merge::from_3way(base_exec, le.executable, re.executable)
                     .as_resolved()
@@ -214,14 +326,9 @@ pub fn merge_trees_3way(
                     Some(le.blob_id),
                     Some(re.blob_id),
                 );
+
                 if let Some(Some(resolved_blob_id)) = blob_alg.as_resolved() {
-                    merged_files.insert(
-                        path,
-                        FileEntry {
-                            blob_id: *resolved_blob_id,
-                            executable: merged_exec,
-                        },
-                    );
+                    merged_files.insert(path, FileEntry::regular(*resolved_blob_id, merged_exec));
                     continue;
                 }
 
@@ -232,25 +339,56 @@ pub fn merge_trees_3way(
                 let left_bytes = git.read_blob(&le.blob_id)?;
                 let right_bytes = git.read_blob(&re.blob_id)?;
 
-                let base_str = String::from_utf8_lossy(&base_bytes);
-                let left_str = String::from_utf8_lossy(&left_bytes);
-                let right_str = String::from_utf8_lossy(&right_bytes);
+                if is_binary_bytes(&left_bytes)
+                    || is_binary_bytes(&right_bytes)
+                    || is_binary_bytes(&base_bytes)
+                {
+                    merged_files.insert(path.clone(), FileEntry::regular(le.blob_id, merged_exec));
+                    let blob_merge = Merge {
+                        removes: vec![b_entry.as_ref().map(|e| e.blob_id)],
+                        adds: vec![Some(le.blob_id), Some(re.blob_id)],
+                    };
+                    let cid = ConflictRecord::compute_id(&path, None, &blob_merge);
+                    let mut intents = BTreeMap::new();
+                    intents.insert(left_agent_id.to_string(), left_intent.to_string());
+                    intents.insert(right_agent_id.to_string(), right_intent.to_string());
+
+                    conflicts.push(ConflictRecord {
+                        id: cid,
+                        path,
+                        symbol: None,
+                        kind: ConflictKind::Binary,
+                        merge: blob_merge,
+                        agent_intents: intents,
+                        base_snippet: if b_entry.is_some() {
+                            format!("<binary: {} bytes>", base_bytes.len())
+                        } else {
+                            "<absent>".to_string()
+                        },
+                        left_snippet: format!("<binary: {} bytes>", left_bytes.len()),
+                        right_snippet: format!("<binary: {} bytes>", right_bytes.len()),
+                        diagnostics: None,
+                        created_at_ms: now_millis(),
+                    });
+                    continue;
+                }
+
+                let base_str = std::str::from_utf8(&base_bytes).unwrap_or("");
+                let left_str = std::str::from_utf8(&left_bytes).unwrap_or("");
+                let right_str = std::str::from_utf8(&right_bytes).unwrap_or("");
 
                 let ast_out = merge_file_3way(
                     &path,
-                    &base_str,
-                    &left_str,
-                    &right_str,
+                    base_str,
+                    left_str,
+                    right_str,
                     &left_label,
                     &right_label,
                 );
                 let merged_blob_id = git.write_blob(ast_out.content.as_bytes())?;
                 merged_files.insert(
                     path.clone(),
-                    FileEntry {
-                        blob_id: merged_blob_id,
-                        executable: merged_exec,
-                    },
+                    FileEntry::regular(merged_blob_id, merged_exec),
                 );
 
                 if ast_out.has_conflicts {
@@ -285,10 +423,7 @@ pub fn merge_trees_3way(
                 }
             }
             (Some(be), Some(le), None) | (Some(be), None, Some(le)) => {
-                // Delete/modify conflict: preserve the modified file in the tree and record a DeleteModify conflict.
                 merged_files.insert(path.clone(), le.clone());
-                let base_bytes = git.read_blob(&be.blob_id)?;
-                let mod_bytes = git.read_blob(&le.blob_id)?;
                 let blob_merge = Merge {
                     removes: vec![Some(be.blob_id)],
                     adds: vec![
@@ -301,6 +436,9 @@ pub fn merge_trees_3way(
                 intents.insert(left_agent_id.to_string(), left_intent.to_string());
                 intents.insert(right_agent_id.to_string(), right_intent.to_string());
 
+                let base_snippet = format_entry_preview(git, be)?;
+                let mod_snippet = format_entry_preview(git, le)?;
+
                 conflicts.push(ConflictRecord {
                     id: cid,
                     path,
@@ -308,26 +446,14 @@ pub fn merge_trees_3way(
                     kind: ConflictKind::DeleteModify,
                     merge: blob_merge,
                     agent_intents: intents,
-                    base_snippet: String::from_utf8_lossy(&base_bytes)
-                        .lines()
-                        .take(15)
-                        .collect::<Vec<_>>()
-                        .join("\n"),
+                    base_snippet,
                     left_snippet: if l_entry.is_some() {
-                        String::from_utf8_lossy(&mod_bytes)
-                            .lines()
-                            .take(15)
-                            .collect::<Vec<_>>()
-                            .join("\n")
+                        mod_snippet.clone()
                     } else {
                         "<deleted>".to_string()
                     },
                     right_snippet: if r_entry.is_some() {
-                        String::from_utf8_lossy(&mod_bytes)
-                            .lines()
-                            .take(15)
-                            .collect::<Vec<_>>()
-                            .join("\n")
+                        mod_snippet
                     } else {
                         "<deleted>".to_string()
                     },
@@ -338,6 +464,19 @@ pub fn merge_trees_3way(
             _ => {}
         }
     }
+
+    resolve_file_directory_conflicts(
+        &effective_base,
+        &left_files,
+        &right_files,
+        &passthrough_subtrees,
+        left_agent_id,
+        left_intent,
+        right_agent_id,
+        right_intent,
+        &mut merged_files,
+        &mut conflicts,
+    );
 
     let merged_tree_id =
         write_tree_from_map_and_subtrees(git, &merged_files, &passthrough_subtrees)?;
@@ -352,6 +491,156 @@ pub fn merge_trees_3way(
         migrations_resequenced,
         touched_paths,
     })
+}
+
+/// Returns `true` if `bytes` contains NUL bytes or is not valid UTF-8.
+fn is_binary_bytes(bytes: &[u8]) -> bool {
+    bytes.contains(&0) || std::str::from_utf8(bytes).is_err()
+}
+
+/// Formats a human-readable snippet for a symlink, gitlink, or regular file entry without ever
+/// calling `read_blob` on a submodule commit (`EntryMode::Gitlink`).
+fn format_special_entry_snippet(git: &GitBackend, entry: Option<&FileEntry>) -> CoreResult<String> {
+    let Some(e) = entry else {
+        return Ok("<absent>".to_string());
+    };
+
+    if e.is_gitlink() {
+        return Ok(format!("gitlink {}", e.blob_id));
+    }
+
+    if e.is_symlink() {
+        let bytes = git.read_blob(&e.blob_id)?;
+        return Ok(format!("symlink -> {}", String::from_utf8_lossy(&bytes)));
+    }
+
+    format_entry_preview(git, e)
+}
+
+/// Formats a short preview snippet for an entry in delete/modify conflicts safely handling
+/// binary files, symlinks, and submodule gitlinks.
+fn format_entry_preview(git: &GitBackend, entry: &FileEntry) -> CoreResult<String> {
+    if entry.is_gitlink() {
+        return Ok(format!("gitlink {}", entry.blob_id));
+    }
+
+    let bytes = git.read_blob(&entry.blob_id)?;
+
+    if entry.is_symlink() {
+        return Ok(format!("symlink -> {}", String::from_utf8_lossy(&bytes)));
+    }
+
+    if is_binary_bytes(&bytes) {
+        return Ok(format!("<binary: {} bytes>", bytes.len()));
+    }
+
+    let text = std::str::from_utf8(&bytes).unwrap_or("");
+    Ok(text.lines().take(15).collect::<Vec<_>>().join("\n"))
+}
+
+/// Detects leaf paths in `merged_files` that collide with directory prefixes implied by other
+/// entries in `merged_files` or `passthrough_subtrees`, emitting [`ConflictKind::FileDirectory`]
+/// records and removing colliding leaf paths so the resulting Git tree has no duplicate entries.
+#[allow(clippy::too_many_arguments)]
+fn resolve_file_directory_conflicts(
+    base_files: &BTreeMap<String, FileEntry>,
+    left_files: &BTreeMap<String, FileEntry>,
+    right_files: &BTreeMap<String, FileEntry>,
+    passthrough_subtrees: &BTreeMap<String, ObjectId>,
+    left_agent_id: &str,
+    left_intent: &str,
+    right_agent_id: &str,
+    right_intent: &str,
+    merged_files: &mut BTreeMap<String, FileEntry>,
+    conflicts: &mut Vec<ConflictRecord>,
+) {
+    let mut dir_prefixes: BTreeSet<String> = BTreeSet::new();
+
+    for path in merged_files.keys() {
+        let mut cur = path.as_str();
+
+        while let Some((parent, _)) = cur.rsplit_once('/') {
+            dir_prefixes.insert(parent.to_string());
+            cur = parent;
+        }
+    }
+
+    for dir_path in passthrough_subtrees.keys() {
+        let trimmed = dir_path.trim_matches('/');
+
+        if !trimmed.is_empty() {
+            dir_prefixes.insert(trimmed.to_string());
+            let mut cur = trimmed;
+
+            while let Some((parent, _)) = cur.rsplit_once('/') {
+                dir_prefixes.insert(parent.to_string());
+                cur = parent;
+            }
+        }
+    }
+
+    let colliding_files: Vec<String> = merged_files
+        .keys()
+        .filter(|p| dir_prefixes.contains(p.as_str()))
+        .cloned()
+        .collect();
+
+    for file_path in colliding_files {
+        let removed_entry = merged_files.remove(&file_path);
+        conflicts.retain(|c| c.path != file_path);
+
+        let b_oid = base_files.get(&file_path).map(|e| e.blob_id);
+        let l_oid = left_files.get(&file_path).map(|e| e.blob_id);
+        let r_oid = right_files.get(&file_path).map(|e| e.blob_id);
+
+        let left_is_dir = has_descendant_prefix(left_files, &file_path);
+        let right_is_dir = has_descendant_prefix(right_files, &file_path);
+        let base_is_dir = has_descendant_prefix(base_files, &file_path);
+
+        let blob_merge = Merge {
+            removes: vec![b_oid],
+            adds: vec![
+                l_oid.or_else(|| removed_entry.as_ref().map(|e| e.blob_id)),
+                r_oid,
+            ],
+        };
+        let cid = ConflictRecord::compute_id(&file_path, None, &blob_merge);
+        let mut intents = BTreeMap::new();
+        intents.insert(left_agent_id.to_string(), left_intent.to_string());
+        intents.insert(right_agent_id.to_string(), right_intent.to_string());
+
+        let describe_side = |is_file: bool, is_dir: bool| -> String {
+            if is_dir {
+                format!("<directory {file_path}/>")
+            } else if is_file {
+                format!("<file {file_path}>")
+            } else {
+                "<absent>".to_string()
+            }
+        };
+
+        conflicts.push(ConflictRecord {
+            id: cid,
+            path: file_path.clone(),
+            symbol: None,
+            kind: ConflictKind::FileDirectory,
+            merge: blob_merge,
+            agent_intents: intents,
+            base_snippet: describe_side(b_oid.is_some(), base_is_dir),
+            left_snippet: describe_side(l_oid.is_some(), left_is_dir),
+            right_snippet: describe_side(r_oid.is_some(), right_is_dir),
+            diagnostics: None,
+            created_at_ms: now_millis(),
+        });
+    }
+}
+
+/// Returns `true` if `map` contains any path nested beneath `dir_prefix/`.
+fn has_descendant_prefix(map: &BTreeMap<String, FileEntry>, dir_prefix: &str) -> bool {
+    let prefix = format!("{dir_prefix}/");
+    map.range(prefix.clone()..)
+        .next()
+        .is_some_and(|(k, _)| k.starts_with(&prefix))
 }
 
 /// Recursively walks `(base_tree, left_tree, right_tree)` in lockstep, skipping any directory
@@ -380,11 +669,13 @@ fn collect_selective_trees_3way(
     let r_nodes = read_nodes_map(git, right_tree)?;
 
     let mut names = BTreeSet::new();
+
     for k in b_nodes.keys().chain(l_nodes.keys()).chain(r_nodes.keys()) {
         names.insert(k.clone());
     }
 
     let mut skipped = 0usize;
+
     for name in names {
         let rel_path = if prefix.is_empty() {
             name.clone()
@@ -401,17 +692,10 @@ fn collect_selective_trees_3way(
             || rn.is_some_and(|n| n.mode == EntryMode::Directory);
 
         if is_dir {
-            let b_sub = bn
-                .filter(|n| n.mode == EntryMode::Directory)
-                .map(|n| &n.id);
-            let l_sub = ln
-                .filter(|n| n.mode == EntryMode::Directory)
-                .map(|n| &n.id);
-            let r_sub = rn
-                .filter(|n| n.mode == EntryMode::Directory)
-                .map(|n| &n.id);
+            let b_sub = bn.filter(|n| n.mode == EntryMode::Directory).map(|n| &n.id);
+            let l_sub = ln.filter(|n| n.mode == EntryMode::Directory).map(|n| &n.id);
+            let r_sub = rn.filter(|n| n.mode == EntryMode::Directory).map(|n| &n.id);
 
-            // Handle file-vs-directory replacements by also recording any non-directory entries.
             record_file_node_if_present(bn, &rel_path, base_files);
             record_file_node_if_present(ln, &rel_path, left_files);
             record_file_node_if_present(rn, &rel_path, right_files);
@@ -443,15 +727,18 @@ fn read_nodes_map(
     tree_id: Option<&ObjectId>,
 ) -> CoreResult<BTreeMap<String, GitTreeNode>> {
     let mut map = BTreeMap::new();
+
     if let Some(tid) = tree_id {
         for node in git.read_tree_nodes(tid)? {
             map.insert(node.name.clone(), node);
         }
     }
+
     Ok(map)
 }
 
-/// Inserts `node_opt` into `out` at `rel_path` if it is a file rather than a directory.
+/// Inserts `node_opt` into `out` at `rel_path` if it is a non-directory leaf entry,
+/// preserving exact [`EntryMode`] (`100644`, `100755`, `120000`, `160000`).
 fn record_file_node_if_present(
     node_opt: Option<&GitTreeNode>,
     rel_path: &str,
@@ -461,27 +748,26 @@ fn record_file_node_if_present(
         if node.mode != EntryMode::Directory {
             out.insert(
                 rel_path.to_string(),
-                FileEntry {
-                    blob_id: node.id,
-                    executable: node.mode == EntryMode::ExecutableFile,
-                },
+                FileEntry::from_mode(node.id, node.mode),
             );
         }
     }
 }
 
-/// Writes a hierarchical Git tree combining modified `files` and unchanged `passthrough_subtrees`.
+/// Writes a hierarchical Git tree combining modified `files` and unchanged `passthrough_subtrees`,
+/// guaranteeing exact entry modes and zero duplicate entry names within any tree level.
 fn write_tree_from_map_and_subtrees(
     git: &GitBackend,
     files: &BTreeMap<String, FileEntry>,
     passthrough_subtrees: &BTreeMap<String, ObjectId>,
 ) -> CoreResult<ObjectId> {
-    let mut direct_nodes: Vec<GitTreeNode> = Vec::new();
+    let mut direct_nodes_by_name: BTreeMap<String, GitTreeNode> = BTreeMap::new();
     let mut subdirs_files: BTreeMap<String, BTreeMap<String, FileEntry>> = BTreeMap::new();
     let mut subdirs_trees: BTreeMap<String, BTreeMap<String, ObjectId>> = BTreeMap::new();
 
     for (rel_path, entry) in files {
         let trimmed = rel_path.trim_matches('/');
+
         if trimmed.is_empty() {
             continue;
         }
@@ -492,21 +778,20 @@ fn write_tree_from_map_and_subtrees(
                 .or_default()
                 .insert(rest.to_string(), entry.clone());
         } else {
-            let mode = if entry.executable {
-                EntryMode::ExecutableFile
-            } else {
-                EntryMode::NormalFile
-            };
-            direct_nodes.push(GitTreeNode {
-                mode,
-                name: trimmed.to_string(),
-                id: entry.blob_id,
-            });
+            direct_nodes_by_name.insert(
+                trimmed.to_string(),
+                GitTreeNode {
+                    mode: entry.entry_mode(),
+                    name: trimmed.to_string(),
+                    id: entry.blob_id,
+                },
+            );
         }
     }
 
     for (dir_path, tree_id) in passthrough_subtrees {
         let trimmed = dir_path.trim_matches('/');
+
         if trimmed.is_empty() {
             continue;
         }
@@ -517,15 +802,19 @@ fn write_tree_from_map_and_subtrees(
                 .or_default()
                 .insert(rest.to_string(), *tree_id);
         } else {
-            direct_nodes.push(GitTreeNode {
-                mode: EntryMode::Directory,
-                name: trimmed.to_string(),
-                id: *tree_id,
-            });
+            direct_nodes_by_name.insert(
+                trimmed.to_string(),
+                GitTreeNode {
+                    mode: EntryMode::Directory,
+                    name: trimmed.to_string(),
+                    id: *tree_id,
+                },
+            );
         }
     }
 
     let mut all_subdir_names = BTreeSet::new();
+
     for k in subdirs_files.keys().chain(subdirs_trees.keys()) {
         all_subdir_names.insert(k.clone());
     }
@@ -534,68 +823,203 @@ fn write_tree_from_map_and_subtrees(
         let f_map = subdirs_files.remove(&dir_name).unwrap_or_default();
         let t_map = subdirs_trees.remove(&dir_name).unwrap_or_default();
         let sub_tree_id = write_tree_from_map_and_subtrees(git, &f_map, &t_map)?;
-        direct_nodes.push(GitTreeNode {
-            mode: EntryMode::Directory,
-            name: dir_name,
-            id: sub_tree_id,
-        });
+        direct_nodes_by_name.insert(
+            dir_name.clone(),
+            GitTreeNode {
+                mode: EntryMode::Directory,
+                name: dir_name,
+                id: sub_tree_id,
+            },
+        );
     }
 
+    let direct_nodes: Vec<GitTreeNode> = direct_nodes_by_name.into_values().collect();
     git.write_tree_nodes(direct_nodes)
 }
 
-/// Identifies files moved or renamed between `base_files` and `side_files`.
+/// Identifies files moved or renamed between `base_files` and `side_files`, running an
+/// `O(D + A)` exact blob-OID match pass before reading blobs for fuzzy shingle similarity.
 fn find_side_renames(
     git: &GitBackend,
     base_files: &BTreeMap<String, FileEntry>,
     side_files: &BTreeMap<String, FileEntry>,
 ) -> CoreResult<Vec<RenameMatch>> {
-    let mut deleted = BTreeMap::new();
+    let mut deleted_entries: BTreeMap<String, &FileEntry> = BTreeMap::new();
+
     for (path, entry) in base_files {
-        if !side_files.contains_key(path) {
-            deleted.insert(path.clone(), git.read_blob(&entry.blob_id)?);
+        if !side_files.contains_key(path) && !entry.is_gitlink() {
+            deleted_entries.insert(path.clone(), entry);
         }
     }
 
-    if deleted.is_empty() {
+    if deleted_entries.is_empty() {
         return Ok(Vec::new());
     }
 
-    let mut added = BTreeMap::new();
+    let mut added_entries: BTreeMap<String, &FileEntry> = BTreeMap::new();
+
     for (path, entry) in side_files {
-        if !base_files.contains_key(path) {
-            added.insert(path.clone(), git.read_blob(&entry.blob_id)?);
+        if !base_files.contains_key(path) && !entry.is_gitlink() {
+            added_entries.insert(path.clone(), entry);
         }
     }
 
-    if added.is_empty() {
+    if added_entries.is_empty() {
         return Ok(Vec::new());
     }
 
-    Ok(detect_renames(&deleted, &added))
+    let mut del_by_oid: BTreeMap<ObjectId, Vec<String>> = BTreeMap::new();
+    let mut add_by_oid: BTreeMap<ObjectId, Vec<String>> = BTreeMap::new();
+
+    for (path, entry) in &deleted_entries {
+        del_by_oid
+            .entry(entry.blob_id)
+            .or_default()
+            .push(path.clone());
+    }
+
+    for (path, entry) in &added_entries {
+        add_by_oid
+            .entry(entry.blob_id)
+            .or_default()
+            .push(path.clone());
+    }
+
+    let mut exact_candidates: Vec<RenameMatch> = Vec::new();
+
+    for (oid, del_paths) in &del_by_oid {
+        let Some(add_paths) = add_by_oid.get(oid) else {
+            continue;
+        };
+
+        let sample_bytes = git.read_blob(oid)?;
+
+        if sample_bytes.is_empty() {
+            continue;
+        }
+
+        if !is_binary_bytes(&sample_bytes) {
+            let token_count = std::str::from_utf8(&sample_bytes)
+                .map(|s| s.split_whitespace().take(3).count())
+                .unwrap_or(0);
+
+            if token_count < 3 {
+                continue;
+            }
+        }
+
+        for old_path in del_paths {
+            for new_path in add_paths {
+                exact_candidates.push(RenameMatch {
+                    old_path: old_path.clone(),
+                    new_path: new_path.clone(),
+                    similarity_bps: 10_000,
+                });
+            }
+        }
+    }
+
+    exact_candidates.sort_by(|a, b| {
+        let a_same_base = a.old_path.rsplit('/').next() == a.new_path.rsplit('/').next();
+        let b_same_base = b.old_path.rsplit('/').next() == b.new_path.rsplit('/').next();
+        let a_same_dir = a.old_path.rsplit_once('/').map(|(d, _)| d)
+            == a.new_path.rsplit_once('/').map(|(d, _)| d);
+        let b_same_dir = b.old_path.rsplit_once('/').map(|(d, _)| d)
+            == b.new_path.rsplit_once('/').map(|(d, _)| d);
+
+        b_same_base
+            .cmp(&a_same_base)
+            .then_with(|| b_same_dir.cmp(&a_same_dir))
+            .then_with(|| a.old_path.cmp(&b.old_path))
+            .then_with(|| a.new_path.cmp(&b.new_path))
+    });
+
+    let mut matched_old: BTreeSet<String> = BTreeSet::new();
+    let mut matched_new: BTreeSet<String> = BTreeSet::new();
+    let mut results: Vec<RenameMatch> = Vec::new();
+
+    for cand in exact_candidates {
+        if matched_old.contains(&cand.old_path) || matched_new.contains(&cand.new_path) {
+            continue;
+        }
+
+        matched_old.insert(cand.old_path.clone());
+        matched_new.insert(cand.new_path.clone());
+        results.push(cand);
+    }
+
+    let mut rem_deleted = BTreeMap::new();
+
+    for (path, entry) in &deleted_entries {
+        if !matched_old.contains(path) && !entry.is_symlink() {
+            rem_deleted.insert(path.clone(), git.read_blob(&entry.blob_id)?);
+        }
+    }
+
+    let mut rem_added = BTreeMap::new();
+
+    for (path, entry) in &added_entries {
+        if !matched_new.contains(path) && !entry.is_symlink() {
+            rem_added.insert(path.clone(), git.read_blob(&entry.blob_id)?);
+        }
+    }
+
+    if !rem_deleted.is_empty() && !rem_added.is_empty() {
+        results.extend(detect_renames(&rem_deleted, &rem_added));
+    }
+
+    Ok(results)
 }
 
-/// Detects colliding sequential migration files added in both `left_files` and `right_files`
-/// and renumbers `right_files` entries in place.
+/// Extracts a normalized pair stem from a migration suffix so paired `.up`/`.down` files
+/// (e.g., `_billing.up.sql` and `_billing.down.sql`) share the same grouping key.
+fn migration_pair_stem(suffix: &str) -> String {
+    let lower = suffix.to_ascii_lowercase();
+
+    for marker in [".up.", ".down.", "_up.", "_down."] {
+        if let Some(pos) = lower.rfind(marker) {
+            return suffix[..pos].to_string();
+        }
+    }
+
+    if let Some(pos) = lower.rfind(".up").filter(|&p| p + 3 == lower.len()) {
+        return suffix[..pos].to_string();
+    }
+
+    if let Some(pos) = lower.rfind(".down").filter(|&p| p + 5 == lower.len()) {
+        return suffix[..pos].to_string();
+    }
+
+    suffix.to_string()
+}
+
+/// Metadata for a single newly added migration file on `right`.
+struct RightMigrationFile {
+    /// Original repository-relative path.
+    path: String,
+    /// Zero-padding width of the original numeric prefix.
+    width: usize,
+    /// Filename suffix after the numeric prefix (including `_` or `-`).
+    suffix: String,
+}
+
+/// Detects colliding sequential migration files added in both `left_files` and `right_files`,
+/// renumbering colliding `right_files` entries (and all subsequent higher-numbered `right`
+/// migrations in the same directory) while keeping paired `.up`/`.down` files on the same sequence number.
 fn resequence_migrations_in_place(
     base_files: &BTreeMap<String, FileEntry>,
     left_files: &BTreeMap<String, FileEntry>,
     right_files: &mut BTreeMap<String, FileEntry>,
     resequenced: &mut Vec<MigrationResequence>,
 ) {
-    // Track highest numeric prefix per migration directory across base + left + right.
-    let mut dir_max_num: BTreeMap<String, u64> = BTreeMap::new();
+    let mut base_left_max_num: BTreeMap<String, u64> = BTreeMap::new();
     let mut left_added_nums: BTreeSet<(String, u64)> = BTreeSet::new();
 
-    for (path, _) in base_files
-        .iter()
-        .chain(left_files.iter())
-        .chain(right_files.iter())
-    {
+    for path in base_files.keys().chain(left_files.keys()) {
         if let Some((dir, file_name)) = path.rsplit_once('/') {
-            if is_migration_dir(dir) {
+            if is_migration_dir(dir) && is_migration_file(file_name) {
                 if let Some((num, _, _)) = parse_numeric_prefix(file_name) {
-                    let entry = dir_max_num.entry(dir.to_string()).or_insert(0);
+                    let entry = base_left_max_num.entry(dir.to_string()).or_insert(0);
                     *entry = (*entry).max(num);
                 }
             }
@@ -605,7 +1029,7 @@ fn resequence_migrations_in_place(
     for path in left_files.keys() {
         if !base_files.contains_key(path) {
             if let Some((dir, file_name)) = path.rsplit_once('/') {
-                if is_migration_dir(dir) {
+                if is_migration_dir(dir) && is_migration_file(file_name) {
                     if let Some((num, _, _)) = parse_numeric_prefix(file_name) {
                         left_added_nums.insert((dir.to_string(), num));
                     }
@@ -614,39 +1038,86 @@ fn resequence_migrations_in_place(
         }
     }
 
-    let right_paths: Vec<String> = right_files.keys().cloned().collect();
-    for path in right_paths {
-        if base_files.contains_key(&path) {
+    // Group right-added migrations per directory by `(num, pair_stem)`.
+    let mut right_groups_by_dir: BTreeMap<
+        String,
+        BTreeMap<(u64, String), Vec<RightMigrationFile>>,
+    > = BTreeMap::new();
+
+    for path in right_files.keys() {
+        if base_files.contains_key(path) {
             continue;
         }
 
-        // Skip if identical blob was added on both sides.
-        if left_files.get(&path) == right_files.get(&path) {
+        if left_files.get(path) == right_files.get(path) {
             continue;
         }
 
         if let Some((dir, file_name)) = path.rsplit_once('/') {
-            if is_migration_dir(dir) {
+            if is_migration_dir(dir) && is_migration_file(file_name) {
                 if let Some((num, width, suffix)) = parse_numeric_prefix(file_name) {
-                    if left_added_nums.contains(&(dir.to_string(), num)) {
-                        let next_num = dir_max_num
-                            .get(dir)
-                            .copied()
-                            .unwrap_or(num)
-                            .saturating_add(1);
-                        dir_max_num.insert(dir.to_string(), next_num);
-                        let new_file_name = format_resequenced_filename(next_num, width, suffix);
-                        let new_path = format!("{dir}/{new_file_name}");
-                        if let Some(entry) = right_files.remove(&path) {
-                            right_files.insert(new_path.clone(), entry);
-                            resequenced.push(MigrationResequence {
-                                original_path: path,
-                                resequenced_path: new_path,
-                            });
-                        }
-                    }
+                    let stem = migration_pair_stem(suffix);
+                    right_groups_by_dir
+                        .entry(dir.to_string())
+                        .or_default()
+                        .entry((num, stem))
+                        .or_default()
+                        .push(RightMigrationFile {
+                            path: path.clone(),
+                            width,
+                            suffix: suffix.to_string(),
+                        });
                 }
             }
+        }
+    }
+
+    for (dir, groups) in right_groups_by_dir {
+        let min_colliding_num = groups
+            .keys()
+            .filter(|(num, _)| left_added_nums.contains(&(dir.clone(), *num)))
+            .map(|(num, _)| *num)
+            .min();
+
+        let Some(first_collision) = min_colliding_num else {
+            continue;
+        };
+
+        let mut next_num = base_left_max_num.get(&dir).copied().unwrap_or(0);
+
+        for (num, _) in groups.keys() {
+            if *num < first_collision {
+                next_num = next_num.max(*num);
+            }
+        }
+
+        let groups_to_shift: Vec<((u64, String), Vec<RightMigrationFile>)> = groups
+            .into_iter()
+            .filter(|((num, _), _)| *num >= first_collision)
+            .collect();
+
+        // Remove all shifted entries first so renumbering 0042 -> 0043 cannot overwrite 0043 before it moves to 0044.
+        let mut staged: Vec<(String, String, FileEntry)> = Vec::new();
+
+        for (_, files_in_group) in groups_to_shift {
+            next_num = next_num.saturating_add(1);
+
+            for mf in files_in_group {
+                let new_file_name = format_resequenced_filename(next_num, mf.width, &mf.suffix);
+                let new_path = format!("{dir}/{new_file_name}");
+
+                if let Some(entry) = right_files.remove(&mf.path) {
+                    staged.push((mf.path, new_path, entry));
+                }
+            }
+        }
+
+        for (old_path, new_path, entry) in staged {
+            right_files.insert(new_path.clone(), entry);
+            resequenced.push(MigrationResequence {
+                original_path: old_path,
+                resequenced_path: new_path,
+            });
         }
     }
 }
@@ -657,6 +1128,7 @@ fn compute_touched_paths(
     target: &BTreeMap<String, FileEntry>,
 ) -> Vec<String> {
     let mut touched = BTreeSet::new();
+
     for (p, entry) in target {
         if base.get(p) != Some(entry) {
             touched.insert(p.clone());
@@ -668,6 +1140,7 @@ fn compute_touched_paths(
             touched.insert(p.clone());
         }
     }
+
     touched.into_iter().collect()
 }
 
@@ -691,21 +1164,14 @@ mod tests {
         let mut base_map = BTreeMap::new();
         base_map.insert(
             "packages/api/src/util.rs".to_string(),
-            FileEntry {
-                blob_id: base_util,
-                executable: false,
-            },
+            FileEntry::regular(base_util, false),
         );
         base_map.insert(
             "packages/untouched-core/src/lib.rs".to_string(),
-            FileEntry {
-                blob_id: untouched_pkg,
-                executable: false,
-            },
+            FileEntry::regular(untouched_pkg, false),
         );
         let base_tree = git.write_tree_from_map(&base_map).expect("base tree");
 
-        // Agent A moves `packages/api/src/util.rs` -> `packages/shared/src/util.rs` and adds migration 0001_users.sql
         let mut left_map = BTreeMap::new();
         left_map.insert(
             "packages/shared/src/util.rs".to_string(),
@@ -717,14 +1183,14 @@ mod tests {
         );
         left_map.insert(
             "db/migrations/0001_users.sql".to_string(),
-            FileEntry {
-                blob_id: git.write_blob(b"CREATE TABLE users (id INT);\n").expect("m1"),
-                executable: false,
-            },
+            FileEntry::regular(
+                git.write_blob(b"CREATE TABLE users (id INT);\n")
+                    .expect("m1"),
+                false,
+            ),
         );
         let left_tree = git.write_tree_from_map(&left_map).expect("left tree");
 
-        // Agent B edits `packages/api/src/util.rs` (adding a new function) and also creates `db/migrations/0001_billing.sql`!
         let right_util = git
             .write_blob(
                 b"pub fn validate_id(id: &str) -> bool {\n    !id.is_empty()\n}\n\npub fn format_id(id: &str) -> String {\n    id.to_uppercase()\n}\n\npub fn parse_cents(raw: &str) -> u64 {\n    raw.parse().unwrap_or(0)\n}\n",
@@ -733,10 +1199,7 @@ mod tests {
         let mut right_map = BTreeMap::new();
         right_map.insert(
             "packages/api/src/util.rs".to_string(),
-            FileEntry {
-                blob_id: right_util,
-                executable: false,
-            },
+            FileEntry::regular(right_util, false),
         );
         right_map.insert(
             "packages/untouched-core/src/lib.rs".to_string(),
@@ -744,10 +1207,11 @@ mod tests {
         );
         right_map.insert(
             "db/migrations/0001_billing.sql".to_string(),
-            FileEntry {
-                blob_id: git.write_blob(b"CREATE TABLE invoices (id INT);\n").expect("m2"),
-                executable: false,
-            },
+            FileEntry::regular(
+                git.write_blob(b"CREATE TABLE invoices (id INT);\n")
+                    .expect("m2"),
+                false,
+            ),
         );
         let right_tree = git.write_tree_from_map(&right_map).expect("right tree");
 
@@ -771,8 +1235,14 @@ mod tests {
             outcome.migrations_resequenced[0].resequenced_path,
             "db/migrations/0002_billing.sql"
         );
-        assert!(!outcome.merged_files.contains_key("packages/api/src/util.rs"));
-        let full_merged_tree = git.read_tree_to_map(&outcome.merged_tree_id).expect("read full merged tree");
+        assert!(
+            !outcome
+                .merged_files
+                .contains_key("packages/api/src/util.rs")
+        );
+        let full_merged_tree = git
+            .read_tree_to_map(&outcome.merged_tree_id)
+            .expect("read full merged tree");
         assert_eq!(
             full_merged_tree["packages/untouched-core/src/lib.rs"].blob_id,
             untouched_pkg
@@ -782,5 +1252,348 @@ mod tests {
             .expect("read merged util");
         let merged_util_str = String::from_utf8_lossy(&merged_util_bytes);
         assert!(merged_util_str.contains("pub fn parse_cents"));
+    }
+
+    #[test]
+    fn binary_conflict_preserves_binary_blob_and_reports_binary_conflict_kind() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let git = GitBackend::init_or_open(tmp.path()).expect("init git");
+
+        let base_png = git.write_blob(b"\x89PNG\r\n\x1a\n\x00base").expect("base");
+        let left_png = git.write_blob(b"\x89PNG\r\n\x1a\n\x00left").expect("left");
+        let right_png = git
+            .write_blob(b"\x89PNG\r\n\x1a\n\x00right")
+            .expect("right");
+
+        let mut base_map = BTreeMap::new();
+        base_map.insert("logo.png".to_string(), FileEntry::regular(base_png, false));
+        let mut left_map = BTreeMap::new();
+        left_map.insert("logo.png".to_string(), FileEntry::regular(left_png, false));
+        let mut right_map = BTreeMap::new();
+        right_map.insert("logo.png".to_string(), FileEntry::regular(right_png, false));
+
+        let base_tree = git.write_tree_from_map(&base_map).expect("base tree");
+        let left_tree = git.write_tree_from_map(&left_map).expect("left tree");
+        let right_tree = git.write_tree_from_map(&right_map).expect("right tree");
+
+        let outcome = merge_trees_3way(
+            &git,
+            &base_tree,
+            &left_tree,
+            &right_tree,
+            "a",
+            "update logo",
+            "b",
+            "update logo",
+        )
+        .expect("merge");
+
+        assert_eq!(outcome.conflicts.len(), 1);
+        assert_eq!(outcome.conflicts[0].kind, ConflictKind::Binary);
+        assert_eq!(outcome.merged_files["logo.png"].blob_id, left_png);
+    }
+
+    #[test]
+    fn symlinks_and_gitlinks_preserve_entry_modes_and_conflict_on_divergence() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let git = GitBackend::init_or_open(tmp.path()).expect("init git");
+
+        let link_target_a = git.write_blob(b"../target_a").expect("link a");
+        let link_target_b = git.write_blob(b"../target_b").expect("link b");
+        let txt_base = git.write_blob(b"hello\n").expect("txt base");
+        let txt_left = git.write_blob(b"hello left\n").expect("txt left");
+        let sub_oid_a =
+            ObjectId::from_hex("1111111111111111111111111111111111111111").expect("oid");
+        let sub_oid_b =
+            ObjectId::from_hex("2222222222222222222222222222222222222222").expect("oid");
+
+        let mut base_map = BTreeMap::new();
+        base_map.insert("note.txt".to_string(), FileEntry::regular(txt_base, false));
+        base_map.insert(
+            "current".to_string(),
+            FileEntry::from_mode(link_target_a, EntryMode::Symlink),
+        );
+        base_map.insert(
+            "vendor/sub".to_string(),
+            FileEntry::from_mode(sub_oid_a, EntryMode::Gitlink),
+        );
+
+        let mut left_map = base_map.clone();
+        left_map.insert("note.txt".to_string(), FileEntry::regular(txt_left, false));
+
+        let mut right_map = base_map.clone();
+        right_map.insert(
+            "current".to_string(),
+            FileEntry::from_mode(link_target_b, EntryMode::Symlink),
+        );
+        right_map.insert(
+            "vendor/sub".to_string(),
+            FileEntry::from_mode(sub_oid_b, EntryMode::Gitlink),
+        );
+
+        let base_tree = git.write_tree_from_map(&base_map).expect("base tree");
+        let left_tree = git.write_tree_from_map(&left_map).expect("left tree");
+        let right_tree = git.write_tree_from_map(&right_map).expect("right tree");
+
+        let outcome = merge_trees_3way(
+            &git,
+            &base_tree,
+            &left_tree,
+            &right_tree,
+            "a",
+            "edit note",
+            "b",
+            "update link and sub",
+        )
+        .expect("merge");
+
+        assert!(outcome.conflicts.is_empty());
+        let merged_map = git
+            .read_tree_to_map(&outcome.merged_tree_id)
+            .expect("read merged");
+        assert_eq!(merged_map["current"].entry_mode(), EntryMode::Symlink);
+        assert_eq!(merged_map["current"].blob_id, link_target_b);
+        assert_eq!(merged_map["vendor/sub"].entry_mode(), EntryMode::Gitlink);
+        assert_eq!(merged_map["vendor/sub"].blob_id, sub_oid_b);
+    }
+
+    #[test]
+    fn file_vs_directory_conflict_emits_conflict_and_writes_valid_tree() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let git = GitBackend::init_or_open(tmp.path()).expect("init git");
+
+        let base_blob = git.write_blob(b"root\n").expect("base");
+        let left_file = git.write_blob(b"i am a file\n").expect("left file");
+        let right_nested = git.write_blob(b"i am inside dir\n").expect("right nested");
+
+        let mut base_map = BTreeMap::new();
+        base_map.insert(
+            "README.md".to_string(),
+            FileEntry::regular(base_blob, false),
+        );
+
+        let mut left_map = base_map.clone();
+        left_map.insert("foo".to_string(), FileEntry::regular(left_file, false));
+
+        let mut right_map = base_map.clone();
+        right_map.insert(
+            "foo/bar.txt".to_string(),
+            FileEntry::regular(right_nested, false),
+        );
+
+        let base_tree = git.write_tree_from_map(&base_map).expect("base");
+        let left_tree = git.write_tree_from_map(&left_map).expect("left");
+        let right_tree = git.write_tree_from_map(&right_map).expect("right");
+
+        let outcome = merge_trees_3way(
+            &git,
+            &base_tree,
+            &left_tree,
+            &right_tree,
+            "a",
+            "add foo file",
+            "b",
+            "add foo dir",
+        )
+        .expect("merge");
+
+        assert_eq!(outcome.conflicts.len(), 1);
+        assert_eq!(outcome.conflicts[0].kind, ConflictKind::FileDirectory);
+        assert_eq!(outcome.conflicts[0].path, "foo");
+
+        let nodes = git
+            .read_tree_nodes(&outcome.merged_tree_id)
+            .expect("read root nodes");
+        assert_eq!(nodes.iter().filter(|n| n.name == "foo").count(), 1);
+    }
+
+    #[test]
+    fn paired_up_down_migrations_and_subsequent_migrations_preserve_pairing_and_order() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let git = GitBackend::init_or_open(tmp.path()).expect("init git");
+
+        let init_blob = git
+            .write_blob(b"CREATE TABLE init (id INT);\n")
+            .expect("init");
+        let mut base_map = BTreeMap::new();
+        base_map.insert(
+            "db/migrations/0041_init.sql".to_string(),
+            FileEntry::regular(init_blob, false),
+        );
+
+        let mut left_map = base_map.clone();
+        left_map.insert(
+            "db/migrations/0042_users.up.sql".to_string(),
+            FileEntry::regular(
+                git.write_blob(b"CREATE TABLE users (id INT);\n")
+                    .expect("lu"),
+                false,
+            ),
+        );
+        left_map.insert(
+            "db/migrations/0042_users.down.sql".to_string(),
+            FileEntry::regular(git.write_blob(b"DROP TABLE users;\n").expect("ld"), false),
+        );
+
+        let mut right_map = base_map.clone();
+        right_map.insert(
+            "db/migrations/0042_billing.up.sql".to_string(),
+            FileEntry::regular(
+                git.write_blob(b"CREATE TABLE billing (id INT);\n")
+                    .expect("ru"),
+                false,
+            ),
+        );
+        right_map.insert(
+            "db/migrations/0042_billing.down.sql".to_string(),
+            FileEntry::regular(git.write_blob(b"DROP TABLE billing;\n").expect("rd"), false),
+        );
+        right_map.insert(
+            "db/migrations/0043_alter_billing.up.sql".to_string(),
+            FileEntry::regular(
+                git.write_blob(b"ALTER TABLE billing ADD COLUMN cents INT;\n")
+                    .expect("r2u"),
+                false,
+            ),
+        );
+        right_map.insert(
+            "db/migrations/0043_alter_billing.down.sql".to_string(),
+            FileEntry::regular(
+                git.write_blob(b"ALTER TABLE billing DROP COLUMN cents;\n")
+                    .expect("r2d"),
+                false,
+            ),
+        );
+
+        let base_tree = git.write_tree_from_map(&base_map).expect("base");
+        let left_tree = git.write_tree_from_map(&left_map).expect("left");
+        let right_tree = git.write_tree_from_map(&right_map).expect("right");
+
+        let outcome = merge_trees_3way(
+            &git,
+            &base_tree,
+            &left_tree,
+            &right_tree,
+            "a",
+            "users migration",
+            "b",
+            "billing migrations",
+        )
+        .expect("merge");
+
+        assert!(outcome.conflicts.is_empty());
+        assert!(
+            outcome
+                .merged_files
+                .contains_key("db/migrations/0043_billing.up.sql")
+        );
+        assert!(
+            outcome
+                .merged_files
+                .contains_key("db/migrations/0043_billing.down.sql")
+        );
+        assert!(
+            outcome
+                .merged_files
+                .contains_key("db/migrations/0044_alter_billing.up.sql")
+        );
+        assert!(
+            outcome
+                .merged_files
+                .contains_key("db/migrations/0044_alter_billing.down.sql")
+        );
+    }
+
+    #[test]
+    fn rename_add_and_rename_rename_collisions_do_not_drop_edits() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let git = GitBackend::init_or_open(tmp.path()).expect("init git");
+
+        let orig = git
+            .write_blob(b"pub fn calc(x: i32) -> i32 {\n    x + 1\n}\n")
+            .expect("orig");
+        let left_moved = git
+            .write_blob(b"pub fn calc(x: i32) -> i32 {\n    x + 2\n}\n")
+            .expect("left moved");
+        let right_moved = git
+            .write_blob(b"pub fn calc(x: i32) -> i32 {\n    x + 3\n}\n")
+            .expect("right moved");
+
+        let mut base_map = BTreeMap::new();
+        base_map.insert("src/a.rs".to_string(), FileEntry::regular(orig, false));
+
+        let mut left_map = BTreeMap::new();
+        left_map.insert(
+            "src/b.rs".to_string(),
+            FileEntry::regular(left_moved, false),
+        );
+
+        let mut right_map = BTreeMap::new();
+        right_map.insert(
+            "src/c.rs".to_string(),
+            FileEntry::regular(right_moved, false),
+        );
+
+        let base_tree = git.write_tree_from_map(&base_map).expect("base");
+        let left_tree = git.write_tree_from_map(&left_map).expect("left");
+        let right_tree = git.write_tree_from_map(&right_map).expect("right");
+
+        let outcome = merge_trees_3way(
+            &git,
+            &base_tree,
+            &left_tree,
+            &right_tree,
+            "a",
+            "rename a -> b",
+            "b",
+            "rename a -> c",
+        )
+        .expect("merge");
+
+        assert_eq!(outcome.conflicts.len(), 1);
+        assert_eq!(outcome.conflicts[0].path, "src/a.rs");
+        assert!(outcome.merged_files.contains_key("src/b.rs"));
+        assert!(outcome.merged_files.contains_key("src/c.rs"));
+
+        // Rename/add collision: left renames a -> b while right edits a AND independently creates b.
+        let right_edited_a = git
+            .write_blob(b"pub fn calc(x: i32) -> i32 {\n    x + 99\n}\n")
+            .expect("right a");
+        let right_new_b = git
+            .write_blob(b"pub fn brand_new() -> bool { true }\n")
+            .expect("right b");
+        let mut right_collision_map = BTreeMap::new();
+        right_collision_map.insert(
+            "src/a.rs".to_string(),
+            FileEntry::regular(right_edited_a, false),
+        );
+        right_collision_map.insert(
+            "src/b.rs".to_string(),
+            FileEntry::regular(right_new_b, false),
+        );
+        let right_collision_tree = git
+            .write_tree_from_map(&right_collision_map)
+            .expect("right collision tree");
+
+        let outcome_ra = merge_trees_3way(
+            &git,
+            &base_tree,
+            &left_tree,
+            &right_collision_tree,
+            "a",
+            "rename a -> b",
+            "b",
+            "edit a and create b",
+        )
+        .expect("merge rename/add");
+
+        assert!(
+            !outcome_ra.conflicts.is_empty(),
+            "rename/add collision must conflict instead of dropping right's edits"
+        );
+        assert_eq!(
+            outcome_ra.merged_files.get("src/a.rs").map(|e| e.blob_id),
+            Some(right_edited_a)
+        );
     }
 }
