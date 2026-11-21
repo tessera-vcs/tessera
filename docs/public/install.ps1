@@ -25,14 +25,22 @@ function Invoke-DownloadWithRetry {
 
         try {
             if (Get-Command curl.exe -ErrorAction SilentlyContinue) {
-                if ($ShowProgress) {
-                    & curl.exe -fL --progress-bar "$Uri" -o $OutFile
-                } else {
-                    & curl.exe -fsSL "$Uri" -o $OutFile
+                $prevErrAction = $ErrorActionPreference
+                try {
+                    # PowerShell 5.1 treats native stderr progress output as terminating under Stop.
+                    $ErrorActionPreference = "Continue"
+                    if ($ShowProgress) {
+                        & curl.exe -fL --progress-bar "$Uri" -o $OutFile
+                    } else {
+                        & curl.exe -fsSL "$Uri" -o $OutFile
+                    }
+                    $curlExit = $LASTEXITCODE
+                } finally {
+                    $ErrorActionPreference = $prevErrAction
                 }
 
-                if ($LASTEXITCODE -ne 0) {
-                    throw "curl.exe exited with code $LASTEXITCODE for $Uri"
+                if ($curlExit -ne 0) {
+                    throw "curl.exe exited with code $curlExit for $Uri"
                 }
             } else {
                 $prevProgress = $ProgressPreference
