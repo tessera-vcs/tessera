@@ -362,7 +362,8 @@ pub fn collect_doctor_report(cwd: &Path) -> Value {
         let hooks_dir = git.common_git_dir().join("hooks");
         let mut installed_hooks = Vec::new();
         let mut missing_hooks = Vec::new();
-        let mut non_exec_hooks = Vec::new();
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let mut non_exec_hooks: Vec<&str> = Vec::new();
 
         for hook_name in EXPECTED_GIT_HOOKS {
             let hook_path = hooks_dir.join(hook_name);

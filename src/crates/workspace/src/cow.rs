@@ -1,7 +1,10 @@
 //! Copy-on-Write filesystem cloning (`clonefile` on macOS, `FICLONE` on Linux, and portable fallback),
 //! build cache path sanitization, and working-tree materialization.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
+#[cfg(unix)]
+use std::collections::VecDeque;
+#[cfg(unix)]
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -390,6 +393,7 @@ fn copy_recursive_fallback(src: &Path, dst: &Path, confinement_root: &Path) -> C
     })?;
 
     let mut any_reflinked = false;
+    #[cfg(unix)]
     let mut created_symlinks = false;
     let mut dir_perms: Vec<(PathBuf, fs::Permissions)> =
         vec![(dst.to_path_buf(), src_meta.permissions())];
@@ -452,7 +456,7 @@ fn copy_recursive_fallback(src: &Path, dst: &Path, confinement_root: &Path) -> C
     }
 
     #[cfg(not(unix))]
-    let _ = (created_symlinks, confinement_root);
+    let _ = confinement_root;
 
     // Apply directory permissions bottom-up so read-only directories do not block child creation.
     for (dir_path, perms) in dir_perms.into_iter().rev() {
@@ -1353,6 +1357,7 @@ pub fn materialize_tree_to_dir_with_baseline(
         }
     }
 
+    #[cfg(unix)]
     let mut materialized_symlinks: Vec<(PathBuf, PathBuf)> = Vec::new();
 
     for (rel_path, entry) in &tree_files {
@@ -1530,9 +1535,6 @@ pub fn materialize_tree_to_dir_with_baseline(
             )));
         }
     }
-
-    #[cfg(not(unix))]
-    let _ = materialized_symlinks;
 
     Ok(())
 }

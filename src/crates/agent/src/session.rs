@@ -81,6 +81,7 @@ fn sanitize_id(raw: &str) -> String {
 }
 
 /// Percent-encodes `raw` for safe inclusion in a URI query parameter (RFC 3986 unreserved set).
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn percent_encode_uri_component(raw: &str) -> String {
     use std::fmt::Write as _;
 
