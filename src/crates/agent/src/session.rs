@@ -3448,6 +3448,17 @@ impl Coordinator {
             }
         }
 
+        let repo_tmp = self
+            .git
+            .repo_root()
+            .join(".tessera")
+            .join("tmp")
+            .join(agent_id);
+
+        if repo_tmp.exists() {
+            let _ = fs::remove_dir_all(&repo_tmp);
+        }
+
         Ok(meta)
     }
 
@@ -3499,6 +3510,11 @@ impl Coordinator {
 
         for id in &removed {
             self.git.delete_ref(&format!("refs/tessera/agents/{id}"));
+            let repo_tmp = self.git.repo_root().join(".tessera").join("tmp").join(id);
+
+            if repo_tmp.exists() {
+                let _ = fs::remove_dir_all(&repo_tmp);
+            }
         }
 
         for ws_path in &removed_workspaces {

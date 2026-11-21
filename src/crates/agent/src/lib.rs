@@ -259,7 +259,24 @@ pub struct LogEntry {
     pub refs: Vec<String>,
 }
 
-/// Summary returned by `tes gc` ([`Coordinator::gc`]).
+/// Options controlling garbage collection behavior for [`Coordinator::gc_with_options`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GcOptions {
+    /// Preview all compaction and pruning actions without modifying any files.
+    pub dry_run: bool,
+    /// Preserve clean sandboxes belonging to local branches already merged into `trunk_branch`.
+    pub keep_merged: bool,
+    /// Evict clean non-trunk, non-HEAD sandboxes whose latest activity is older than this many days.
+    pub stale_days: Option<u64>,
+    /// Strip `cow_cache_dirs` (`target/`, `node_modules/`, etc.) inside idle branch sandboxes
+    /// while keeping the sandbox working tree intact.
+    pub prune_caches: bool,
+    /// Sweep sibling `<repo>-<hash>` slugs in the global workspaces cache whose source repository
+    /// no longer exists on disk.
+    pub all_repos: bool,
+}
+
+/// Summary returned by `tes gc` ([`Coordinator::gc`] / [`Coordinator::gc_with_options`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GcReport {
     /// Whether garbage collection ran in preview mode (`--dry-run`) without modifying files.
@@ -268,12 +285,48 @@ pub struct GcReport {
     pub compacted_operations: usize,
     /// Orphaned branch sandbox directories pruned (or eligible under `--dry-run`).
     pub pruned_sandboxes: Vec<String>,
+    /// Clean sandbox directories belonging to branches already merged into `trunk_branch` that were pruned.
+    #[serde(default)]
+    pub pruned_merged_sandboxes: Vec<String>,
+    /// Clean sandbox directories exceeding `--stale <days>` that were pruned.
+    #[serde(default)]
+    pub pruned_stale_sandboxes: Vec<String>,
+    /// Crashed `verify-sandbox-*` directories with dead owner PIDs that were pruned.
+    #[serde(default)]
+    pub pruned_verify_sandboxes: Vec<String>,
+    /// Orphaned `.tessera/workspaces/<agent_id>` directories pruned from `repo_root`.
+    #[serde(default)]
+    pub pruned_agent_workspaces: Vec<String>,
+    /// Stale `.tessera/tmp/<agent_id>` directories pruned.
+    #[serde(default)]
+    pub pruned_tmp_dirs: Vec<String>,
     /// Orphaned sandbox sidecar files (`.slot`, `.tree`, `.pending-merge`) pruned (or eligible).
     pub pruned_sidecars: Vec<String>,
     /// Dead port lease directories (`<sandboxes_root>/bin/.leases/<port>`) pruned (or eligible).
     pub pruned_dead_leases: Vec<String>,
-    /// Orphaned sandbox directories skipped because a live process still holds a lease or session in them.
+    /// Number of stale `.git/tessera/stat_cache/*` files pruned.
+    #[serde(default)]
+    pub pruned_stat_caches: usize,
+    /// Number of stale `.git/tessera/locks/sandbox-*.lock` files pruned.
+    #[serde(default)]
+    pub pruned_locks: usize,
+    /// Number of expired `.git/tessera/session-slots/*.slot` files pruned.
+    #[serde(default)]
+    pub pruned_session_slots: usize,
+    /// Stale branch entries removed from `OpLog` `View::branches` after external `git branch -d`.
+    #[serde(default)]
+    pub pruned_stale_view_branches: Vec<String>,
+    /// Build/dependency cache directories stripped inside idle sandboxes via `--prune-caches`.
+    #[serde(default)]
+    pub pruned_caches: Vec<String>,
+    /// Orphaned `<repo>-<hash>` workspace slugs pruned across the global cache root via `--all`.
+    #[serde(default)]
+    pub pruned_global_repos: Vec<String>,
+    /// Sandbox directories skipped because a live process, active session, or uncommitted edit owns them.
     pub skipped_active_sandboxes: Vec<String>,
+    /// Estimated unique physical bytes reclaimed (or reclaimable under `--dry-run`).
+    #[serde(default)]
+    pub reclaimed_bytes: u64,
 }
 
 /// Strategy for resolving a first-class conflict via `tes resolve`.

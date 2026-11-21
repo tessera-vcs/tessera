@@ -440,11 +440,23 @@ pub enum Commands {
         agent: Option<String>,
     },
 
-    /// Compact ephemeral micro-snapshots and prune orphaned sandboxes and dead port leases.
+    /// Compact ephemeral micro-snapshots and prune orphaned, merged, or stale sandboxes, caches, and dead port leases.
     Gc {
         /// Preview what would be compacted and pruned without deleting any files.
         #[arg(short = 'n', long)]
         dry_run: bool,
+        /// Keep clean sandboxes belonging to local branches already merged into trunk.
+        #[arg(long)]
+        keep_merged: bool,
+        /// Evict clean non-trunk sandboxes untouched for at least this many days.
+        #[arg(long, value_name = "DAYS")]
+        stale: Option<u64>,
+        /// Strip cloned build/dependency caches (`target/`, `node_modules/`, etc.) inside idle sandboxes.
+        #[arg(long)]
+        prune_caches: bool,
+        /// Also sweep orphaned `<repo>-<hash>` workspace caches for deleted repositories across the global cache directory.
+        #[arg(long)]
+        all: bool,
     },
 
     /// Continuously watch the working tree and auto-reconcile edits for hookless editors/harnesses.

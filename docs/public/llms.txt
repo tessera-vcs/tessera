@@ -60,7 +60,7 @@ Tessera (`tes`) coordinates concurrent AI coding agents and terminal sessions in
 - [tes oplog](https://tessera.getlunaris.dev/cli/oplog): Inspect the lock-free, content-addressed Operation Log history.
 - [tes undo](https://tessera.getlunaris.dev/cli/undo): Undo the most recent operation or roll back to a specific operation ID or checkpoint.
 - [tes sync](https://tessera.getlunaris.dev/cli/sync): Auto-rebase all active sessions onto the latest trunk commit using 3-way AST merge.
-- [tes gc](https://tessera.getlunaris.dev/cli/gc): Compact ephemeral working-copy micro-snapshots and prune orphaned sandboxes and dead port leases (`--dry-run`).
+- [tes gc](https://tessera.getlunaris.dev/cli/gc): Compact ephemeral working-copy micro-snapshots and prune orphaned, merged, stale, verify, and global sandboxes plus dead port leases (`--dry-run`, `--keep-merged`, `--stale`, `--prune-caches`, `--all`).
 - [tes watch](https://tessera.getlunaris.dev/cli/watch): Continuously watch the working tree and auto-reconcile edits for hookless editors or harnesses.
 - [tes agent](https://tessera.getlunaris.dev/cli/agent): Manage active agent and terminal sessions (`spawn`, `list`, `focus`, `exec`, `close`, `clear`; alias `tes session`).
 - [tes config](https://tessera.getlunaris.dev/cli/config): View or modify `tessera.toml` settings (`show`, `set`, `add-cache-dir`, `add-package-glob`, `add-bin-dir`, `set-env`, `trust`, `untrust`).

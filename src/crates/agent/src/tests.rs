@@ -3420,3 +3420,269 @@ fn temp_repo_sandboxes_stay_contained_with_cache_hygiene_and_repo_marker() {
         "contained tempdir branch sandbox must validate via is_valid_sandbox_repo_root"
     );
 }
+
+#[test]
+fn gc_reconciles_deleted_refs_prunes_merged_verify_tmp_caches_and_preserves_dirty() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    fs::write(root.join("lib.rs"), "pub fn base() -> i32 { 1 }\n").expect("write lib.rs");
+
+    let (coord, _) = Coordinator::init_repo(root).expect("init_repo");
+
+    // Simulate a branch deleted externally (Git ref removed while OpLog `view.branches` still lists it).
+    coord
+        .switch_branch("a-ext", "feat/ext-del")
+        .expect("create feat/ext-del");
+    let (_, ext_ws, _) = coord
+        .prepare_branch_sandbox("a-ext", Some("feat/ext-del"))
+        .expect("prepare feat/ext-del sandbox");
+    assert!(ext_ws.is_dir());
+    coord.close_agent("a-ext").expect("close a-ext session");
+    let ext_ref = coord.git().common_git_dir().join("refs/heads/feat/ext-del");
+    fs::remove_file(&ext_ref).expect("simulate raw git branch -d");
+
+    // Seed three merged branches: one clean & idle (prunable), one dirty (must skip),
+    // and one clean but bound to an active session (must skip so live shell CWDs stay intact).
+    coord
+        .switch_branch("a-merged", "feat/merged-clean")
+        .expect("create feat/merged-clean");
+    let (_, merged_clean_ws, _) = coord
+        .prepare_branch_sandbox("a-merged", Some("feat/merged-clean"))
+        .expect("prepare merged-clean sandbox");
+    coord.close_agent("a-merged").expect("close a-merged");
+
+    coord
+        .switch_branch("a-dirty", "feat/merged-dirty")
+        .expect("create feat/merged-dirty");
+    let (_, merged_dirty_ws, _) = coord
+        .prepare_branch_sandbox("a-dirty", Some("feat/merged-dirty"))
+        .expect("prepare merged-dirty sandbox");
+    fs::write(
+        merged_dirty_ws.join("lib.rs"),
+        "pub fn base() -> i32 { 999 }\n",
+    )
+    .expect("dirty merged-dirty sandbox");
+    coord.close_agent("a-dirty").expect("close a-dirty");
+
+    coord
+        .switch_branch("a-bound", "feat/merged-bound")
+        .expect("create feat/merged-bound");
+    let (_, merged_bound_ws, _) = coord
+        .prepare_branch_sandbox("a-bound", Some("feat/merged-bound"))
+        .expect("prepare merged-bound sandbox");
+
+    // Seed an unmerged branch with a build cache (`target/`) for `--keep-merged`, `--prune-caches`, and `--stale 0`.
+    coord
+        .switch_branch("a-unmerged", "feat/unmerged-work")
+        .expect("create feat/unmerged-work");
+    let (_, unmerged_ws, _) = coord
+        .prepare_branch_sandbox("a-unmerged", Some("feat/unmerged-work"))
+        .expect("prepare unmerged sandbox");
+    let unmerged_target = unmerged_ws.join("target");
+    fs::create_dir_all(&unmerged_target).expect("mkdir target");
+    fs::write(unmerged_target.join("artifact.bin"), vec![b'X'; 65_536]).expect("write artifact");
+    // Commit on feat/unmerged-work so it is NOT merged into trunk.
+    fs::write(unmerged_ws.join("unmerged.rs"), "pub fn u() -> i32 { 2 }\n")
+        .expect("write unmerged");
+    let unmerged_blob = coord
+        .git()
+        .write_blob(b"pub fn u() -> i32 { 2 }\n")
+        .expect("write blob");
+    let main_cid = coord
+        .git()
+        .resolve_ref("refs/heads/main")
+        .expect("resolve main")
+        .expect("main cid");
+    let main_commit = coord.git().read_commit(&main_cid).expect("read main");
+    let mut tree_map = coord
+        .git()
+        .read_tree_to_map(&main_commit.tree_id)
+        .expect("read tree");
+    tree_map.insert(
+        "unmerged.rs".to_string(),
+        core::FileEntry::regular(unmerged_blob, false),
+    );
+    let new_tree = coord
+        .git()
+        .write_tree_from_map(&tree_map)
+        .expect("write tree");
+    let new_cid = coord
+        .git()
+        .write_commit(
+            &new_tree,
+            &[main_cid],
+            "Tester <test@example.com>",
+            "feat: unmerged commit",
+        )
+        .expect("write commit");
+    coord
+        .git()
+        .update_ref("refs/heads/feat/unmerged-work", &new_cid)
+        .expect("update ref");
+    coord.close_agent("a-unmerged").expect("close a-unmerged");
+
+    // Seed crashed + live verify sandboxes, orphaned agent workspace, stale tmp dir, lock, and expired session slot.
+    let dead_verify = coord.sandboxes_root().join("verify-sandbox-99999999-1-1");
+    let live_verify = coord
+        .sandboxes_root()
+        .join(format!("verify-sandbox-{}-1-1", std::process::id()));
+    fs::create_dir_all(&dead_verify).expect("mkdir dead verify");
+    fs::write(dead_verify.join("tmp.bin"), vec![b'V'; 8192]).expect("write dead verify file");
+    fs::create_dir_all(&live_verify).expect("mkdir live verify");
+
+    let orphan_agent_ws = root.join(".tessera").join("workspaces").join("ghost-agent");
+    fs::create_dir_all(&orphan_agent_ws).expect("mkdir orphan agent ws");
+    fs::write(orphan_agent_ws.join("stale.rs"), b"// old").expect("write stale.rs");
+
+    let stale_tmp = root.join(".tessera").join("tmp").join("ghost-agent");
+    fs::create_dir_all(&stale_tmp).expect("mkdir stale tmp");
+    fs::write(stale_tmp.join("scratch.txt"), b"scratch").expect("write scratch");
+
+    let stale_lock = coord
+        .git()
+        .common_git_dir()
+        .join("tessera")
+        .join("locks")
+        .join("sandbox-ghost-branch.lock");
+    fs::create_dir_all(stale_lock.parent().expect("locks parent")).expect("mkdir locks");
+    fs::write(&stale_lock, b"").expect("write stale lock");
+
+    let expired_slot = coord
+        .git()
+        .common_git_dir()
+        .join("tessera")
+        .join("session-slots")
+        .join("ghost-session.slot");
+    fs::create_dir_all(expired_slot.parent().expect("slots parent")).expect("mkdir slots");
+    fs::write(&expired_slot, b"5\n1000\n").expect("write expired slot");
+
+    let ext_safe = Coordinator::sanitize_branch_name("feat/ext-del");
+    let merged_clean_safe = Coordinator::sanitize_branch_name("feat/merged-clean");
+    let merged_dirty_safe = Coordinator::sanitize_branch_name("feat/merged-dirty");
+    let merged_bound_safe = Coordinator::sanitize_branch_name("feat/merged-bound");
+    let unmerged_safe = Coordinator::sanitize_branch_name("feat/unmerged-work");
+
+    // Dry run with `--keep-merged` must preserve merged-clean and mutate nothing.
+    let keep_preview = coord
+        .gc_with_options(&crate::GcOptions {
+            dry_run: true,
+            keep_merged: true,
+            ..crate::GcOptions::default()
+        })
+        .expect("gc dry-run keep-merged");
+    assert!(keep_preview.pruned_merged_sandboxes.is_empty());
+    assert_eq!(keep_preview.pruned_sandboxes, vec![ext_safe.clone()]);
+    assert_eq!(
+        keep_preview.pruned_stale_view_branches,
+        vec!["feat/ext-del"]
+    );
+    assert_eq!(
+        keep_preview.pruned_verify_sandboxes,
+        vec!["verify-sandbox-99999999-1-1"]
+    );
+    assert_eq!(keep_preview.pruned_agent_workspaces, vec!["ghost-agent"]);
+    assert!(
+        keep_preview
+            .pruned_tmp_dirs
+            .contains(&"repo/ghost-agent".to_string())
+    );
+    assert!(keep_preview.pruned_locks >= 1);
+    assert!(keep_preview.pruned_session_slots >= 1);
+    assert!(ext_ws.is_dir(), "dry-run must not remove ext_ws");
+    assert!(dead_verify.is_dir(), "dry-run must not remove dead_verify");
+
+    // Default apply + `--prune-caches` prunes everything safe, strips unmerged target/, and skips dirty or session-bound sandboxes.
+    let report = coord
+        .gc_with_options(&crate::GcOptions {
+            dry_run: false,
+            keep_merged: false,
+            prune_caches: true,
+            ..crate::GcOptions::default()
+        })
+        .expect("gc apply");
+    assert_eq!(report.pruned_sandboxes, vec![ext_safe]);
+    assert_eq!(report.pruned_stale_view_branches, vec!["feat/ext-del"]);
+    assert_eq!(report.pruned_merged_sandboxes, vec![merged_clean_safe]);
+    assert!(
+        report.skipped_active_sandboxes.contains(&merged_dirty_safe),
+        "dirty merged sandbox must be skipped: {report:?}"
+    );
+    assert!(
+        report.skipped_active_sandboxes.contains(&merged_bound_safe),
+        "sandbox bound to an active session must be skipped: {report:?}"
+    );
+    assert_eq!(
+        report.pruned_verify_sandboxes,
+        vec!["verify-sandbox-99999999-1-1"]
+    );
+    assert_eq!(report.pruned_agent_workspaces, vec!["ghost-agent"]);
+    assert!(
+        report
+            .pruned_caches
+            .contains(&format!("{unmerged_safe}/target")),
+        "idle sandbox cache should be pruned: {report:?}"
+    );
+    assert!(report.reclaimed_bytes > 0);
+
+    assert!(!ext_ws.exists());
+    assert!(!merged_clean_ws.exists());
+    assert!(
+        merged_dirty_ws.is_dir(),
+        "dirty merged sandbox must survive"
+    );
+    assert!(
+        merged_bound_ws.is_dir(),
+        "active-session merged sandbox must survive"
+    );
+    assert!(!dead_verify.exists());
+    assert!(live_verify.is_dir(), "live verify sandbox must survive");
+    assert!(!orphan_agent_ws.exists());
+    assert!(!stale_tmp.exists());
+    assert!(!stale_lock.exists());
+    assert!(!expired_slot.exists());
+    assert!(
+        unmerged_ws.is_dir(),
+        "unmerged sandbox must survive without --stale"
+    );
+    assert!(
+        !unmerged_target.exists(),
+        "target cache inside unmerged sandbox must be stripped"
+    );
+
+    // Confirm `feat/ext-del` was removed from OpLog `view.branches`.
+    let view_after = coord
+        .oplog()
+        .load_current_reconciled()
+        .expect("load view")
+        .view;
+    assert!(
+        !view_after.branches.contains_key("feat/ext-del"),
+        "stale view.branches entry must be pruned"
+    );
+
+    // `--stale 0` evicts clean unmerged sandbox while leaving trunk intact.
+    let stale_report = coord
+        .gc_with_options(&crate::GcOptions {
+            stale_days: Some(0),
+            ..crate::GcOptions::default()
+        })
+        .expect("gc stale 0");
+    assert_eq!(stale_report.pruned_stale_sandboxes, vec![unmerged_safe]);
+    assert!(!unmerged_ws.exists());
+
+    // `close_agent()` cleans up `.tessera/tmp/<agent_id>`.
+    coord
+        .switch_branch("a-tmp-close", "main")
+        .expect("spawn a-tmp-close");
+    let agent_tmp_dir = root.join(".tessera").join("tmp").join("a-tmp-close");
+    fs::create_dir_all(&agent_tmp_dir).expect("mkdir agent_tmp_dir");
+    fs::write(agent_tmp_dir.join("buf.txt"), b"ephemeral").expect("write buf");
+    coord.close_agent("a-tmp-close").expect("close a-tmp-close");
+    assert!(
+        !agent_tmp_dir.exists(),
+        "close_agent must clean up .tessera/tmp/<agent_id>"
+    );
+
+    coord.close_agent("a-bound").expect("close a-bound");
+    let _ = fs::remove_dir_all(&live_verify);
+}
