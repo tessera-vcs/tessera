@@ -517,11 +517,14 @@ pub fn collect_doctor_report(cwd: &Path) -> Value {
                         continue;
                     }
 
-                    let port_name = p
+                    let Some(port_name) = p
                         .file_name()
                         .and_then(|n| n.to_str())
-                        .unwrap_or("")
-                        .to_string();
+                        .filter(|s| s.parse::<u16>().is_ok())
+                        .map(ToString::to_string)
+                    else {
+                        continue;
+                    };
                     let pid_raw = fs::read_to_string(p.join("pid")).unwrap_or_default();
                     let pid_opt = pid_raw.trim().parse::<i32>().ok();
                     let alive = pid_opt.is_some_and(is_pid_alive);

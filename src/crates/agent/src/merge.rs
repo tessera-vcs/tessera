@@ -1226,13 +1226,6 @@ impl Coordinator {
                                 )
                                 .unwrap_or(merged_commit_id)
                         };
-                        let _ = self
-                            .git
-                            .update_ref(&format!("refs/tessera/agents/{aid}"), &rem_new_commit);
-                        let _ = self.git.update_ref(
-                            &format!("refs/tessera/changes/{}", rem_agent.change_id.as_str()),
-                            &rem_new_commit,
-                        );
                         rebased_remaining_agents.insert(
                             aid.clone(),
                             RebasedSession {
@@ -1254,6 +1247,8 @@ impl Coordinator {
                 BTreeSet::new()
             };
 
+        let mut applied_rebased_refs: Vec<(String, ChangeId, ObjectId)> = Vec::new();
+
         self.oplog.record_tx(
             "merge",
             format!(
@@ -1262,6 +1257,8 @@ impl Coordinator {
             ),
             false,
             |view| {
+                applied_rebased_refs.clear();
+
                 if verification_passed {
                     view.branches.insert(branch.clone(), merged_commit_id);
                 }
@@ -1333,16 +1330,198 @@ impl Coordinator {
 
                     for (aid, agent_meta) in view.agents.iter_mut() {
                         if let Some(rebased) = rebased_remaining_agents.get(aid) {
-                            agent_meta.own_blobs = rebased.own_blobs.clone();
-                            agent_meta.deleted_paths = rebased.deleted_paths.clone();
+                            if agent_meta.effective_branch(&default_trunk) != branch.as_str() {
+                                continue;
+                            }
+
+                            let snapshot_before = current.view.agents.get(aid);
+                            let before_base_map = snapshot_before
+                                .and_then(|b| self.git.read_commit(&b.base_commit).ok())
+                                .and_then(|c| self.git.read_tree_to_map(&c.tree_id).ok())
+                                .unwrap_or_default();
+
+                            let mut merged_own = rebased.own_blobs.clone();
+                            let mut merged_deleted = rebased.deleted_paths.clone();
+                            let mut had_concurrent_edits = false;
+                            let mut skip_rebase = false;
+
+                            if let Some(before) = snapshot_before {
+                                for old_path in before.own_blobs.keys() {
+                                    if !agent_meta.own_blobs.contains_key(old_path) {
+                                        merged_own.remove(old_path);
+                                        had_concurrent_edits = true;
+                                    }
+                                }
+
+                                for old_del in &before.deleted_paths {
+                                    if !agent_meta.deleted_paths.contains(old_del) {
+                                        merged_deleted.remove(old_del);
+                                        had_concurrent_edits = true;
+                                    }
+                                }
+                            }
+
+                            for (rel_path, live_bid) in &agent_meta.own_blobs {
+                                let changed_since_load = snapshot_before
+                                    .is_none_or(|b| b.own_blobs.get(rel_path) != Some(live_bid));
+
+                                if !changed_since_load {
+                                    continue;
+                                }
+
+                                had_concurrent_edits = true;
+                                merged_deleted.remove(rel_path);
+
+                                let old_bid = before_base_map.get(rel_path).map(|e| e.blob_id);
+                                let new_bid = acc_map_for_post.get(rel_path).map(|e| e.blob_id);
+
+                                if Some(*live_bid) == new_bid {
+                                    merged_own.remove(rel_path);
+                                    continue;
+                                }
+
+                                if old_bid == new_bid {
+                                    merged_own.insert(rel_path.clone(), *live_bid);
+                                    continue;
+                                }
+
+                                let old_b = old_bid
+                                    .and_then(|id| self.git.read_blob(&id).ok())
+                                    .unwrap_or_default();
+                                let new_b = new_bid
+                                    .and_then(|id| self.git.read_blob(&id).ok())
+                                    .unwrap_or_default();
+                                let Ok(live_b) = self.git.read_blob(live_bid) else {
+                                    skip_rebase = true;
+                                    break;
+                                };
+
+                                if is_binary_bytes(&old_b)
+                                    || is_binary_bytes(&new_b)
+                                    || is_binary_bytes(&live_b)
+                                {
+                                    skip_rebase = true;
+                                    break;
+                                }
+
+                                let reb = merge_file_3way(
+                                    rel_path,
+                                    &String::from_utf8_lossy(&old_b),
+                                    &String::from_utf8_lossy(&new_b),
+                                    &String::from_utf8_lossy(&live_b),
+                                    &branch,
+                                    aid,
+                                );
+
+                                if reb.has_conflicts || has_git_conflict_markers(&reb.content) {
+                                    skip_rebase = true;
+                                    break;
+                                }
+
+                                if let Ok(reb_bid) = self.git.write_blob(reb.content.as_bytes()) {
+                                    if Some(reb_bid) == new_bid {
+                                        merged_own.remove(rel_path);
+                                    } else {
+                                        merged_own.insert(rel_path.clone(), reb_bid);
+                                    }
+                                } else {
+                                    skip_rebase = true;
+                                    break;
+                                }
+                            }
+
+                            if !skip_rebase {
+                                for rel_path in &agent_meta.deleted_paths {
+                                    let added_since_load = snapshot_before
+                                        .is_none_or(|b| !b.deleted_paths.contains(rel_path));
+
+                                    if !added_since_load {
+                                        continue;
+                                    }
+
+                                    had_concurrent_edits = true;
+                                    merged_own.remove(rel_path);
+
+                                    let old_bid = before_base_map.get(rel_path).map(|e| e.blob_id);
+                                    let new_bid = acc_map_for_post.get(rel_path).map(|e| e.blob_id);
+
+                                    if new_bid.is_none() {
+                                        merged_deleted.remove(rel_path);
+                                    } else if old_bid != new_bid {
+                                        skip_rebase = true;
+                                        break;
+                                    } else {
+                                        merged_deleted.insert(rel_path.clone());
+                                    }
+                                }
+                            }
+
+                            if skip_rebase {
+                                continue;
+                            }
+
+                            let mut final_head_commit = rebased.head_commit;
+                            let mut final_head_tree = rebased.head_tree;
+
+                            if had_concurrent_edits {
+                                let live_head_map = self
+                                    .git
+                                    .read_tree_to_map(&agent_meta.head_tree)
+                                    .unwrap_or_default();
+                                let mut rebuilt_map = acc_map_for_post.clone();
+
+                                for (p, bid) in &merged_own {
+                                    let mode = live_head_map
+                                        .get(p)
+                                        .or_else(|| rebuilt_map.get(p))
+                                        .map_or(EntryMode::NormalFile, FileEntry::entry_mode);
+                                    rebuilt_map.insert(p.clone(), FileEntry::from_mode(*bid, mode));
+                                }
+
+                                for p in &merged_deleted {
+                                    rebuilt_map.remove(p);
+                                }
+
+                                if let Ok(rebuilt_tree) = self.git.write_tree_from_map(&rebuilt_map)
+                                {
+                                    final_head_tree = rebuilt_tree;
+                                    final_head_commit = if rebuilt_tree == acc_tree {
+                                        merged_commit_id
+                                    } else {
+                                        self.git
+                                            .write_commit(
+                                                &rebuilt_tree,
+                                                std::slice::from_ref(&merged_commit_id),
+                                                &author,
+                                                &agent_meta.intent,
+                                            )
+                                            .unwrap_or(rebased.head_commit)
+                                    };
+                                }
+                            }
+
+                            agent_meta.own_blobs = merged_own;
+                            agent_meta.deleted_paths = merged_deleted;
                             agent_meta.base_commit = merged_commit_id;
-                            agent_meta.head_commit = rebased.head_commit;
-                            agent_meta.head_tree = rebased.head_tree;
-                            agent_meta.read_blobs.clear();
+                            agent_meta.head_commit = final_head_commit;
+                            agent_meta.head_tree = final_head_tree;
+
+                            if let Some(before) = snapshot_before {
+                                agent_meta
+                                    .read_blobs
+                                    .retain(|path, bid| before.read_blobs.get(path) != Some(bid));
+                            } else {
+                                agent_meta.read_blobs.clear();
+                            }
+
                             agent_meta.integrated_peer_blobs.clear();
-                            agent_meta.updated_at_ms = now_millis();
-                            rebased_changes
-                                .push((agent_meta.change_id.clone(), rebased.head_commit));
+                            agent_meta.updated_at_ms = now_millis().max(agent_meta.updated_at_ms);
+                            rebased_changes.push((agent_meta.change_id.clone(), final_head_commit));
+                            applied_rebased_refs.push((
+                                aid.clone(),
+                                agent_meta.change_id.clone(),
+                                final_head_commit,
+                            ));
                             continue;
                         }
 
@@ -1400,6 +1579,15 @@ impl Coordinator {
                 Ok(())
             },
         )?;
+
+        for (aid, cid, head_cid) in &applied_rebased_refs {
+            let _ = self
+                .git
+                .update_ref(&format!("refs/tessera/agents/{aid}"), head_cid);
+            let _ = self
+                .git
+                .update_ref(&format!("refs/tessera/changes/{}", cid.as_str()), head_cid);
+        }
 
         Ok(MergeReport {
             target_branch: branch,
@@ -1464,7 +1652,8 @@ impl Coordinator {
             .collect();
 
         let mut rebased_agents = Vec::new();
-        let mut new_conflicts = Vec::new();
+        let mut dirty_rebased_ids = BTreeSet::new();
+        let mut pending_conflicts: Vec<(String, ConflictRecord)> = Vec::new();
 
         for mut agent in agents {
             let eff_branch = agent
@@ -1478,7 +1667,6 @@ impl Coordinator {
                 .unwrap_or(trunk_commit_id);
 
             if agent.base_commit == target_cid {
-                rebased_agents.push(agent);
                 continue;
             }
 
@@ -1512,7 +1700,7 @@ impl Coordinator {
 
             for c in outcome.conflicts {
                 self.oplog.save_conflict(&c)?;
-                new_conflicts.push(c);
+                pending_conflicts.push((agent.agent_id.clone(), c));
             }
 
             let rebased_commit = self.git.write_commit(
@@ -1549,18 +1737,7 @@ impl Coordinator {
             agent.integrated_peer_blobs.clear();
             agent.updated_at_ms = now_millis();
 
-            if let Some(ws_path) = &agent.workspace_path {
-                materialize_tree_to_dir(&self.git, &outcome.merged_tree_id, Path::new(ws_path))?;
-            }
-
-            self.git.update_ref(
-                &format!("refs/tessera/agents/{}", agent.agent_id),
-                &rebased_commit,
-            )?;
-            self.git.update_ref(
-                &format!("refs/tessera/changes/{}", agent.change_id.as_str()),
-                &rebased_commit,
-            )?;
+            dirty_rebased_ids.insert(agent.agent_id.clone());
             rebased_agents.push(agent);
         }
 
@@ -1580,6 +1757,9 @@ impl Coordinator {
             .map(|c| c.tree_id)
             .unwrap_or(trunk_tree_id);
 
+        let mut applied_rebased = Vec::new();
+        let mut applied_ids = BTreeSet::new();
+
         self.oplog.record_tx(
             "sync",
             format!(
@@ -1588,6 +1768,9 @@ impl Coordinator {
             ),
             false,
             |view| {
+                applied_rebased.clear();
+                applied_ids.clear();
+
                 for (b, cid) in &git_branches {
                     view.branches.insert(b.clone(), *cid);
                 }
@@ -1660,24 +1843,53 @@ impl Coordinator {
                 }
 
                 for a in &rebased_agents {
-                    view.agents.insert(a.agent_id.clone(), a.clone());
-                    view.changes.insert(a.change_id.clone(), a.head_commit);
+                    let snapshot_before = current.view.agents.get(&a.agent_id);
+
+                    if let Some(updated) = apply_synced_agent_to_view(view, a, snapshot_before) {
+                        applied_ids.insert(updated.agent_id.clone());
+                        applied_rebased.push(updated);
+                    }
                 }
 
-                for c in &new_conflicts {
-                    view.conflicts.insert(c.path.clone(), c.id.clone());
+                for (aid, c) in &pending_conflicts {
+                    if applied_ids.contains(aid) {
+                        view.conflicts.insert(c.path.clone(), c.id.clone());
+                    }
                 }
 
                 Ok(())
             },
         )?;
 
+        for (aid, c) in &pending_conflicts {
+            if !applied_ids.contains(aid) {
+                self.oplog.delete_conflict(&c.id);
+            }
+        }
+
+        for agent in &applied_rebased {
+            if dirty_rebased_ids.contains(&agent.agent_id) {
+                if let Some(ws_path) = &agent.workspace_path {
+                    materialize_tree_to_dir(&self.git, &agent.head_tree, Path::new(ws_path))?;
+                }
+            }
+
+            self.git.update_ref(
+                &format!("refs/tessera/agents/{}", agent.agent_id),
+                &agent.head_commit,
+            )?;
+            self.git.update_ref(
+                &format!("refs/tessera/changes/{}", agent.change_id.as_str()),
+                &agent.head_commit,
+            )?;
+        }
+
         self.reconcile_in_flight_sessions();
         let caller_id = detect_session_id(None);
         let _ = self.snapshot_agent(&caller_id, true);
         self.git.sync_git_index(&head_branch_cid);
 
-        Ok(rebased_agents)
+        Ok(applied_rebased)
     }
 
     /// Resolves a first-class conflict at `path` using `strategy`, updating the target branch's
@@ -2190,4 +2402,52 @@ fn format_merge_commit_message(
             }
         }
     }
+}
+
+/// Applies a rebased [`AgentMetadata`] entry into `view` inside [`Coordinator::sync_all_agents`],
+/// skipping agents that were closed, switched branches, or recorded concurrent file edits since
+/// `snapshot_before` was loaded, while preserving concurrent metadata updates (`claimed_symbols`,
+/// `intent`, `checkpoints`, `waypoint`, `read_blobs`).
+///
+/// Returns `Some(updated_agent)` when the rebase was applied, or `None` when skipped.
+pub(crate) fn apply_synced_agent_to_view(
+    view: &mut core::View,
+    rebased: &AgentMetadata,
+    snapshot_before: Option<&AgentMetadata>,
+) -> Option<AgentMetadata> {
+    let live = view.agents.get_mut(&rebased.agent_id)?;
+
+    if let Some(before) = snapshot_before {
+        if live.target_branch != before.target_branch
+            || live.base_commit != before.base_commit
+            || live.own_blobs != before.own_blobs
+            || live.deleted_paths != before.deleted_paths
+            || live.head_commit != before.head_commit
+            || live.head_tree != before.head_tree
+        {
+            return None;
+        }
+    }
+
+    live.base_commit = rebased.base_commit;
+    live.head_commit = rebased.head_commit;
+    live.head_tree = rebased.head_tree;
+    live.own_blobs = rebased.own_blobs.clone();
+    live.deleted_paths = rebased.deleted_paths.clone();
+    live.integrated_peer_blobs.clear();
+
+    if rebased.read_blobs.is_empty() {
+        if let Some(before) = snapshot_before {
+            live.read_blobs
+                .retain(|path, bid| before.read_blobs.get(path) != Some(bid));
+        } else {
+            live.read_blobs.clear();
+        }
+    }
+
+    live.updated_at_ms = live.updated_at_ms.max(rebased.updated_at_ms);
+    let updated = live.clone();
+    view.changes
+        .insert(updated.change_id.clone(), updated.head_commit);
+    Some(updated)
 }

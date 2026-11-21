@@ -14,7 +14,8 @@ tes commit [-m <MESSAGE>] [options]
 - `-b, --branch <BRANCH>` - Explicit target branch override.
 - `--amend` - Amend the tip commit of the target branch instead of creating a new child commit.
 - `--no-edit` - Reuse the previous commit message when amending without `-m`.
-- `--verify <CMD>` - Run a verification command before committing.
+- `--verify[=<CMD>]` - Run speculative verification before committing. Uses the configured `verify_command` when passed without a value, or runs a custom command when passed with `=` (e.g., `--verify="npm run build"`; `=` is required when supplying a command).
+- `--verify-cmd <CMD>` - Explicit speculative verification command to run before committing (e.g., `--verify-cmd "npm run build"`; conflicts with `--verify`).
 - `--co-author [=<NAME <EMAIL>>]` - Append a `Co-authored-by:` trailer to this commit (defaults to configured `co_author_trailer` when passed without a value; repeatable).
 - `--no-co-author` - Omit `Co-authored-by:` trailers for this commit even if `co_author = true` in repository config.
 - `--author <NAME <EMAIL>>` - Override the commit `Author` identity for this commit.
@@ -45,4 +46,8 @@ tes commit -m "feat(pricing): add tier selector" --co-author
 # include a custom Co-authored-by trailer or override the commit author
 tes commit -m "feat(pricing): pair on billing logic" --co-author "Alice <alice@example.com>"
 tes commit -m "fix(auth): token refresh" --author "Jane Doe <jane@example.com>"
+
+# run a verification command before committing
+tes commit -m "feat(pricing): add tier selector" --verify="npm run build"
+tes commit -m "feat(pricing): add tier selector" --verify-cmd "npm run build"
 ```

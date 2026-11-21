@@ -67,14 +67,14 @@ For AI coding editors that support the Model Context Protocol (MCP), [tes mcp](/
 | `status` | `{ agent_id? }` | Snapshot and return session status, branch state, and claimed symbols |
 | `radar` | `{}` | Return all active agent sessions, target branches, and overlapping edits |
 | `claim` | `{ intent?, branch?, from?, symbols?, agent_id? }` | Claim a task intent, optional target branch and parent base, and file/symbol list |
-| `commit` | `{ message?, branch?, amend?, author?, co_author?, no_co_author?, verify?, agent_id? }` | Commit the session's isolated changes onto its target branch |
-| `diff` | `{ branch?, staged?, rev_range?, paths?, agent_id? }` | Inspect unified diffs for the session, staged edits, branch, or revision range |
-| `log` | `{ branch?, limit? }` | Return commit history for a branch |
+| `commit` | `{ message?, branch?, amend?, dry_run?, author?, co_author?, no_co_author?, verify?, agent_id? }` | Commit the session's isolated changes onto its target branch |
+| `diff` | `{ branch?, staged?, all?, range?, stat?, name_status?, paths?, agent_id? }` | Inspect unified diffs for the session, staged edits, branch, or revision range |
+| `log` | `{ branch?, limit?, agent_id? }` | Return commit history for a branch |
 | `oplog` | `{ limit? }` | Return recent entries from the Operation Log |
-| `push` | `{ remote?, branch?, force?, tags?, dry_run?, agent_id? }` | Push the active (or specified) branch to a Git remote |
+| `push` | `{ remote?, branch?, message?, set_upstream?, force?, force_with_lease?, tags?, delete?, dry_run?, no_auto_commit?, agent_id? }` | Push the active (or specified) branch to a Git remote |
 | `pull` | `{ remote?, branch?, agent_id? }` | Fetch and fast-forward or 3-way AST-merge a remote branch and rebase sessions |
 | `checkpoint` | `{ label, agent_id? }` | Create a named atomic checkpoint in the Operation Log |
-| `restore` | `{ source?, branch?, paths?, agent_id? }` | Restore a branch or file paths to a commit, branch, or checkpoint |
+| `restore` | `{ source?, revision?, branch?, paths?, agent_id? }` | Restore a branch or file paths to a commit, branch, or checkpoint |
 | `branch` | `{ action?: "list"\|"switch"\|"delete"\|"rename", branch?, new_branch?, from?, force?, agent_id? }` | List, switch, delete, or rename branches across Git refs, sandboxes, and sessions |
 | `stash` | `{ action?: "push"\|"pop"\|"apply"\|"list"\|"drop"\|"clear", message?, branch?, paths?, index?, agent_id? }` | Session-isolated AST stash operations |
 | `cherry-pick` | `{ commit, branch?, agent_id? }` | 3-way AST cherry-pick a commit onto a target branch |
@@ -83,7 +83,7 @@ For AI coding editors that support the Model Context Protocol (MCP), [tes mcp](/
 | `sync` | `{}` | Non-blocking auto-rebase of active sessions onto the latest trunk commit |
 | `undo` | `{ op?, checkpoint? }` | Atomically roll back to the previous operation, an `OpId` prefix, or a checkpoint |
 | `merge` | `{ agents?, into?, message?, verify?, keep_open?, dry_run?, author?, co_author?, no_co_author? }` | Commit the session or AST-merge multiple branches into a target branch |
-| `agent` | `{ action?: "list"\|"close"\|"clear", agent_id?, force? }` | List, close, or clear active agent sessions |
+| `agent` | `{ action?: "list"\|"close"\|"clear", name?, all?, force?, agent_id? }` | List, close, or clear active agent sessions |
 | `config` | `{ action?: "show" }` | Inspect effective repository configuration |
 | `doctor` | `{}` | Run repository health, config trust, filesystem, and integration diagnostics |
 

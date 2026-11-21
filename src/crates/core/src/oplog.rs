@@ -253,14 +253,12 @@ fn merge_agent_metadata(
     combined.read_blobs = merge_map_3way(base_read, &primary.read_blobs, &secondary.read_blobs);
 
     let primary_committed = base_opt.is_some_and(|b| {
-        b.base_commit != primary.base_commit
-            && primary.own_blobs.is_empty()
-            && !b.own_blobs.is_empty()
+        b.base_commit != primary.base_commit && b.has_own_changes() && !primary.has_own_changes()
     });
     let secondary_committed = base_opt.is_some_and(|b| {
         b.base_commit != secondary.base_commit
-            && secondary.own_blobs.is_empty()
-            && !b.own_blobs.is_empty()
+            && b.has_own_changes()
+            && !secondary.has_own_changes()
     });
 
     if !primary_committed && !secondary_committed {
@@ -272,17 +270,32 @@ fn merge_agent_metadata(
         combined.deleted_paths =
             merge_set_3way(base_del, &primary.deleted_paths, &secondary.deleted_paths);
 
-        for del in &combined.deleted_paths {
-            if !primary.own_blobs.contains_key(del) {
-                combined.own_blobs.remove(del);
+        for path in primary.own_blobs.keys() {
+            if combined.own_blobs.contains_key(path) {
+                combined.deleted_paths.remove(path);
+            }
+        }
+
+        for path in &primary.deleted_paths {
+            if combined.deleted_paths.contains(path) {
+                combined.own_blobs.remove(path);
             }
         }
     } else if secondary_committed && !primary_committed {
         combined.base_commit = secondary.base_commit;
         combined.head_commit = secondary.head_commit;
         combined.head_tree = secondary.head_tree;
+
         let base_own = base_opt.map_or(&empty_blobs, |b| &b.own_blobs);
         combined.own_blobs.retain(|k, v| base_own.get(k) != Some(v));
+
+        let empty_del = BTreeSet::new();
+        let base_del = base_opt.map_or(&empty_del, |b| &b.deleted_paths);
+        combined.deleted_paths.retain(|k| !base_del.contains(k));
+    }
+
+    for del in &combined.deleted_paths {
+        combined.own_blobs.remove(del);
     }
 
     let empty_fb = BTreeSet::new();
@@ -525,14 +538,13 @@ impl OpLogStore {
             .unwrap_or_default()
     }
 
-    /// Resolves `parents` through the compacted parent forwarding table so callers walking the
-    /// OpLog DAG (`list_history`, `find_common_parent_view`, `undo`) seamlessly bridge deleted
-    /// ephemeral operations.
-    #[must_use]
-    pub fn resolve_parent_ids(&self, parents: &[OpId]) -> Vec<OpId> {
-        let map = self.load_compacted_parents();
-
-        if map.is_empty() {
+    /// Expands `parents` through `compacted` forwarding links while tracking every visited
+    /// [`OpId`] so cyclic or diamond forwarding graphs terminate in linear time.
+    fn expand_compacted_parents(
+        compacted: &BTreeMap<OpId, Vec<OpId>>,
+        parents: &[OpId],
+    ) -> Vec<OpId> {
+        if compacted.is_empty() {
             return parents.to_vec();
         }
 
@@ -541,18 +553,31 @@ impl OpLogStore {
         let mut stack: Vec<OpId> = parents.iter().rev().cloned().collect();
 
         while let Some(id) = stack.pop() {
-            if let Some(forwarded) = map.get(&id) {
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+
+            if let Some(forwarded) = compacted.get(&id) {
                 for anc in forwarded.iter().rev() {
                     if !seen.contains(anc) {
                         stack.push(anc.clone());
                     }
                 }
-            } else if seen.insert(id.clone()) {
+            } else {
                 out.push(id);
             }
         }
 
         out
+    }
+
+    /// Resolves `parents` through the compacted parent forwarding table so callers walking the
+    /// OpLog DAG (`list_history`, `find_common_parent_view`, `undo`) seamlessly bridge deleted
+    /// ephemeral operations.
+    #[must_use]
+    pub fn resolve_parent_ids(&self, parents: &[OpId]) -> Vec<OpId> {
+        let map = self.load_compacted_parents();
+        Self::expand_compacted_parents(&map, parents)
     }
 
     /// Returns the directory storing active operation head markers (`.git/tessera/op_heads`).
@@ -1049,7 +1074,69 @@ impl OpLogStore {
         }
     }
 
-    /// Reconciles multiple `op_heads` assuming the caller already holds [`Self::acquire_oplog_lock`].
+    /// Partitions `heads` into `(maximal_heads, redundant_ancestors)` by pruning any head that is
+    /// already a strict ancestor of another head in `heads`.
+    fn partition_maximal_heads(&self, heads: &[OpId]) -> (Vec<OpId>, Vec<OpId>) {
+        let head_set: BTreeSet<&OpId> = heads.iter().collect();
+        let compacted = self.load_compacted_parents();
+        let mut redundant = BTreeSet::new();
+
+        for head in heads {
+            let Ok(head_op) = self.read_operation(head) else {
+                continue;
+            };
+
+            let mut visited = BTreeSet::new();
+            let mut queue = std::collections::VecDeque::new();
+
+            for p in Self::expand_compacted_parents(&compacted, &head_op.parents) {
+                if &p != head && visited.insert(p.clone()) {
+                    queue.push_back(p);
+                }
+            }
+
+            let mut steps = 0usize;
+
+            while let Some(curr) = queue.pop_front() {
+                if head_set.contains(&curr) {
+                    redundant.insert(curr.clone());
+                }
+
+                steps += 1;
+
+                if steps >= 512 {
+                    break;
+                }
+
+                if let Ok(curr_op) = self.read_operation(&curr) {
+                    for p in Self::expand_compacted_parents(&compacted, &curr_op.parents) {
+                        if &p != head && visited.insert(p.clone()) {
+                            queue.push_back(p);
+                        }
+                    }
+                }
+            }
+        }
+
+        if redundant.len() == heads.len() {
+            return (heads.to_vec(), Vec::new());
+        }
+
+        let mut maximal = Vec::new();
+        let mut pruned = Vec::new();
+
+        for head in heads {
+            if redundant.contains(head) {
+                pruned.push(head.clone());
+            } else {
+                maximal.push(head.clone());
+            }
+        }
+
+        (maximal, pruned)
+    }
+
+    /// Reconciles multiple `op_heads` assuming the caller already holds [`Self::acquire_lock`].
     fn load_current_reconciled_unlocked(&self) -> CoreResult<Operation> {
         let heads = self.list_op_heads()?;
 
@@ -1063,10 +1150,24 @@ impl OpLogStore {
             return self.read_operation(&heads[0]);
         }
 
-        let first_op = self.read_operation(&heads[0])?;
+        let (maximal_heads, redundant_heads) = self.partition_maximal_heads(&heads);
+
+        if maximal_heads.len() == 1 {
+            let surviving = self.read_operation(&maximal_heads[0])?;
+
+            for stale in &redundant_heads {
+                if *stale != surviving.id && validate_hex_id("operation", stale.as_str()).is_ok() {
+                    let _ = fs::remove_file(self.op_heads_dir().join(stale.as_str()));
+                }
+            }
+
+            return Ok(surviving);
+        }
+
+        let first_op = self.read_operation(&maximal_heads[0])?;
         let mut acc_view = first_op.view.clone();
 
-        for next_head_id in &heads[1..] {
+        for next_head_id in &maximal_heads[1..] {
             let next_op = self.read_operation(next_head_id)?;
 
             let base_view = self
@@ -1077,14 +1178,24 @@ impl OpLogStore {
         }
 
         let reconciled_op = Operation::new(
-            heads.clone(),
+            maximal_heads.clone(),
             "reconciler",
-            format!("auto-reconcile {} concurrent agent operations", heads.len()),
+            format!(
+                "auto-reconcile {} concurrent agent operations",
+                maximal_heads.len()
+            ),
             true,
             acc_view,
         )?;
 
         self.write_operation(&reconciled_op)?;
+
+        for stale in &redundant_heads {
+            if *stale != reconciled_op.id && validate_hex_id("operation", stale.as_str()).is_ok() {
+                let _ = fs::remove_file(self.op_heads_dir().join(stale.as_str()));
+            }
+        }
+
         Ok(reconciled_op)
     }
 
@@ -1165,25 +1276,6 @@ impl OpLogStore {
     /// nodes) to locate the most recent common ancestor [`View`] between `left` and `right`.
     fn find_common_parent_view(&self, left: &Operation, right: &Operation) -> Option<View> {
         let compacted = self.load_compacted_parents();
-        let expand = |parents: &[OpId]| -> Vec<OpId> {
-            let mut out = Vec::new();
-            let mut stack: Vec<OpId> = parents.iter().rev().cloned().collect();
-            let mut seen = BTreeSet::new();
-
-            while let Some(id) = stack.pop() {
-                if let Some(fw) = compacted.get(&id) {
-                    for a in fw.iter().rev() {
-                        if !seen.contains(a) {
-                            stack.push(a.clone());
-                        }
-                    }
-                } else if seen.insert(id.clone()) {
-                    out.push(id);
-                }
-            }
-
-            out
-        };
 
         let mut left_ancestors = BTreeSet::new();
         let mut left_queue = std::collections::VecDeque::new();
@@ -1206,7 +1298,7 @@ impl OpLogStore {
                         return Some(lop.view);
                     }
 
-                    for p in expand(&lop.parents) {
+                    for p in Self::expand_compacted_parents(&compacted, &lop.parents) {
                         if right_ancestors.contains(&p) {
                             if let Ok(op) = self.read_operation(&p) {
                                 return Some(op.view);
@@ -1226,7 +1318,7 @@ impl OpLogStore {
                         return Some(rop.view);
                     }
 
-                    for p in expand(&rop.parents) {
+                    for p in Self::expand_compacted_parents(&compacted, &rop.parents) {
                         if left_ancestors.contains(&p) {
                             if let Ok(op) = self.read_operation(&p) {
                                 return Some(op.view);
@@ -1309,17 +1401,7 @@ impl OpLogStore {
                 },
             };
 
-            let mut parent_stack: Vec<OpId> = op.parents.iter().rev().cloned().collect();
-
-            while let Some(pid) = parent_stack.pop() {
-                if let Some(fw) = compacted.get(&pid) {
-                    for anc in fw.iter().rev() {
-                        parent_stack.push(anc.clone());
-                    }
-
-                    continue;
-                }
-
+            for pid in Self::expand_compacted_parents(&compacted, &op.parents) {
                 if !visited.contains(&pid) && !loaded.contains_key(&pid) {
                     if let Ok(parent_op) = self.read_operation(&pid) {
                         heap.push((parent_op.timestamp_ms, pid.clone()));
@@ -1783,5 +1865,230 @@ LD_PRELOAD = "/tmp/evil.so"
         assert_eq!(trusted_cfg.verify_command.as_deref(), Some("cargo test"));
         let local_cfg = store.load_local_config().expect("load local");
         assert!(local_cfg.verify_command.is_none());
+    }
+
+    #[test]
+    fn merge_agent_metadata_enforces_disjointness_and_handles_deletion_only_commits() {
+        let c1 = ObjectId::from_hex("1111111111111111111111111111111111111111").expect("c1");
+        let c2 = ObjectId::from_hex("2222222222222222222222222222222222222222").expect("c2");
+        let t2 = ObjectId::from_hex("3333333333333333333333333333333333333333").expect("t2");
+        let b1 = ObjectId::from_hex("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").expect("b1");
+        let b2 = ObjectId::from_hex("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").expect("b2");
+        let b3 = ObjectId::from_hex("cccccccccccccccccccccccccccccccccccccccc").expect("b3");
+
+        let make_agent = |base_commit: ObjectId, updated_at_ms: u64| AgentMetadata {
+            agent_id: "agent-1".to_string(),
+            slot: 1,
+            change_id: ChangeId::from_seed("agent-1"),
+            base_commit,
+            head_commit: base_commit,
+            head_tree: base_commit,
+            intent: "work".to_string(),
+            intent_inferred: false,
+            claimed_symbols: BTreeSet::new(),
+            scopes: Vec::new(),
+            workspace_path: None,
+            read_blobs: BTreeMap::new(),
+            own_blobs: BTreeMap::new(),
+            deleted_paths: BTreeSet::new(),
+            foreign_baseline: BTreeSet::new(),
+            integrated_peer_blobs: BTreeMap::new(),
+            target_branch: Some("main".to_string()),
+            checkpoints: BTreeMap::new(),
+            waypoint: None,
+            updated_at_ms,
+        };
+
+        // Primary (newer) edit vs secondary (older) delete must stay strictly disjoint.
+        let base = make_agent(c1, 50);
+        let mut primary = make_agent(c1, 200);
+        primary.own_blobs.insert("a.rs".to_string(), b1);
+
+        let mut secondary = make_agent(c1, 100);
+        secondary.deleted_paths.insert("a.rs".to_string());
+        secondary.deleted_paths.insert("b.rs".to_string());
+
+        let merged_edit_wins = merge_agent_metadata(Some(&base), &primary, &secondary);
+        assert_eq!(merged_edit_wins.own_blobs.get("a.rs"), Some(&b1));
+        assert!(!merged_edit_wins.deleted_paths.contains("a.rs"));
+        assert!(merged_edit_wins.deleted_paths.contains("b.rs"));
+
+        // Primary (newer) delete vs secondary (older) edit must also stay strictly disjoint.
+        let mut primary_del = make_agent(c1, 200);
+        primary_del.deleted_paths.insert("a.rs".to_string());
+
+        let mut secondary_edit = make_agent(c1, 100);
+        secondary_edit.own_blobs.insert("a.rs".to_string(), b2);
+        secondary_edit.own_blobs.insert("c.rs".to_string(), b3);
+
+        let merged_del_wins = merge_agent_metadata(Some(&base), &primary_del, &secondary_edit);
+        assert!(merged_del_wins.deleted_paths.contains("a.rs"));
+        assert!(!merged_del_wins.own_blobs.contains_key("a.rs"));
+        assert_eq!(merged_del_wins.own_blobs.get("c.rs"), Some(&b3));
+
+        // Deletion-only commit on secondary advances base/head and prunes committed deletions.
+        let mut del_base = make_agent(c1, 50);
+        del_base.deleted_paths.insert("old.rs".to_string());
+
+        let mut sec_committed = make_agent(c2, 100);
+        sec_committed.head_commit = c2;
+        sec_committed.head_tree = t2;
+
+        let mut pri_uncommitted = make_agent(c1, 200);
+        pri_uncommitted.deleted_paths.insert("old.rs".to_string());
+        pri_uncommitted.deleted_paths.insert("extra.rs".to_string());
+        pri_uncommitted.own_blobs.insert("new.rs".to_string(), b1);
+
+        let merged_commit = merge_agent_metadata(Some(&del_base), &pri_uncommitted, &sec_committed);
+        assert_eq!(merged_commit.base_commit, c2);
+        assert_eq!(merged_commit.head_commit, c2);
+        assert_eq!(merged_commit.head_tree, t2);
+        assert!(!merged_commit.deleted_paths.contains("old.rs"));
+        assert!(merged_commit.deleted_paths.contains("extra.rs"));
+        assert_eq!(merged_commit.own_blobs.get("new.rs"), Some(&b1));
+    }
+
+    #[test]
+    fn reconcile_three_heads_prunes_stale_ancestor_without_regressing_branch() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = OpLogStore::new(tmp.path());
+
+        let c0 = ObjectId::from_hex("1000000000000000000000000000000000000000").expect("c0");
+        let c1 = ObjectId::from_hex("2000000000000000000000000000000000000000").expect("c1");
+        let c2 = ObjectId::from_hex("3000000000000000000000000000000000000000").expect("c2");
+        let c3 = ObjectId::from_hex("4000000000000000000000000000000000000000").expect("c3");
+
+        let mut root_view = View::default();
+        root_view.branches.insert("main".to_string(), c0);
+        root_view.branches.insert("feat".to_string(), c0);
+        let root_op = store.init(root_view).expect("init");
+
+        let mut v1 = root_op.view.clone();
+        v1.branches.insert("feat".to_string(), c1);
+        let op_h1 = Operation::new(vec![root_op.id.clone()], "agent-a", "feat c1", false, v1)
+            .expect("op_h1");
+        store.write_operation(&op_h1).expect("write op_h1");
+
+        let mut v2 = op_h1.view.clone();
+        v2.branches.insert("feat".to_string(), c2);
+        let op_h2 =
+            Operation::new(vec![op_h1.id.clone()], "agent-a", "feat c2", false, v2).expect("op_h2");
+        store.write_operation(&op_h2).expect("write op_h2");
+
+        // Simulate a crash between creating `op_heads/H2` and unlinking `op_heads/H1`.
+        atomic_write_file(
+            &store.op_heads_dir().join(op_h1.id.as_str()),
+            op_h1.id.as_str().as_bytes(),
+        )
+        .expect("recreate stale H1 head");
+
+        let mut v3 = root_op.view.clone();
+        v3.branches.insert("other".to_string(), c3);
+        let op_h3 = Operation::new(vec![root_op.id.clone()], "agent-b", "other c3", false, v3)
+            .expect("op_h3");
+        store.write_operation(&op_h3).expect("write op_h3");
+
+        assert_eq!(store.list_op_heads().expect("3 heads").len(), 3);
+
+        let reconciled = store.load_current_reconciled().expect("reconcile 3 heads");
+        assert_eq!(reconciled.view.branches.get("feat"), Some(&c2));
+        assert_eq!(reconciled.view.branches.get("other"), Some(&c3));
+        assert!(!reconciled.parents.contains(&op_h1.id));
+        assert_eq!(store.list_op_heads().expect("1 head").len(), 1);
+
+        // Also verify a 2-head stale ancestor collapses directly to the surviving descendant.
+        let mut v4 = reconciled.view.clone();
+        v4.next_agent_slot = 9;
+        let op_next = Operation::new(vec![reconciled.id.clone()], "agent-a", "slot 9", false, v4)
+            .expect("op_next");
+        store.write_operation(&op_next).expect("write op_next");
+        atomic_write_file(
+            &store.op_heads_dir().join(reconciled.id.as_str()),
+            reconciled.id.as_str().as_bytes(),
+        )
+        .expect("recreate stale reconciled head");
+
+        let collapsed = store.load_current_reconciled().expect("collapse 2 heads");
+        assert_eq!(collapsed.id, op_next.id);
+        assert_eq!(
+            store.list_op_heads().expect("single head"),
+            vec![op_next.id]
+        );
+    }
+
+    #[test]
+    fn cyclic_and_diamond_compacted_parents_terminate_cleanly() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = OpLogStore::new(tmp.path());
+        let root_op = store.init(View::default()).expect("init");
+
+        let op1 = store
+            .record_tx("agent-a", "op1", false, |v| {
+                v.next_agent_slot = 2;
+                Ok(())
+            })
+            .expect("op1");
+
+        let cyc_a = OpId(format!("{:064x}", 0xa1u64));
+        let cyc_b = OpId(format!("{:064x}", 0xb2u64));
+        let self_op = OpId(format!("{:064x}", 0xc3u64));
+
+        let mut compacted: BTreeMap<OpId, Vec<OpId>> = BTreeMap::new();
+        compacted.insert(cyc_a.clone(), vec![cyc_b.clone()]);
+        compacted.insert(cyc_b.clone(), vec![cyc_a.clone(), root_op.id.clone()]);
+        compacted.insert(self_op.clone(), vec![self_op.clone()]);
+
+        // Build a 30-level diamond graph that would explode exponentially without a seen set.
+        let diamond_root = OpId(format!("{:064x}", 0x1000u64));
+        let mut prev_nodes = vec![diamond_root.clone()];
+
+        for level in 1u64..=30 {
+            let left = OpId(format!("{:064x}", 0x2000u64 + level * 2));
+            let right = OpId(format!("{:064x}", 0x2000u64 + level * 2 + 1));
+
+            for node in prev_nodes {
+                compacted.insert(node, vec![left.clone(), right.clone()]);
+            }
+
+            prev_nodes = vec![left, right];
+        }
+
+        for leaf in prev_nodes {
+            compacted.insert(leaf, vec![root_op.id.clone()]);
+        }
+
+        let bytes = serde_json::to_vec(&compacted).expect("serialize compacted");
+        atomic_write_file(&store.compacted_parents_path(), &bytes).expect("write compacted");
+
+        assert_eq!(
+            store.resolve_parent_ids(std::slice::from_ref(&cyc_a)),
+            vec![root_op.id.clone()]
+        );
+        assert!(
+            store
+                .resolve_parent_ids(std::slice::from_ref(&self_op))
+                .is_empty()
+        );
+        assert_eq!(
+            store.resolve_parent_ids(std::slice::from_ref(&diamond_root)),
+            vec![root_op.id.clone()]
+        );
+
+        let mut v_cyc = root_op.view.clone();
+        v_cyc.next_agent_slot = 5;
+        let op_with_cycle =
+            Operation::new(vec![cyc_a], "agent-b", "from cyclic parent", false, v_cyc)
+                .expect("op_with_cycle");
+        store
+            .write_operation(&op_with_cycle)
+            .expect("write op_with_cycle");
+
+        assert_eq!(
+            store.find_common_parent_view(&op_with_cycle, &op1),
+            Some(root_op.view.clone())
+        );
+
+        let history = store.list_history(20).expect("list_history with cycle");
+        assert!(history.iter().any(|o| o.id == root_op.id));
     }
 }

@@ -18,8 +18,8 @@ use workspace::{
 
 use crate::merge::apply_co_author_trailer;
 use crate::worktree::{
-    is_binary_bytes, is_harness_config_path, remove_worktree_file, write_worktree_file,
-    write_worktree_file_checked, write_worktree_rel,
+    acquire_file_lock, is_binary_bytes, is_harness_config_path, remove_worktree_file,
+    write_worktree_file, write_worktree_file_checked, write_worktree_rel,
 };
 use crate::{
     CherryPickReport, Coordinator, DeleteBranchReport, LogEntry, PullReport, RenameBranchReport,
@@ -433,9 +433,10 @@ impl Coordinator {
         for raw_p in paths {
             let trimmed_raw = raw_p
                 .trim()
+                .replace('\\', "/")
                 .trim_start_matches("./")
                 .trim_matches('/')
-                .replace('\\', "/");
+                .to_string();
 
             if trimmed_raw.is_empty() || trimmed_raw == "." {
                 for (k, entry) in &source_map {
@@ -818,9 +819,14 @@ impl Coordinator {
         }
 
         let slot_file = self.branches_root().join(format!("{safe_b}.slot"));
+        let slots_lock_path = self.git.common_git_dir().join("tessera").join("slots.lock");
 
-        if slot_file.exists() {
-            let _ = fs::remove_file(&slot_file);
+        {
+            let _slot_lock = acquire_file_lock(&slots_lock_path).ok();
+
+            if slot_file.exists() {
+                let _ = fs::remove_file(&slot_file);
+            }
         }
 
         let pending_file = self.branches_root().join(format!("{safe_b}.pending-merge"));
@@ -963,9 +969,14 @@ impl Coordinator {
 
         let old_slot = self.branches_root().join(format!("{safe_old}.slot"));
         let new_slot = self.branches_root().join(format!("{safe_new}.slot"));
+        let slots_lock_path = self.git.common_git_dir().join("tessera").join("slots.lock");
 
-        if old_slot.is_file() {
-            let _ = fs::rename(&old_slot, &new_slot);
+        {
+            let _slot_lock = acquire_file_lock(&slots_lock_path).ok();
+
+            if old_slot.is_file() {
+                let _ = fs::rename(&old_slot, &new_slot);
+            }
         }
 
         let old_pending = self
@@ -1153,6 +1164,7 @@ impl Coordinator {
             .iter()
             .map(|p| {
                 p.trim()
+                    .replace('\\', "/")
                     .trim_start_matches("./")
                     .trim_end_matches('/')
                     .to_string()
@@ -1163,7 +1175,8 @@ impl Coordinator {
         if !normalized_paths.is_empty() {
             let matches_filter = |rel_path: &str| {
                 normalized_paths.iter().any(|filter| {
-                    rel_path == filter
+                    filter == "."
+                        || rel_path == filter
                         || rel_path
                             .strip_prefix(filter.as_str())
                             .is_some_and(|rest| rest.starts_with('/'))

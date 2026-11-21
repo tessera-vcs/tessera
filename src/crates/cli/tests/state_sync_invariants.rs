@@ -2581,3 +2581,187 @@ fn binary_conflict_symlink_worktree_and_gc_undo_integrity_e2e() {
         "tes undo after tes gc must cleanly restore pre-commit milestone state"
     );
 }
+
+/// Verifies subdirectory-relative `tes restore .` / `tes restore <file>` / `tes stash push <file>`,
+/// `tes push --tags` leaving WIP uncommitted, and MCP `push` failing with `"isError": true`.
+#[test]
+fn subdir_restore_stash_push_tags_and_mcp_push_error_e2e() {
+    let repo = Repo::new(&[
+        ("sub/a.rs", "pub fn a() -> i32 { 1 }\n", false),
+        ("sub/b.rs", "pub fn b() -> i32 { 1 }\n", false),
+        ("other/keep.rs", "pub fn keep() -> i32 { 1 }\n", false),
+        ("root_keep.rs", "pub fn root() -> i32 { 1 }\n", false),
+    ]);
+
+    let tes_bin = Path::new(env!("CARGO_BIN_EXE_tes"));
+    let run_in_subdir = |subdir: &str, session: &str, args: &[&str]| -> Output {
+        let mut cmd = Command::new(tes_bin);
+        cmd.current_dir(repo.path(subdir))
+            .args(args)
+            .env("TES_NO_PAGER", "1");
+
+        for key in ISOLATED_ENV {
+            cmd.env_remove(key);
+        }
+
+        cmd.env("TES_SESSION_ID", session);
+        cmd.output().expect("spawn tes in subdir")
+    };
+
+    // Subdirectory `cd sub && tes restore .` must restore ONLY `sub/`, leaving siblings intact.
+    repo.write("sub/a.rs", "pub fn a() -> i32 { 999 }\n");
+    repo.write("other/keep.rs", "pub fn keep() -> i32 { 222 }\n");
+    repo.write("root_keep.rs", "pub fn root() -> i32 { 333 }\n");
+
+    let restore_dot = run_in_subdir("sub", "term-sub-restore", &["restore", "."]);
+    assert!(
+        restore_dot.status.success(),
+        "cd sub && tes restore . failed: {}",
+        String::from_utf8_lossy(&restore_dot.stderr)
+    );
+    assert_eq!(
+        repo.read("sub/a.rs"),
+        "pub fn a() -> i32 { 1 }\n",
+        "sub/a.rs must be restored by `cd sub && tes restore .`"
+    );
+    assert_eq!(
+        repo.read("other/keep.rs"),
+        "pub fn keep() -> i32 { 222 }\n",
+        "sibling directory other/keep.rs must NEVER be overwritten by `cd sub && tes restore .`"
+    );
+    assert_eq!(
+        repo.read("root_keep.rs"),
+        "pub fn root() -> i32 { 333 }\n",
+        "root_keep.rs outside sub/ must NEVER be overwritten by `cd sub && tes restore .`"
+    );
+
+    // Subdirectory `cd sub && tes restore b.rs` resolves relative to `sub/`.
+    repo.write("sub/b.rs", "pub fn b() -> i32 { 888 }\n");
+    let restore_b = run_in_subdir("sub", "term-sub-restore", &["restore", "b.rs"]);
+    assert!(
+        restore_b.status.success(),
+        "cd sub && tes restore b.rs failed: {}",
+        String::from_utf8_lossy(&restore_b.stderr)
+    );
+    assert_eq!(repo.read("sub/b.rs"), "pub fn b() -> i32 { 1 }\n");
+    assert_eq!(repo.read("other/keep.rs"), "pub fn keep() -> i32 { 222 }\n");
+
+    // Subdirectory `cd sub && tes stash push a.rs` stashes ONLY `sub/a.rs`.
+    repo.write("sub/a.rs", "pub fn a() -> i32 { 444 }\n");
+    let stash_out = run_in_subdir("sub", "term-sub-stash", &["stash", "push", "a.rs"]);
+    assert!(
+        stash_out.status.success(),
+        "cd sub && tes stash push a.rs failed: {}",
+        String::from_utf8_lossy(&stash_out.stderr)
+    );
+    assert_eq!(
+        repo.read("sub/a.rs"),
+        "pub fn a() -> i32 { 1 }\n",
+        "sub/a.rs must be stashed and restored to baseline"
+    );
+    assert_eq!(
+        repo.read("other/keep.rs"),
+        "pub fn keep() -> i32 { 222 }\n",
+        "other/keep.rs must NOT be stashed when running `cd sub && tes stash push a.rs`"
+    );
+
+    let stash_list_raw = repo.tes("term-sub-stash", &["stash", "list", "--json"]);
+    let stash_list: serde_json::Value =
+        serde_json::from_str(&stash_list_raw).expect("parse stash list json");
+    let first_stash = &stash_list[0];
+    assert!(
+        first_stash["own_blobs"].get("sub/a.rs").is_some(),
+        "stash entry must record sub/a.rs: {first_stash}"
+    );
+    assert!(
+        first_stash["own_blobs"].get("other/keep.rs").is_none(),
+        "stash entry must not include unrelated sibling other/keep.rs: {first_stash}"
+    );
+
+    repo.tes("term-sub-stash", &["stash", "drop", "0"]);
+    repo.tes(
+        "term-sub-restore",
+        &["restore", "other/keep.rs", "root_keep.rs"],
+    );
+
+    // `tes push --tags` must push tags without silently auto-committing WIP edits.
+    let remote_tmp = tempfile::tempdir().expect("remote tempdir");
+    let bare_init = Command::new("git")
+        .current_dir(remote_tmp.path())
+        .args(["init", "--bare"])
+        .output()
+        .expect("git init --bare");
+    assert!(bare_init.status.success());
+
+    repo.git(&[
+        "remote",
+        "add",
+        "origin",
+        remote_tmp.path().to_str().expect("remote path"),
+    ]);
+    repo.git(&["push", "-u", "origin", "HEAD"]);
+    repo.git(&["tag", "v0.1.0"]);
+
+    let head_before = repo.git(&["rev-parse", "HEAD"]).trim().to_string();
+    repo.write("root_keep.rs", "pub fn root() -> i32 { 777 }\n");
+    repo.hook("term-tags", "root_keep.rs");
+
+    repo.tes("term-tags", &["push", "--tags"]);
+
+    let head_after = repo.git(&["rev-parse", "HEAD"]).trim().to_string();
+    assert_eq!(
+        head_after, head_before,
+        "tes push --tags must NOT silently auto-commit WIP edits"
+    );
+    assert_eq!(
+        repo.read("root_keep.rs"),
+        "pub fn root() -> i32 { 777 }\n",
+        "WIP edit must remain uncommitted after tes push --tags"
+    );
+
+    let remote_tag = Command::new("git")
+        .arg("--git-dir")
+        .arg(remote_tmp.path())
+        .args(["rev-parse", "refs/tags/v0.1.0"])
+        .output()
+        .expect("check remote tag");
+    assert!(
+        remote_tag.status.success(),
+        "tes push --tags must push tag v0.1.0 to origin"
+    );
+
+    // MCP `push` failure must return `"isError": true`.
+    let current_branch = repo.git(&["rev-parse", "--abbrev-ref", "HEAD"]);
+    let current_branch = current_branch.trim();
+    let mcp_req = format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{{\"name\":\"push\",\"arguments\":{{\"remote\":\"nonexistent-remote-xyz\",\"branch\":\"{current_branch}\",\"no_auto_commit\":true}}}}}}\n"
+    );
+    let mut mcp_cmd = Command::new(tes_bin);
+    mcp_cmd
+        .current_dir(&repo.root)
+        .args(["mcp"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped());
+
+    for key in ISOLATED_ENV {
+        mcp_cmd.env_remove(key);
+    }
+
+    let mut mcp_child = mcp_cmd.spawn().expect("spawn tes mcp");
+
+    {
+        use std::io::Write;
+        let stdin = mcp_child.stdin.as_mut().expect("mcp stdin");
+        stdin.write_all(mcp_req.as_bytes()).expect("write mcp req");
+    }
+
+    let mcp_out = mcp_child.wait_with_output().expect("wait mcp");
+    let mcp_stdout = String::from_utf8_lossy(&mcp_out.stdout);
+    let resp: serde_json::Value = serde_json::from_str(mcp_stdout.trim())
+        .unwrap_or_else(|e| panic!("invalid MCP JSON response ({e}): {mcp_stdout}"));
+    assert_eq!(
+        resp["result"]["isError"],
+        serde_json::json!(true),
+        "failed MCP push must return isError: true, got: {resp}"
+    );
+}

@@ -18,7 +18,7 @@ use serde_json::{Value, json};
 use crate::args::{AgentCommands, CompleteArgs, ConfigCommands, HookCommands, StashCommands};
 use crate::output::{
     CliContext, c_bold, c_cyan, c_dim, c_green, c_red, c_yellow, emit_paged_output,
-    format_session_link,
+    format_session_link, is_existing_user_path, resolve_user_pathspecs,
 };
 
 /// Parses a stash reference (`0` or `stash@{0}`) into its zero-based stack index.
@@ -55,7 +55,7 @@ fn format_conflict_kind(kind: ConflictKind) -> &'static str {
 }
 
 /// Truncates a multiline conflict snippet to at most `max_lines` lines for clean terminal display.
-fn snippet_preview(raw: &str, max_lines: usize) -> Vec<String> {
+pub(crate) fn snippet_preview(raw: &str, max_lines: usize) -> Vec<String> {
     let trimmed = raw.trim();
 
     if trimmed.is_empty() {
@@ -66,8 +66,9 @@ fn snippet_preview(raw: &str, max_lines: usize) -> Vec<String> {
         .lines()
         .take(max_lines)
         .map(|l| {
-            if l.len() > 120 {
-                format!("{}...", &l[..117])
+            if l.chars().count() > 120 {
+                let prefix: String = l.chars().take(117).collect();
+                format!("{prefix}...")
             } else {
                 l.to_string()
             }
@@ -409,9 +410,15 @@ pub fn run_stash(
             let mut eff_msg = sub_msg.or(message);
             let eff_br = sub_br.or(branch);
             let mut eff_paths = paths;
+            let repo_root = coord.git().repo_root();
 
             if eff_msg.is_none() && eff_paths.len() == 1 {
                 let candidate = &eff_paths[0];
+                let resolved_candidate =
+                    resolve_user_pathspecs(&ctx.cwd, repo_root, std::slice::from_ref(candidate))
+                        .into_iter()
+                        .next()
+                        .unwrap_or_else(|| candidate.clone());
                 let cfg = coord.oplog().load_config()?;
                 let current = coord.oplog().load_current_reconciled()?;
                 let default_branch = coord
@@ -430,10 +437,11 @@ pub fn run_stash(
                     })
                     .unwrap_or(default_branch.clone());
                 let branch_ws = if target_branch == default_branch {
-                    coord.git().repo_root().to_path_buf()
+                    repo_root.to_path_buf()
                 } else {
                     coord.branch_sandbox_dir(&target_branch)
                 };
+                let resolved_prefix = format!("{resolved_candidate}/");
                 let base_has_path = coord
                     .git()
                     .resolve_ref(&format!("refs/heads/{target_branch}"))
@@ -441,14 +449,18 @@ pub fn run_stash(
                     .flatten()
                     .and_then(|cid| coord.git().read_commit(&cid).ok())
                     .and_then(|c| coord.git().read_tree_to_map(&c.tree_id).ok())
-                    .is_some_and(|m| m.contains_key(candidate));
-                let meta_owns = current
-                    .view
-                    .agents
-                    .get(&session_id)
-                    .is_some_and(|m| m.owns_path(candidate));
+                    .is_some_and(|m| {
+                        m.contains_key(&resolved_candidate)
+                            || m.contains_key(candidate)
+                            || m.keys().any(|k| k.starts_with(&resolved_prefix))
+                    });
+                let meta_owns =
+                    current.view.agents.get(&session_id).is_some_and(|m| {
+                        m.owns_path(&resolved_candidate) || m.owns_path(candidate)
+                    });
 
-                let is_known_path = coord.git().repo_root().join(candidate).exists()
+                let is_known_path = is_existing_user_path(&ctx.cwd, repo_root, candidate)
+                    || branch_ws.join(&resolved_candidate).exists()
                     || branch_ws.join(candidate).exists()
                     || meta_owns
                     || base_has_path;
@@ -458,11 +470,12 @@ pub fn run_stash(
                 }
             }
 
+            let resolved_paths = resolve_user_pathspecs(&ctx.cwd, repo_root, &eff_paths);
             let entry = coord.stash_push_with_paths(
                 &session_id,
                 eff_msg.as_deref(),
                 eff_br.as_deref(),
-                &eff_paths,
+                &resolved_paths,
             )?;
 
             if ctx.json {
@@ -773,13 +786,35 @@ pub fn run_resolve(
         ),
     };
 
-    let blob_id = coord.resolve_conflict(&path, strat)?;
+    let candidate_path = resolve_user_pathspecs(
+        &ctx.cwd,
+        coord.git().repo_root(),
+        std::slice::from_ref(&path),
+    )
+    .into_iter()
+    .next()
+    .unwrap_or_else(|| path.clone());
+    let target_path = if candidate_path != path
+        && coord
+            .oplog()
+            .load_current_reconciled()
+            .ok()
+            .is_some_and(|op| {
+                !op.view.conflicts.contains_key(&candidate_path)
+                    && op.view.conflicts.contains_key(&path)
+            }) {
+        path
+    } else {
+        candidate_path
+    };
+
+    let blob_id = coord.resolve_conflict(&target_path, strat)?;
 
     if ctx.json {
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
-                "resolved_path": path,
+                "resolved_path": target_path,
                 "blob_id": blob_id,
             }))?
         );
@@ -787,7 +822,7 @@ pub fn run_resolve(
         println!(
             "{} Resolved conflict at {} (blob {})",
             c_green("✓"),
-            c_bold(&path),
+            c_bold(&target_path),
             c_yellow(blob_id.short())
         );
     }
@@ -854,19 +889,26 @@ pub fn run_restore(
         })
         .unwrap_or(default_branch);
 
+    let repo_root = coord.git().repo_root();
     let (resolved_source, resolved_paths): (Option<String>, Vec<String>) = if let Some(src) = source
     {
-        let paths = if targets.is_empty() {
+        let raw_paths = if targets.is_empty() {
             vec![".".to_string()]
         } else {
             targets
         };
-        (Some(src), paths)
+        (
+            Some(src),
+            resolve_user_pathspecs(&ctx.cwd, repo_root, &raw_paths),
+        )
     } else if targets.is_empty() {
-        (None, vec![".".to_string()])
+        (
+            None,
+            resolve_user_pathspecs(&ctx.cwd, repo_root, &[".".to_string()]),
+        )
     } else if targets.len() == 1 {
         let arg0 = &targets[0];
-        let path_on_disk = coord.git().repo_root().join(arg0).exists();
+        let path_on_disk = is_existing_user_path(&ctx.cwd, repo_root, arg0);
         let is_rev = coord
             .resolve_checkpoint_or_revision(arg0, &eff_branch)
             .ok()
@@ -875,16 +917,15 @@ pub fn run_restore(
 
         if is_rev && !path_on_disk {
             (Some(arg0.clone()), Vec::new())
-        } else if path_on_disk {
-            (None, vec![arg0.clone()])
-        } else if is_rev {
-            (Some(arg0.clone()), Vec::new())
         } else {
-            (None, vec![arg0.clone()])
+            (
+                None,
+                resolve_user_pathspecs(&ctx.cwd, repo_root, std::slice::from_ref(arg0)),
+            )
         }
     } else {
         let arg0 = &targets[0];
-        let path_on_disk = coord.git().repo_root().join(arg0).exists();
+        let path_on_disk = is_existing_user_path(&ctx.cwd, repo_root, arg0);
         let is_rev = coord
             .resolve_checkpoint_or_revision(arg0, &eff_branch)
             .ok()
@@ -892,9 +933,12 @@ pub fn run_restore(
             .is_some();
 
         if is_rev && !path_on_disk {
-            (Some(arg0.clone()), targets[1..].to_vec())
+            (
+                Some(arg0.clone()),
+                resolve_user_pathspecs(&ctx.cwd, repo_root, &targets[1..]),
+            )
         } else {
-            (None, targets)
+            (None, resolve_user_pathspecs(&ctx.cwd, repo_root, &targets))
         }
     };
 

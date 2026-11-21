@@ -369,8 +369,14 @@ pub enum Commands {
         /// Keep merged agent sessions open instead of auto-closing them after a clean merge.
         #[arg(long)]
         keep_open: bool,
-        /// Append a `Co-authored-by` trailer (defaults to configured `co_author_trailer` when passed without a value).
-        #[arg(long, value_name = "NAME <EMAIL>", num_args = 0..=1, default_missing_value = "")]
+        /// Append a `Co-authored-by` trailer (defaults to configured `co_author_trailer` when passed without a value; pass `--co-author="Name <email>"` for a custom trailer).
+        #[arg(
+            long,
+            value_name = "NAME <EMAIL>",
+            num_args = 0..=1,
+            default_missing_value = "",
+            require_equals = true
+        )]
         co_author: Vec<String>,
         /// Suppress `Co-authored-by` trailers even if `co_author = true` in repository config.
         #[arg(long, conflicts_with = "co_author")]

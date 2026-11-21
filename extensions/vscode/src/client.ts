@@ -669,8 +669,9 @@ export class CliClient {
   }
 
   /**
-   * Builds a process environment with standard user binary locations prepended to `PATH`
-   * while preserving Windows `Path`/`PATH` case-insensitivity and avoiding Unix directories on Windows.
+   * Builds a process environment with `TES_FROM_IDE_EXTENSION=1` and standard user binary locations
+   * prepended to `PATH` while preserving Windows `Path`/`PATH` case-insensitivity and avoiding Unix
+   * directories on Windows.
    *
    * @param envOverrides Optional environment variables to merge into the child process environment.
    * @returns The constructed process environment object.
@@ -678,7 +679,10 @@ export class CliClient {
   private buildEnv(
     envOverrides?: Readonly<Record<string, string>>
   ): NodeJS.ProcessEnv {
-    const env: NodeJS.ProcessEnv = { ...process.env };
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      TES_FROM_IDE_EXTENSION: "1",
+    };
 
     if (process.platform === "win32") {
       const extraDirs = [
@@ -954,10 +958,7 @@ export class CliClient {
       throw new Error(`Invalid session identifier '${sessionId}'`);
     }
 
-    return this.runJson<FocusSessionReport>(
-      ["session", "focus", "--", trimmed],
-      { TES_FROM_IDE_EXTENSION: "1" }
-    );
+    return this.runJson<FocusSessionReport>(["session", "focus", "--", trimmed]);
   }
 
   /**
@@ -1227,7 +1228,7 @@ export class CliClient {
   }
 
   /**
-   * Discards uncommitted working changes on `branch` by restoring it to its `HEAD` commit.
+   * Discards uncommitted working changes on `branch` by restoring it to its latest commit (`refs/heads/<branch>`).
    *
    * Error conditions: Throws `Error` if `branch` is not a valid Git ref name.
    *
@@ -1240,7 +1241,7 @@ export class CliClient {
       throw new Error(`Invalid branch name '${branch}'`);
     }
 
-    await this.runRaw(["restore", "-b", trimmed, "--", "HEAD"]);
+    await this.runRaw(["restore", "-b", trimmed, "."]);
   }
 
   /**

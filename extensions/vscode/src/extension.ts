@@ -1020,10 +1020,11 @@ export function activate(context: vscode.ExtensionContext): void {
 
         const snap = latestSnapshot ?? (await activeClient.fetchSnapshot());
         const trunkBranch = snap.branchReport.trunk_branch || "main";
+        const editorBranch = snap.branchReport.editor_branch || trunkBranch;
         const targetBranch =
           typeof branch === "string" && branch.trim().length > 0
             ? branch.trim()
-            : snap.branchReport.editor_branch;
+            : editorBranch;
 
         let targetRelPath =
           typeof relPath === "string" && relPath.trim().length > 0
@@ -1066,9 +1067,27 @@ export function activate(context: vscode.ExtensionContext): void {
 
         const [cleanPath, absPath] = confined;
 
-        if (targetBranch === trunkBranch) {
+        if (targetBranch === editorBranch) {
           const leftUri = BranchContentProvider.buildUri("HEAD", cleanPath);
           const rightUri = vscode.Uri.file(absPath);
+          await vscode.commands.executeCommand(
+            "vscode.diff",
+            leftUri,
+            rightUri,
+            `${cleanPath} (${editorBranch} HEAD <-> Working Tree)`
+          );
+          return;
+        }
+
+        if (targetBranch === trunkBranch) {
+          const leftUri = BranchContentProvider.buildUri(
+            `refs/heads/${trunkBranch}`,
+            cleanPath
+          );
+          const rightUri = BranchContentProvider.buildUri(
+            targetBranch,
+            cleanPath
+          );
           await vscode.commands.executeCommand(
             "vscode.diff",
             leftUri,

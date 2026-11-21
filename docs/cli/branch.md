@@ -12,7 +12,10 @@ Alias: `tes branches`
 
 ## Options
 
-- `-l, --list` - List branches.
+- `-l, --list` - List branches (optionally filtered by a glob pattern).
+- `--show-current` - Print only the current active branch name.
+- `-r, --remotes` - List remote-tracking branches.
+- `-a, --all` - List both local and remote-tracking branches.
 - `-v, --verbose` - Show the tip commit SHA and subject line for each branch in list mode.
 - `-d, --delete` - Safely delete `<branch>` and its Copy-on-Write sandbox (refuses if unmerged or dirty).
 - `-D, --force-delete` - Force-delete `<branch>` and its Copy-on-Write sandbox even if unmerged or dirty.
@@ -29,6 +32,13 @@ When run with no arguments (or with `-l` / `-v`), `tes branch` lists all local G
 ```bash:no-line-numbers
 # list all branches
 tes branch
+
+# print only the current active branch name
+tes branch --show-current
+
+# list remote-tracking branches or both local and remote branches
+tes branch -r
+tes branch -a
 
 # list branches with short commit SHAs and commit subjects
 tes branch -v

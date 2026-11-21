@@ -15,7 +15,9 @@ use core::{
 };
 use walkdir::WalkDir;
 
-use crate::snapshot::{ALWAYS_IGNORED_DIRS, IgnoreMatcher, is_vcs_internal_segment};
+use crate::snapshot::{
+    ALWAYS_IGNORED_DIRS, IgnoreMatcher, is_vcs_internal_segment, join_rel_segments,
+};
 
 /// Maximum symlink resolution depth permitted when verifying confinement inside a workspace root.
 #[cfg(unix)]
@@ -743,13 +745,19 @@ pub fn create_cow_workspace(
             cloned_entries += 1;
         } else {
             for scope in scopes {
-                let normalized = scope.trim_matches('/');
+                let normalized = normalize_scope_prefix(scope);
+
+                if normalized.is_empty() {
+                    continue;
+                }
 
                 if normalized == name_str || normalized.starts_with(&format!("{name_str}/")) {
-                    let Ok((_, sub_src)) = resolve_confined_repo_path(repo_root, normalized) else {
+                    let Ok((clean_rel, sub_src)) =
+                        resolve_confined_repo_path(repo_root, &normalized)
+                    else {
                         continue;
                     };
-                    let sub_dst = workspace_dir.join(normalized);
+                    let sub_dst = join_rel_segments(workspace_dir, &clean_rel);
 
                     if sub_src.exists() && !sub_dst.exists() {
                         clone_path_cow_within(&sub_src, &sub_dst, workspace_dir)?;
@@ -780,31 +788,69 @@ pub fn create_cow_workspace(
     Ok(cloned_entries)
 }
 
+/// Normalizes a workspace scope prefix by converting backslashes to forward slashes and stripping
+/// leading `./` or `/` and trailing `/` segments.
+fn normalize_scope_prefix(scope: &str) -> String {
+    let unified = scope.replace('\\', "/");
+    let mut trimmed = unified.as_str();
+
+    loop {
+        if let Some(rest) = trimmed.strip_prefix("./") {
+            trimmed = rest;
+        } else if let Some(rest) = trimmed.strip_prefix('/') {
+            trimmed = rest;
+        } else {
+            break;
+        }
+    }
+
+    trimmed.trim_end_matches('/').to_string()
+}
+
+/// Converts `path` to a UTF-8 lossy string while stripping any Windows verbatim path prefix
+/// (`\\?\UNC\server\share` -> `\\server\share`, `\\?\C:\...` -> `C:\...`) and trailing
+/// directory separators so sanitized shebangs and `VIRTUAL_ENV=` assignments stay portable.
+fn strip_windows_verbatim_prefix(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    let stripped = if let Some(unc) = raw.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc}")
+    } else if let Some(rest) = raw.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        raw.into_owned()
+    };
+
+    stripped.trim_end_matches(['/', '\\']).to_string()
+}
+
 /// Collects both the raw and canonicalized string representations of `parent_repo_root` so path
-/// matching handles OS symlinked temp roots (such as `/var` vs `/private/var` on macOS).
+/// matching handles OS symlinked temp roots (such as `/var` vs `/private/var` on macOS) and
+/// Windows `\\?\` verbatim prefixes.
 fn collect_parent_prefixes(parent_repo_root: &Path) -> Vec<String> {
     let mut prefixes = Vec::new();
+    let mut push_unique = |candidate: String| {
+        if !candidate.is_empty() && !prefixes.contains(&candidate) {
+            prefixes.push(candidate);
+        }
+    };
+
     let raw = parent_repo_root
         .to_string_lossy()
         .trim_end_matches(['/', '\\'])
         .to_string();
-
-    if !raw.is_empty() {
-        prefixes.push(raw);
-    }
+    push_unique(raw);
+    push_unique(strip_windows_verbatim_prefix(parent_repo_root));
 
     if let Ok(canon) = parent_repo_root.canonicalize() {
         let canon_str = canon
             .to_string_lossy()
             .trim_end_matches(['/', '\\'])
             .to_string();
-
-        if !canon_str.is_empty() && !prefixes.contains(&canon_str) {
-            prefixes.push(canon_str);
-        }
+        push_unique(canon_str);
+        push_unique(strip_windows_verbatim_prefix(&canon));
     }
 
-    // Match longer canonical prefixes (e.g. `/private/var/...`) before shorter aliases (`/var/...`).
+    // Match longer canonical prefixes (e.g. `/private/var/...` or `\\?\C:\...`) before shorter aliases.
     prefixes.sort_by_key(|p| std::cmp::Reverse(p.len()));
     prefixes
 }
@@ -834,69 +880,73 @@ fn replace_any_prefix(text: &str, prefixes: &[String], replacement: &str) -> Str
 }
 
 /// Rewrites `#!` shebangs and `VIRTUAL_ENV=` assignments inside a cloned Python virtualenv's `bin`
-/// directory that still reference `parent_prefixes` so scripts invoke the sandbox interpreter.
+/// (Unix) and `Scripts` (Windows) directories that still reference `parent_prefixes` so scripts
+/// invoke the sandbox interpreter.
 fn sanitize_python_venv(
     venv_dir: &Path,
     parent_prefixes: &[String],
     workspace_replacement: &str,
 ) -> usize {
-    let bin_dir = venv_dir.join("bin");
-
-    if !bin_dir.is_dir() {
-        return 0;
-    }
-
-    let Ok(entries) = fs::read_dir(&bin_dir) else {
-        return 0;
-    };
-
     let mut rewritten = 0usize;
 
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Ok(meta) = fs::symlink_metadata(&path) else {
-            continue;
-        };
+    for sub in ["bin", "Scripts"] {
+        let scripts_dir = venv_dir.join(sub);
 
-        if !meta.is_file() || meta.file_type().is_symlink() || meta.len() > 2 * 1024 * 1024 {
+        if !scripts_dir.is_dir() {
             continue;
         }
 
-        let file_name = entry.file_name();
-        let name_str = file_name.to_string_lossy();
-        let Ok(bytes) = fs::read(&path) else {
+        let Ok(entries) = fs::read_dir(&scripts_dir) else {
             continue;
         };
 
-        if bytes.starts_with(b"#!") {
-            let line_end = bytes
-                .iter()
-                .position(|&b| b == b'\n')
-                .unwrap_or(bytes.len());
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(meta) = fs::symlink_metadata(&path) else {
+                continue;
+            };
 
-            if let Ok(shebang) = std::str::from_utf8(&bytes[..line_end]) {
-                if contains_any_prefix(shebang, parent_prefixes) {
-                    let updated_shebang =
-                        replace_any_prefix(shebang, parent_prefixes, workspace_replacement);
+            if !meta.is_file() || meta.file_type().is_symlink() || meta.len() > 2 * 1024 * 1024 {
+                continue;
+            }
 
-                    let mut new_bytes = Vec::with_capacity(
-                        updated_shebang.len() + bytes.len().saturating_sub(line_end),
-                    );
-                    new_bytes.extend_from_slice(updated_shebang.as_bytes());
-                    new_bytes.extend_from_slice(&bytes[line_end..]);
+            let file_name = entry.file_name();
+            let name_str = file_name.to_string_lossy();
+            let Ok(bytes) = fs::read(&path) else {
+                continue;
+            };
 
-                    if write_working_tree_file_safe(&path, &new_bytes).is_ok() {
-                        rewritten += 1;
+            if bytes.starts_with(b"#!") {
+                let line_end = bytes
+                    .iter()
+                    .position(|&b| b == b'\n')
+                    .unwrap_or(bytes.len());
+
+                if let Ok(shebang) = std::str::from_utf8(&bytes[..line_end]) {
+                    if contains_any_prefix(shebang, parent_prefixes) {
+                        let updated_shebang =
+                            replace_any_prefix(shebang, parent_prefixes, workspace_replacement);
+
+                        let mut new_bytes = Vec::with_capacity(
+                            updated_shebang.len() + bytes.len().saturating_sub(line_end),
+                        );
+                        new_bytes.extend_from_slice(updated_shebang.as_bytes());
+                        new_bytes.extend_from_slice(&bytes[line_end..]);
+
+                        if write_working_tree_file_safe(&path, &new_bytes).is_ok() {
+                            rewritten += 1;
+                        }
                     }
                 }
-            }
-        } else if name_str.starts_with("activate") {
-            if let Ok(text) = std::str::from_utf8(&bytes) {
-                if contains_any_prefix(text, parent_prefixes) {
-                    let updated = replace_any_prefix(text, parent_prefixes, workspace_replacement);
+            } else if name_str.to_ascii_lowercase().starts_with("activate") {
+                if let Ok(text) = std::str::from_utf8(&bytes) {
+                    if contains_any_prefix(text, parent_prefixes) {
+                        let updated =
+                            replace_any_prefix(text, parent_prefixes, workspace_replacement);
 
-                    if write_working_tree_file_safe(&path, updated.as_bytes()).is_ok() {
-                        rewritten += 1;
+                        if write_working_tree_file_safe(&path, updated.as_bytes()).is_ok() {
+                            rewritten += 1;
+                        }
                     }
                 }
             }
@@ -912,7 +962,8 @@ fn sanitize_python_venv(
 ///
 /// Removes path-poisoned `.d` dependency-info stamps, Cargo `target/*/build/*/output` and
 /// `root-output` scripts, and stale `CMakeCache.txt` files while preserving compiled `.rlib`/`.rmeta`
-/// artifacts, and rewrites Python `.venv/bin/*` shebangs to point at `workspace_dir`.
+/// artifacts, and rewrites Python `.venv/bin/*` and `.venv/Scripts/*` shebangs and activation
+/// scripts to point at `workspace_dir`.
 ///
 /// # Errors
 /// Returns [`CoreError::Io`] on directory walk errors.
@@ -926,10 +977,7 @@ pub fn sanitize_build_cache(workspace_dir: &Path, parent_repo_root: &Path) -> Co
     let workspace_canon = workspace_dir
         .canonicalize()
         .unwrap_or_else(|_| workspace_dir.to_path_buf());
-    let workspace_replacement = workspace_canon
-        .to_string_lossy()
-        .trim_end_matches(['/', '\\'])
-        .to_string();
+    let workspace_replacement = strip_windows_verbatim_prefix(&workspace_canon);
 
     let mut sanitized_count = 0usize;
     let mut build_cache_dirs: Vec<(PathBuf, bool)> = Vec::new();
@@ -1233,10 +1281,11 @@ pub fn materialize_tree_to_dir_with_baseline(
             }
         }
     } else {
-        let extra_preserved = core::OpLogStore::new(git.common_git_dir())
-            .load_config()
-            .map(|c| c.cow_cache_dirs)
-            .unwrap_or_default();
+        let extra_preserved =
+            core::OpLogStore::new_with_repo_root(git.common_git_dir(), git.repo_root())
+                .load_config()
+                .map(|c| c.cow_cache_dirs)
+                .unwrap_or_default();
 
         let global_excludes = git.global_excludes_file();
         let mut init_matcher =
@@ -1633,8 +1682,9 @@ mod tests {
 
         let rewritten = fs::read_to_string(venv_bin.join("pytest")).expect("read pytest");
         let ws_canon = ws_dir.path().canonicalize().expect("canon ws");
+        let ws_clean = strip_windows_verbatim_prefix(&ws_canon);
         assert!(
-            rewritten.starts_with(&format!("#!{}/.venv/bin/python3\n", ws_canon.display())),
+            rewritten.starts_with(&format!("#!{ws_clean}/.venv/bin/python3\n")),
             "unexpected shebang: {rewritten}"
         );
     }
@@ -1879,5 +1929,121 @@ mod tests {
                 .is_file(),
             "existing branch node_modules must not be wiped when .bin is absent"
         );
+    }
+
+    #[test]
+    fn strip_windows_verbatim_prefix_handles_drive_unc_and_posix_paths() {
+        assert_eq!(
+            strip_windows_verbatim_prefix(Path::new(r"\\?\C:\Users\dev\repo")),
+            r"C:\Users\dev\repo"
+        );
+        assert_eq!(
+            strip_windows_verbatim_prefix(Path::new(r"\\?\C:\Users\dev\repo\")),
+            r"C:\Users\dev\repo"
+        );
+        assert_eq!(
+            strip_windows_verbatim_prefix(Path::new(r"\\?\UNC\server\share\repo")),
+            r"\\server\share\repo"
+        );
+        assert_eq!(
+            strip_windows_verbatim_prefix(Path::new(r"\\?\UNC\server\share\repo\")),
+            r"\\server\share\repo"
+        );
+        assert_eq!(
+            strip_windows_verbatim_prefix(Path::new("/Users/dev/repo/")),
+            "/Users/dev/repo"
+        );
+    }
+
+    #[test]
+    fn create_cow_workspace_normalizes_dot_slash_and_backslash_scopes() {
+        let src_dir = tempfile::tempdir().expect("src tempdir");
+        let dst_parent = tempfile::tempdir().expect("dst tempdir");
+        let dst_dir = dst_parent.path().join("scoped-ws");
+
+        fs::create_dir_all(src_dir.path().join("packages/api")).expect("mkdir api");
+        fs::create_dir_all(src_dir.path().join("packages/web")).expect("mkdir web");
+        fs::create_dir_all(src_dir.path().join("packages/other")).expect("mkdir other");
+        fs::write(src_dir.path().join("Cargo.toml"), "[workspace]\n").expect("write root");
+        fs::write(
+            src_dir.path().join("packages/api/lib.rs"),
+            "pub fn api() {}\n",
+        )
+        .expect("write api");
+        fs::write(
+            src_dir.path().join("packages/web/index.ts"),
+            "export const ok = true;\n",
+        )
+        .expect("write web");
+        fs::write(
+            src_dir.path().join("packages/other/skip.rs"),
+            "pub fn skip() {}\n",
+        )
+        .expect("write other");
+
+        let scopes = vec!["./packages/api".to_string(), r"packages\web\".to_string()];
+        create_cow_workspace(src_dir.path(), &dst_dir, &scopes, &[]).expect("create scoped ws");
+
+        assert!(dst_dir.join("Cargo.toml").is_file());
+        assert!(
+            dst_dir
+                .join("packages")
+                .join("api")
+                .join("lib.rs")
+                .is_file()
+        );
+        assert!(
+            dst_dir
+                .join("packages")
+                .join("web")
+                .join("index.ts")
+                .is_file()
+        );
+        assert!(!dst_dir.join("packages").join("other").exists());
+    }
+
+    #[test]
+    fn sanitize_build_cache_rewrites_windows_venv_scripts_directory() {
+        let src_dir = tempfile::tempdir().expect("src tempdir");
+        let ws_dir = tempfile::tempdir().expect("ws tempdir");
+        let src_prefix =
+            strip_windows_verbatim_prefix(&src_dir.path().canonicalize().expect("canon src"));
+        let ws_prefix =
+            strip_windows_verbatim_prefix(&ws_dir.path().canonicalize().expect("canon ws"));
+
+        let venv_scripts = ws_dir.path().join(".venv").join("Scripts");
+        fs::create_dir_all(&venv_scripts).expect("mkdir Scripts");
+        fs::write(
+            venv_scripts.join("pytest"),
+            format!("#!{src_prefix}/.venv/Scripts/python.exe\nprint('ok')\n"),
+        )
+        .expect("write pytest");
+        fs::write(
+            venv_scripts.join("activate.bat"),
+            format!("set \"VIRTUAL_ENV={src_prefix}/.venv\"\n"),
+        )
+        .expect("write activate.bat");
+        fs::write(
+            venv_scripts.join("Activate.ps1"),
+            format!("$env:VIRTUAL_ENV = \"{src_prefix}/.venv\"\n"),
+        )
+        .expect("write Activate.ps1");
+
+        let count = sanitize_build_cache(ws_dir.path(), src_dir.path()).expect("sanitize");
+        assert!(count >= 3, "expected >= 3 sanitized files, got {count}");
+
+        let pytest = fs::read_to_string(venv_scripts.join("pytest")).expect("read pytest");
+        assert!(pytest.starts_with(&format!("#!{ws_prefix}/.venv/Scripts/python.exe\n")));
+        assert!(!pytest.contains(r"\\?\"));
+
+        let activate_bat =
+            fs::read_to_string(venv_scripts.join("activate.bat")).expect("read activate.bat");
+        assert!(activate_bat.contains(&ws_prefix));
+        assert!(!activate_bat.contains(r"\\?\"));
+
+        let activate_ps1 =
+            fs::read_to_string(venv_scripts.join("Activate.ps1")).expect("read Activate.ps1");
+        assert!(activate_ps1.contains(&ws_prefix));
+        assert!(!activate_ps1.contains(r"\\?\"));
     }
 }

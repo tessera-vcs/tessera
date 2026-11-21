@@ -8,10 +8,11 @@ use std::process::Command;
 use core::{ConflictKind, SessionWaypoint};
 
 use crate::harness::{
-    strip_jsonc, upsert_claude_hooks_json, upsert_mcp_json, upsert_opencode_json,
-    upsert_vscode_mcp_json,
+    strip_jsonc, upsert_claude_hooks_json, upsert_git_hook, upsert_marked_section, upsert_mcp_json,
+    upsert_opencode_json, upsert_vscode_mcp_json,
 };
 use crate::hooks::{is_contaminated_by_foreign_peer, strip_peer_inserted_lines};
+use crate::merge::apply_synced_agent_to_view;
 use crate::session::{
     detect_session_id_with_env, detect_session_waypoint_with_env, is_ide_process_name,
     is_shell_or_cli_harness_process, percent_encode_uri_component,
@@ -2936,4 +2937,331 @@ fn watcher_skips_head_blobs_and_drops_stale_pre_commit_observations() {
         cur.view.conflicts.contains_key("other.txt"),
         "active conflict must remain registered for tes resolve"
     );
+}
+
+#[test]
+fn harness_inverted_markers_never_duplicate_contents() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    let md_path = tmp.path().join("AGENTS.md");
+    let inverted_md = "<!-- tessera:end -->\nunique user heading\n<!-- tessera:start -->\n";
+    fs::write(&md_path, inverted_md).expect("write inverted md");
+    upsert_marked_section(
+        &md_path,
+        "<!-- tessera:start -->\nmanaged block\n<!-- tessera:end -->\n",
+    )
+    .expect("upsert inverted tessera md");
+    let after_md = fs::read_to_string(&md_path).expect("read md");
+    assert_eq!(
+        after_md.matches("unique user heading").count(),
+        1,
+        "inverted tessera markers must not duplicate existing markdown content: {after_md}"
+    );
+    assert_eq!(
+        after_md.matches("managed block").count(),
+        1,
+        "managed block should be appended once: {after_md}"
+    );
+
+    let lunr_path = tmp.path().join("CLAUDE.md");
+    let inverted_lunr = "<!-- lunr:end -->\nkeep legacy note\n<!-- lunr:start -->\n";
+    fs::write(&lunr_path, inverted_lunr).expect("write inverted lunr md");
+    upsert_marked_section(
+        &lunr_path,
+        "<!-- tessera:start -->\nnew block\n<!-- tessera:end -->\n",
+    )
+    .expect("upsert inverted lunr md");
+    let after_lunr = fs::read_to_string(&lunr_path).expect("read lunr md");
+    assert_eq!(
+        after_lunr.matches("keep legacy note").count(),
+        1,
+        "inverted lunr markers must not duplicate existing content: {after_lunr}"
+    );
+
+    let hook_path = tmp.path().join("post-commit");
+    let inverted_hook = "#!/bin/sh\necho keep-hook\n# tessera:end\necho middle\n# tessera:start\n";
+    fs::write(&hook_path, inverted_hook).expect("write inverted hook");
+    upsert_git_hook(&hook_path, "# tessera:start\necho synced\n# tessera:end\n")
+        .expect("upsert inverted git hook");
+    let after_hook = fs::read_to_string(&hook_path).expect("read hook");
+    assert_eq!(
+        after_hook.matches("echo keep-hook").count(),
+        1,
+        "inverted hook markers must not duplicate hook prefix: {after_hook}"
+    );
+    assert_eq!(
+        after_hook.matches("echo middle").count(),
+        1,
+        "inverted hook markers must not duplicate middle content: {after_hook}"
+    );
+    assert_eq!(
+        after_hook.matches("echo synced").count(),
+        1,
+        "hook snippet should be appended once: {after_hook}"
+    );
+}
+
+#[test]
+fn merge_agents_with_options_preserves_concurrent_peer_edits_during_verify() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    fs::write(root.join("a.rs"), "pub fn a() -> i32 { 1 }\n").expect("write a.rs");
+    fs::write(root.join("b1.rs"), "pub fn b1() -> i32 { 1 }\n").expect("write b1.rs");
+    fs::write(root.join("b2.rs"), "pub fn b2() -> i32 { 1 }\n").expect("write b2.rs");
+
+    let (coord, init_report) = Coordinator::init_repo(root).expect("init_repo");
+    let trunk_branch = init_report.trunk_branch;
+
+    coord
+        .claim_intent_and_symbols("agent-a", Some("Update a"), &["a.rs".to_string()])
+        .expect("claim a");
+    coord
+        .claim_intent_and_symbols("agent-b", Some("Update b"), &["b1.rs".to_string()])
+        .expect("claim b");
+
+    fs::write(root.join("a.rs"), "pub fn a() -> i32 { 2 }\n").expect("edit a.rs");
+    handle_post_tool_hook(&coord, "agent-a", "a.rs").expect("post-tool a");
+
+    fs::write(root.join("b1.rs"), "pub fn b1() -> i32 { 10 }\n").expect("edit b1.rs");
+    handle_post_tool_hook(&coord, "agent-b", "b1.rs").expect("post-tool b1");
+
+    let sync_tmp = tempfile::tempdir().expect("sync tempdir");
+    let started_flag = sync_tmp.path().join("verify_started");
+    let done_flag = sync_tmp.path().join("peer_done");
+
+    #[cfg(unix)]
+    let verify_cmd = format!(
+        "touch '{}' && while [ ! -f '{}' ]; do sleep 0.02; done",
+        started_flag.display(),
+        done_flag.display()
+    );
+
+    #[cfg(windows)]
+    let verify_cmd = format!(
+        "type nul > \"{}\" && powershell -NoProfile -NonInteractive -Command \"while (-not (Test-Path -LiteralPath '{}')) {{ Start-Sleep -Milliseconds 20 }}\"",
+        started_flag.display(),
+        done_flag.display()
+    );
+
+    let report = std::thread::scope(|s| {
+        let root_ref = root;
+        let started_ref = &started_flag;
+        let done_ref = &done_flag;
+
+        let peer_handle = s.spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+
+            while !started_ref.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+
+            assert!(
+                started_ref.exists(),
+                "timed out waiting for --verify command to start"
+            );
+
+            let peer_coord = Coordinator::open(root_ref).expect("open peer coord");
+            fs::write(root_ref.join("b2.rs"), "pub fn b2() -> i32 { 77 }\n")
+                .expect("peer edit b2.rs");
+            handle_post_tool_hook(&peer_coord, "agent-b", "b2.rs").expect("peer post-tool b2");
+            peer_coord
+                .claim_intent_and_symbols("agent-b", None, &["b2.rs::b2".to_string()])
+                .expect("peer claim b2");
+            fs::write(done_ref, b"ok").expect("write done flag");
+        });
+
+        let merge_res = coord.merge_agents_with_options(
+            &["agent-a".to_string()],
+            Some(&trunk_branch),
+            Some(&verify_cmd),
+            false,
+            &CommitOptions {
+                message: Some("feat: agent a".to_string()),
+                ..Default::default()
+            },
+        );
+        peer_handle.join().expect("peer thread panicked");
+        merge_res.expect("merge_agents_with_options")
+    });
+
+    assert!(report.verification_passed);
+
+    let cur = coord
+        .oplog()
+        .load_current_reconciled()
+        .expect("load oplog after merge");
+    let agent_b = cur
+        .view
+        .agents
+        .get("agent-b")
+        .expect("agent-b must remain active");
+    assert_eq!(agent_b.base_commit, report.merged_commit_id);
+    assert!(
+        agent_b.own_blobs.contains_key("b1.rs"),
+        "agent-b original edit b1.rs must remain tracked: {:?}",
+        agent_b.own_blobs
+    );
+    assert!(
+        agent_b.own_blobs.contains_key("b2.rs"),
+        "agent-b concurrent edit b2.rs recorded during --verify must not be lost: {:?}",
+        agent_b.own_blobs
+    );
+    assert!(
+        agent_b.claimed_symbols.contains("b2.rs::b2"),
+        "agent-b concurrent symbol claim must not be lost: {:?}",
+        agent_b.claimed_symbols
+    );
+
+    let head_map = coord
+        .git()
+        .read_tree_to_map(&agent_b.head_tree)
+        .expect("read agent-b head_tree");
+    let b2_bytes = coord
+        .git()
+        .read_blob(&head_map.get("b2.rs").expect("b2.rs in head_tree").blob_id)
+        .expect("read b2.rs blob");
+    assert_eq!(
+        String::from_utf8_lossy(&b2_bytes),
+        "pub fn b2() -> i32 { 77 }\n"
+    );
+    let a_bytes = coord
+        .git()
+        .read_blob(&head_map.get("a.rs").expect("a.rs in head_tree").blob_id)
+        .expect("read a.rs blob");
+    assert_eq!(
+        String::from_utf8_lossy(&a_bytes),
+        "pub fn a() -> i32 { 2 }\n"
+    );
+}
+
+#[test]
+fn sync_all_agents_skips_unchanged_and_does_not_clobber_concurrent_edits() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    fs::write(root.join("a.rs"), "pub fn a() -> i32 { 1 }\n").expect("write a.rs");
+    fs::write(root.join("b.rs"), "pub fn b() -> i32 { 1 }\n").expect("write b.rs");
+
+    let (coord, init_report) = Coordinator::init_repo(root).expect("init_repo");
+    let trunk_ref = format!("refs/heads/{}", init_report.trunk_branch);
+
+    coord
+        .claim_intent_and_symbols("agent-stale", Some("Edit b"), &["b.rs".to_string()])
+        .expect("claim stale");
+    fs::write(root.join("b.rs"), "pub fn b() -> i32 { 2 }\n").expect("edit b.rs");
+    handle_post_tool_hook(&coord, "agent-stale", "b.rs").expect("post-tool stale");
+
+    // Advance trunk directly in Git so `agent-stale` falls behind while `agent-fresh`
+    // starts at the new tip.
+    let old_main = coord
+        .git()
+        .resolve_ref(&trunk_ref)
+        .expect("resolve trunk")
+        .expect("trunk cid");
+    let old_tree = coord
+        .git()
+        .read_commit(&old_main)
+        .expect("read trunk")
+        .tree_id;
+    let mut next_map = coord.git().read_tree_to_map(&old_tree).expect("read tree");
+    let new_a_blob = coord
+        .git()
+        .write_blob(b"pub fn a() -> i32 { 99 }\n")
+        .expect("write a blob");
+    next_map.insert(
+        "a.rs".to_string(),
+        core::FileEntry::from_mode(new_a_blob, core::EntryMode::NormalFile),
+    );
+    let next_tree = coord
+        .git()
+        .write_tree_from_map(&next_map)
+        .expect("write next tree");
+    let author = coord.git().resolve_git_author();
+    let new_main = coord
+        .git()
+        .write_commit(
+            &next_tree,
+            &[old_main],
+            &author,
+            "feat: external trunk update",
+        )
+        .expect("write next commit");
+    coord
+        .git()
+        .update_ref(&trunk_ref, &new_main)
+        .expect("update trunk");
+
+    coord
+        .claim_intent_and_symbols("agent-fresh", Some("Fresh agent"), &["a.rs".to_string()])
+        .expect("claim fresh");
+
+    let rebased = coord.sync_all_agents().expect("sync_all_agents");
+    assert!(
+        rebased.iter().any(|a| a.agent_id == "agent-stale"),
+        "stale agent must be rebased: {rebased:?}"
+    );
+    assert!(
+        !rebased.iter().any(|a| a.agent_id == "agent-fresh"),
+        "unchanged agent already at target_cid must not be pushed into rebased_agents: {rebased:?}"
+    );
+
+    // Verify concurrent view mutations inside `apply_synced_agent_to_view` are never clobbered.
+    let cur = coord.oplog().load_current_reconciled().expect("load oplog");
+    let before = cur
+        .view
+        .agents
+        .get("agent-stale")
+        .expect("agent-stale")
+        .clone();
+    let mut rebased_candidate = before.clone();
+    rebased_candidate.base_commit = old_main;
+    rebased_candidate.head_commit = old_main;
+    rebased_candidate.head_tree = old_tree;
+    rebased_candidate.read_blobs.clear();
+
+    // A concurrently closed agent must not be resurrected.
+    let mut closed_view = cur.view.clone();
+    closed_view.agents.remove("agent-stale");
+    assert!(
+        apply_synced_agent_to_view(&mut closed_view, &rebased_candidate, Some(&before)).is_none()
+    );
+    assert!(!closed_view.agents.contains_key("agent-stale"));
+
+    // An agent that recorded new `own_blobs` or switched branches concurrently must be skipped.
+    let mut concurrent_edit_view = cur.view.clone();
+    let live_edit = concurrent_edit_view
+        .agents
+        .get_mut("agent-stale")
+        .expect("live edit");
+    live_edit.own_blobs.insert("c.rs".to_string(), new_a_blob);
+    assert!(
+        apply_synced_agent_to_view(&mut concurrent_edit_view, &rebased_candidate, Some(&before))
+            .is_none()
+    );
+    assert!(
+        concurrent_edit_view.agents["agent-stale"]
+            .own_blobs
+            .contains_key("c.rs"),
+        "concurrent own_blobs edit must not be clobbered"
+    );
+
+    // Concurrent metadata-only updates (`claimed_symbols`, `intent`, new `read_blobs`)
+    // are preserved while the rebase commits/trees are applied.
+    let mut metadata_view = cur.view.clone();
+    let live_meta = metadata_view
+        .agents
+        .get_mut("agent-stale")
+        .expect("live meta");
+    live_meta
+        .claimed_symbols
+        .insert("b.rs::concurrent_sym".to_string());
+    live_meta.intent = "Refined concurrent intent".to_string();
+    live_meta
+        .read_blobs
+        .insert("extra.rs".to_string(), new_a_blob);
+    let applied = apply_synced_agent_to_view(&mut metadata_view, &rebased_candidate, Some(&before))
+        .expect("metadata-only concurrent update should still apply rebase");
+    assert_eq!(applied.base_commit, old_main);
+    assert_eq!(applied.intent, "Refined concurrent intent");
+    assert!(applied.claimed_symbols.contains("b.rs::concurrent_sym"));
+    assert_eq!(applied.read_blobs.get("extra.rs"), Some(&new_a_blob));
 }

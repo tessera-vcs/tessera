@@ -21,14 +21,14 @@ tes mcp
 | `status` | `{ agent_id? }` | Snapshot and return the session's status, Change-ID, commit SHA, intent, and claimed symbols |
 | `radar` | `{}` | Return live multi-agent radar showing active sessions, intents, and overlapping edits |
 | `claim` | `{ intent?, branch?, from?, symbols?, agent_id? }` | Claim a task intent, optional target branch and parent base (`from`), and file/symbol paths |
-| `commit` | `{ message?, branch?, amend?, author?, co_author?, no_co_author?, verify?, agent_id? }` | Commit the session's isolated changes onto its target branch |
-| `diff` | `{ branch?, staged?, rev_range?, paths?, agent_id? }` | Inspect unified diffs for the session, staged edits, branch, or revision range |
-| `log` | `{ branch?, limit? }` | Return commit history for a branch |
+| `commit` | `{ message?, branch?, amend?, dry_run?, author?, co_author?, no_co_author?, verify?, agent_id? }` | Commit the session's isolated changes onto its target branch |
+| `diff` | `{ branch?, staged?, all?, range?, stat?, name_status?, paths?, agent_id? }` | Inspect unified diffs for the session, staged edits, branch, or revision range |
+| `log` | `{ branch?, limit?, agent_id? }` | Return commit history for a branch |
 | `oplog` | `{ limit? }` | Return recent entries from the lock-free Operation Log |
-| `push` | `{ remote?, branch?, force?, tags?, dry_run?, agent_id? }` | Push the session's active (or specified) branch to a Git remote |
+| `push` | `{ remote?, branch?, message?, set_upstream?, force?, force_with_lease?, tags?, delete?, dry_run?, no_auto_commit?, agent_id? }` | Push the session's active (or specified) branch to a Git remote |
 | `pull` | `{ remote?, branch?, agent_id? }` | Fetch and fast-forward or 3-way AST-merge a remote branch and rebase active sessions |
 | `checkpoint` | `{ label, agent_id? }` | Create a named atomic checkpoint in the Operation Log |
-| `restore` | `{ source?, branch?, paths?, agent_id? }` | Restore a branch or specific paths to a commit SHA, `HEAD~N`, branch, or checkpoint |
+| `restore` | `{ source?, revision?, branch?, paths?, agent_id? }` | Restore a branch or specific paths to a commit SHA, `HEAD~N`, branch, or checkpoint |
 | `branch` | `{ action?: "list"\|"switch"\|"delete"\|"rename", branch?, new_branch?, from?, force?, agent_id? }` | List, switch, delete, or rename branches across Git refs, sandboxes, and sessions |
 | `stash` | `{ action?: "push"\|"pop"\|"apply"\|"list"\|"drop"\|"clear", message?, branch?, paths?, index?, agent_id? }` | Save or reapply session-isolated uncommitted changes via 3-way AST merge |
 | `cherry-pick` | `{ commit, branch?, agent_id? }` | Apply the delta of an existing commit onto the target branch via 3-way AST merge |
@@ -37,7 +37,7 @@ tes mcp
 | `sync` | `{}` | Non-blocking auto-rebase of all active sessions onto the latest trunk commit |
 | `undo` | `{ op?, checkpoint? }` | Atomically roll back repository state to the previous operation, an `OpId` prefix, or a checkpoint |
 | `merge` | `{ agents?, into?, message?, verify?, keep_open?, dry_run?, author?, co_author?, no_co_author? }` | Semantically merge sessions or branches into a target branch (or preview with `dry_run`) |
-| `agent` | `{ action?: "list"\|"close"\|"clear", agent_id?, force? }` | List, close, or clear active agent sessions |
+| `agent` | `{ action?: "list"\|"close"\|"clear", name?, all?, force?, agent_id? }` | List, close, or clear active agent sessions |
 | `config` | `{ action?: "show" }` | Inspect effective repository configuration |
 | `doctor` | `{}` | Run repository health, config trust, filesystem, and integration diagnostics |
 

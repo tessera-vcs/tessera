@@ -88,6 +88,8 @@ fn is_committed_on_any_branch(
 /// Handles `tes hook pre-tool`: records the baseline blob of `rel_path` seen by `session_id`
 /// before an edit occurs, and warns if another active session is concurrently modifying `rel_path`.
 ///
+/// Serializes `repo_root` baseline reads/writes under `<common_git_dir>/tessera/post_tool.lock`
+/// so concurrent `pre-tool` and `post-tool` invocations cannot race on shared working-tree files.
 /// Never silently overwrites unowned uncommitted human edits in `repo_root`, preserves executable
 /// permissions on any staged baseline restoration, and refreshes stale `read_blobs` when the
 /// target branch base has advanced.
@@ -100,7 +102,46 @@ pub fn handle_pre_tool_hook(
     rel_path: &str,
 ) -> CoreResult<PreToolOutcome> {
     let normalized_path = normalize_repo_rel_path(coord.git().repo_root(), rel_path)?;
-    let meta = coord.ensure_session(session_id, None)?;
+    let mut meta = coord.ensure_session(session_id, None)?;
+    let initial_base_tree_blob = coord
+        .git()
+        .read_commit(&meta.base_commit)
+        .ok()
+        .and_then(|c| {
+            coord
+                .git()
+                .read_tree_entry_at_path(&c.tree_id, &normalized_path)
+                .ok()
+                .flatten()
+                .map(|e| e.blob_id)
+        });
+    let common_git_dir = coord.git().common_git_dir();
+
+    if is_ignored_or_secret_path(
+        coord.git().repo_root(),
+        common_git_dir,
+        &normalized_path,
+        initial_base_tree_blob.is_some(),
+    ) {
+        return Ok(PreToolOutcome {
+            session_id: session_id.to_string(),
+            path: normalized_path,
+            radar_warning: None,
+        });
+    }
+
+    let _post_tool_lock =
+        acquire_file_lock(&common_git_dir.join("tessera").join("post_tool.lock"))?;
+
+    let cur_op_opt = coord.oplog().load_current_reconciled().ok();
+
+    if let Some(latest) = cur_op_opt
+        .as_ref()
+        .and_then(|op| op.view.agents.get(session_id))
+    {
+        meta = latest.clone();
+    }
+
     let base_tree_entry = coord
         .git()
         .read_commit(&meta.base_commit)
@@ -113,20 +154,6 @@ pub fn handle_pre_tool_hook(
                 .flatten()
         });
     let base_tree_blob = base_tree_entry.as_ref().map(|e| e.blob_id);
-    let common_git_dir = coord.git().common_git_dir();
-
-    if is_ignored_or_secret_path(
-        coord.git().repo_root(),
-        common_git_dir,
-        &normalized_path,
-        base_tree_blob.is_some(),
-    ) {
-        return Ok(PreToolOutcome {
-            session_id: session_id.to_string(),
-            path: normalized_path,
-            radar_warning: None,
-        });
-    }
 
     let default_branch = coord
         .git()
@@ -161,7 +188,6 @@ pub fn handle_pre_tool_hook(
         .filter(|p| p.is_file())
         .unwrap_or_else(|| full_path.clone());
 
-    let cur_op_opt = coord.oplog().load_current_reconciled().ok();
     let head_cid_opt = coord.git().resolve_head_commit().ok().flatten();
     let head_blob_at_path = head_cid_opt.and_then(|hcid| {
         coord.git().read_commit(&hcid).ok().and_then(|c| {
@@ -360,6 +386,8 @@ pub fn handle_pre_tool_hook(
             Ok(())
         },
     )?;
+
+    drop(_post_tool_lock);
 
     ensure_background_watcher(coord.git().repo_root(), common_git_dir);
 

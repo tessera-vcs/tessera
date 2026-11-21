@@ -2129,8 +2129,10 @@ type DelimSpan = (char, usize, usize);
 fn trailing_identifier_word(prefix: &str) -> &str {
     let trimmed = prefix.trim_end();
     let start = trimmed
-        .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-        .map(|idx| idx + 1)
+        .char_indices()
+        .rev()
+        .find(|&(_, c)| !(c.is_ascii_alphanumeric() || c == '_'))
+        .map(|(idx, c)| idx + c.len_utf8())
         .unwrap_or(0);
     &trimmed[start..]
 }
@@ -4158,6 +4160,46 @@ version = "0.29.0"
         assert!(
             res_poetry.content.contains("name = \"fastapi\"")
                 && res_poetry.content.contains("name = \"uvicorn\"")
+        );
+    }
+
+    #[test]
+    fn multibyte_utf8_before_delimiters_never_panics() {
+        assert_eq!(trailing_identifier_word("caf\u{00e9}"), "");
+        assert_eq!(trailing_identifier_word("caf\u{00e9}_ok"), "_ok");
+        assert_eq!(trailing_identifier_word("// r\u{00e9}sum\u{00e9} "), "");
+
+        let base_call = "caf\u{00e9}(a, b)\n";
+        let left_call = "caf\u{00e9}(a, b, c)\n";
+        let right_call = "caf\u{00e9}(a, b, d)\n";
+        let res_call = merge_text_3way(base_call, left_call, right_call, "a", "b");
+        assert!(
+            !res_call.has_conflicts,
+            "expected clean merge without panic, got:\n{}",
+            res_call.content
+        );
+        assert_eq!(res_call.content, "caf\u{00e9}(a, b, c, d)\n");
+
+        let base_comment = "// r\u{00e9}sum\u{00e9} (v1)\n";
+        let left_comment = "// r\u{00e9}sum\u{00e9} (v2)\n";
+        let right_comment = "// r\u{00e9}sum\u{00e9} (v3)\n";
+        let res_comment = merge_text_3way(base_comment, left_comment, right_comment, "a", "b");
+        assert!(res_comment.has_conflicts);
+
+        let base_bracket = "caf\u{00e9}[0]\n";
+        let left_bracket = "caf\u{00e9}[1]\n";
+        let right_bracket = "caf\u{00e9}[2]\n";
+        let res_bracket = merge_text_3way(base_bracket, left_bracket, right_bracket, "a", "b");
+        assert!(res_bracket.has_conflicts);
+
+        let base_brace = "caf\u{00e9} { x: 1, y: 2 }\n";
+        let left_brace = "caf\u{00e9} { x: 1, y: 2, z: 3 }\n";
+        let right_brace = "caf\u{00e9} { x: 1, y: 2, w: 4 }\n";
+        let res_brace = merge_text_3way(base_brace, left_brace, right_brace, "a", "b");
+        assert!(
+            !res_brace.has_conflicts,
+            "expected clean brace merge without panic, got:\n{}",
+            res_brace.content
         );
     }
 }

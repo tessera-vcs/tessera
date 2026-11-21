@@ -22,7 +22,7 @@ tes env [options]
 
 ## Description
 
-The `env` command configures your shell so each terminal tab displays its active Tessera branch (`(tes:<branch>)`) in the prompt, syncs session environment variables (`TES_BRANCH`, `TES_PORT`, `TES_WORKSPACE`, `TES_REPO_ROOT`, plus `PORT` and framework port variables when `port_isolation = true`), and enables dynamic `<TAB>` completion and automatic sandbox command routing where supported by the shell.
+The `env` command configures your shell so each terminal tab displays its active Tessera branch (`(tes:<branch>)`) in the prompt, syncs session environment variables (`TES_BRANCH` and `TES_PORT` across all shells including PowerShell and Elvish, plus `TES_WORKSPACE`, `TES_REPO_ROOT`, and automatic `PORT` / framework port variables when `port_isolation = true` in POSIX, Fish, `tcsh`, and Nushell hooks), and enables dynamic `<TAB>` completion and automatic sandbox command routing where supported by the shell.
 
 ### Per-Shell Capabilities
 
@@ -37,7 +37,7 @@ The `env` command configures your shell so each terminal tab displays its active
 | **Nushell** (`--nu`) | Yes | No | No (use `tes exec [-b <branch>] -- <cmd>`) |
 | **Elvish** (`--elvish`) | Yes | No | No (use `tes exec [-b <branch>] -- <cmd>`) |
 
-> **Platform Note:** Environment variable syncing (`TES_BRANCH`, `TES_PORT`, and `PORT` when `port_isolation = true`) works cross-platform across macOS, Linux, BSD, and Windows. Executable CLI port-wrapper shims (`TES_SHIM_BIN`) are POSIX-only (macOS, Linux, BSD, and WSL).
+> **Platform Note:** `tes env` exports `TES_BRANCH` and `TES_PORT` across all supported shells (including PowerShell and Elvish). Automatic `PORT` and framework port variable export in shell hooks applies to POSIX (`zsh`, `bash`, `sh`), Fish, `tcsh`, and Nushell; on Windows (or in Elvish), use `tes exec [-b <branch>] -- <cmd>` for isolated `PORT` and framework port variables. Executable CLI port-wrapper shims (`TES_SHIM_BIN`) are POSIX-only (macOS, Linux, BSD, and WSL).
 
 Even without `tes env` installed in your shell profile, Tessera automatically isolates terminal tabs across macOS, Linux, FreeBSD, OpenBSD, and Windows using terminal session environment variables (`TERM_SESSION_ID`, `ITERM_SESSION_ID`, `TMUX_PANE`, `ZELLIJ_PANE_ID`, `WEZTERM_PANE`, `KITTY_WINDOW_ID`, `GHOSTTY_SURFACE_ID`, `ALACRITTY_WINDOW_ID`, `GNOME_TERMINAL_SCREEN`, `KONSOLE_DBUS_SESSION`, `TILIX_ID`, `WT_SESSION`), POSIX session leader (`getsid(0)`), and Windows console/process tree tracking.
 

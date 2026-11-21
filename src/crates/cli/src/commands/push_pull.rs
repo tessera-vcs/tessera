@@ -216,6 +216,7 @@ pub fn execute_push(
         && !args.delete
         && !args.dry_run
         && !is_delete_refspec
+        && (!args.tags || args.branch.is_some())
         && !local_branch.is_empty()
         && (meta.head_commit != meta.base_commit
             || meta.has_own_changes()

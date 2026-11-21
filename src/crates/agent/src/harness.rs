@@ -494,7 +494,7 @@ This repository uses Tessera (`tes`) for concurrent multi-agent source control (
 }
 
 /// Inserts or updates a `<!-- tessera:start --> ... <!-- tessera:end -->` markdown section in `path`.
-fn upsert_marked_section(path: &Path, block: &str) -> CoreResult<()> {
+pub(crate) fn upsert_marked_section(path: &Path, block: &str) -> CoreResult<()> {
     let mut existing = if path.is_file() {
         fs::read_to_string(path).map_err(|source| CoreError::Io {
             path: path.display().to_string(),
@@ -504,21 +504,28 @@ fn upsert_marked_section(path: &Path, block: &str) -> CoreResult<()> {
         String::new()
     };
 
-    if let (Some(l_start), Some(l_end)) = (
-        existing.find("<!-- lunr:start -->"),
-        existing.find("<!-- lunr:end -->"),
-    ) {
-        let after = l_end + "<!-- lunr:end -->".len();
+    let legacy_start_marker = "<!-- lunr:start -->";
+    let legacy_end_marker = "<!-- lunr:end -->";
+
+    if let Some((l_start, after)) = existing.find(legacy_start_marker).and_then(|start| {
+        let search_from = start + legacy_start_marker.len();
+        existing[search_from..]
+            .find(legacy_end_marker)
+            .map(|rel_end| (start, search_from + rel_end + legacy_end_marker.len()))
+    }) {
         existing = format!("{}{}", &existing[..l_start], &existing[after..])
             .trim()
             .to_string();
     }
 
-    let updated = if let (Some(start), Some(end)) = (
-        existing.find("<!-- tessera:start -->"),
-        existing.find("<!-- tessera:end -->"),
-    ) {
-        let after_end = end + "<!-- tessera:end -->".len();
+    let start_marker = "<!-- tessera:start -->";
+    let end_marker = "<!-- tessera:end -->";
+    let updated = if let Some((start, after_end)) = existing.find(start_marker).and_then(|start| {
+        let search_from = start + start_marker.len();
+        existing[search_from..]
+            .find(end_marker)
+            .map(|rel_end| (start, search_from + rel_end + end_marker.len()))
+    }) {
         format!(
             "{}{}{}",
             &existing[..start],
@@ -790,18 +797,21 @@ pub(crate) fn upsert_claude_hooks_json(path: &Path) -> CoreResult<()> {
 }
 
 /// Inserts or updates a `# tessera:start ... # tessera:end` shell hook block in `.git/hooks/<hook>`.
-fn upsert_git_hook(path: &Path, snippet: &str) -> CoreResult<()> {
+pub(crate) fn upsert_git_hook(path: &Path, snippet: &str) -> CoreResult<()> {
     let existing = if path.is_file() {
         fs::read_to_string(path).unwrap_or_default()
     } else {
         String::new()
     };
 
-    let updated = if let (Some(start), Some(end)) = (
-        existing.find("# tessera:start"),
-        existing.find("# tessera:end"),
-    ) {
-        let after_end = end + "# tessera:end".len();
+    let start_marker = "# tessera:start";
+    let end_marker = "# tessera:end";
+    let updated = if let Some((start, after_end)) = existing.find(start_marker).and_then(|start| {
+        let search_from = start + start_marker.len();
+        existing[search_from..]
+            .find(end_marker)
+            .map(|rel_end| (start, search_from + rel_end + end_marker.len()))
+    }) {
         format!(
             "{}{}{}",
             &existing[..start],

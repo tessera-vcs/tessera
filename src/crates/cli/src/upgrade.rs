@@ -571,14 +571,69 @@ pub fn parse_release_tag_from_json(raw: &str) -> Result<SemVer> {
     SemVer::parse(tag)
 }
 
+/// Extracts and parses the release SemVer tag from a redirected GitHub `/releases/tag/<tag>` URL.
+fn extract_tag_from_redirect_url(effective_url: &str) -> Result<SemVer> {
+    let trimmed = effective_url.trim();
+    let tag = trimmed
+        .rsplit("/releases/tag/")
+        .next()
+        .filter(|s| *s != trimmed && !s.is_empty())
+        .map(|s| {
+            s.split(['?', '#', '"', '\'', ' ', '\r', '\n'])
+                .next()
+                .unwrap_or(s)
+        })
+        .ok_or_else(|| {
+            anyhow!("could not determine latest release tag from redirect URL '{trimmed}'")
+        })?;
+
+    SemVer::parse(tag)
+}
+
+/// Extracts a redirected `/releases/tag/<tag>` URL from verbose HTTP client output (`wget` / `fetch`).
+#[cfg(any(not(windows), test))]
+fn extract_redirect_url_from_output(text: &str) -> Option<String> {
+    for line in text.lines() {
+        let trimmed = line.trim();
+
+        if let Some(rest) = trimmed
+            .strip_prefix("Location:")
+            .or_else(|| trimmed.strip_prefix("location:"))
+        {
+            let loc = rest.split_whitespace().next().unwrap_or("");
+
+            if loc.contains("/releases/tag/") {
+                return Some(loc.to_string());
+            }
+        }
+
+        if let Some(idx) = trimmed.find("https://") {
+            let candidate = trimmed[idx..]
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim_matches(|c| matches!(c, '\'' | '"' | '[' | ']' | '(' | ')'));
+
+            if candidate.contains("/releases/tag/") {
+                return Some(candidate.to_string());
+            }
+        }
+    }
+
+    None
+}
+
 /// Resolves the latest release tag by following `https://github.com/<repo>/releases/latest`
 /// without consuming unauthenticated GitHub API rate-limit quota.
+///
+/// Falls back cleanly to `wget`, FreeBSD `fetch`, or Windows PowerShell `Invoke-WebRequest`
+/// when `curl` / `curl.exe` is unavailable on `PATH`.
 fn resolve_latest_tag_via_redirect(repo: &str) -> Result<SemVer> {
     let url = format!("https://github.com/{repo}/releases/latest");
     let curl_bin = if cfg!(windows) { "curl.exe" } else { "curl" };
     let null_dest = if cfg!(windows) { "NUL" } else { "/dev/null" };
 
-    let out = Command::new(curl_bin)
+    match Command::new(curl_bin)
         .args([
             "-fsSLI",
             "--connect-timeout",
@@ -592,27 +647,115 @@ fn resolve_latest_tag_via_redirect(repo: &str) -> Result<SemVer> {
             &url,
         ])
         .output()
-        .with_context(|| format!("failed to query latest release from {url}"))?;
+    {
+        Ok(out) => {
+            if !out.status.success() {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                bail!(
+                    "failed to resolve latest release from {url}: {}",
+                    stderr.trim()
+                );
+            }
 
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        bail!(
-            "failed to resolve latest release from {url}: {}",
-            stderr.trim()
-        );
+            let effective_url = String::from_utf8_lossy(&out.stdout);
+            return extract_tag_from_redirect_url(&effective_url);
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to query latest release from {url}"));
+        }
     }
 
-    let effective_url = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    let tag = effective_url
-        .rsplit("/releases/tag/")
-        .next()
-        .filter(|s| *s != effective_url && !s.is_empty())
-        .map(|s| s.split(['?', '#']).next().unwrap_or(s))
-        .ok_or_else(|| {
-            anyhow!("could not determine latest release tag from redirect URL '{effective_url}'")
-        })?;
+    #[cfg(windows)]
+    {
+        let ps_script = "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; \
+            $ProgressPreference = 'SilentlyContinue'; \
+            $resp = Invoke-WebRequest -Method Head -Uri $env:TES_DL_URL -UseBasicParsing; \
+            $u = $resp.BaseResponse.ResponseUri.AbsoluteUri; \
+            if (-not $u) { $u = $resp.BaseResponse.RequestMessage.RequestUri.AbsoluteUri }; \
+            if (-not $u) { $u = $resp.Headers['Location'] }; \
+            Write-Output $u";
 
-    SemVer::parse(tag)
+        let out = Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", ps_script])
+            .env("TES_DL_URL", &url)
+            .output()
+            .context(
+                "neither curl.exe nor powershell is available to resolve the latest release",
+            )?;
+
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            bail!(
+                "PowerShell redirect lookup failed for {url}: {}",
+                stderr.trim()
+            );
+        }
+
+        let effective_url = String::from_utf8_lossy(&out.stdout);
+        extract_tag_from_redirect_url(&effective_url)
+    }
+
+    #[cfg(not(windows))]
+    {
+        match Command::new("wget")
+            .args(["--spider", "--max-redirect=5", "-S", "-T", "15", &url])
+            .output()
+        {
+            Ok(out) => {
+                let combined = format!(
+                    "{}\n{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+
+                if let Some(redirect_url) = extract_redirect_url_from_output(&combined) {
+                    return extract_tag_from_redirect_url(&redirect_url);
+                }
+
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                bail!("wget redirect lookup failed for {url}: {}", stderr.trim());
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("failed to query latest release via wget from {url}")
+                });
+            }
+        }
+
+        if cfg!(target_os = "freebsd") {
+            match Command::new("fetch")
+                .args(["-s", "-vv", "-T", "15", &url])
+                .output()
+            {
+                Ok(out) => {
+                    let combined = format!(
+                        "{}\n{}",
+                        String::from_utf8_lossy(&out.stdout),
+                        String::from_utf8_lossy(&out.stderr)
+                    );
+
+                    if let Some(redirect_url) = extract_redirect_url_from_output(&combined) {
+                        return extract_tag_from_redirect_url(&redirect_url);
+                    }
+
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    bail!("fetch redirect lookup failed for {url}: {}", stderr.trim());
+                }
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!("failed to query latest release via fetch from {url}")
+                    });
+                }
+            }
+        }
+
+        bail!(
+            "no HTTP client available to resolve latest release from {url} (install curl or wget)"
+        );
+    }
 }
 
 /// Downloads `url` into memory as UTF-8 text.
@@ -625,8 +768,8 @@ fn download_to_string(url: &str, send_github_headers: bool) -> Result<String> {
     fs::read_to_string(&out_path).with_context(|| format!("failed to read response from {url}"))
 }
 
-/// Downloads `url` to `dest` using the platform's native HTTP client (`curl`, `wget`, BSD `ftp`,
-/// or Windows `curl.exe` / PowerShell `Invoke-WebRequest`).
+/// Downloads `url` to `dest` using the platform's native HTTP client (`curl`, `wget`, FreeBSD
+/// `fetch`, OpenBSD/macOS `ftp`, or Windows `curl.exe` / PowerShell `Invoke-WebRequest`).
 fn download_to_file(url: &str, dest: &Path, send_github_headers: bool) -> Result<()> {
     let user_agent = format!("tessera-cli/{}", env!("CARGO_PKG_VERSION"));
     let github_token = if send_github_headers && url.starts_with("https://api.github.com/") {
@@ -657,7 +800,8 @@ fn download_to_file(url: &str, dest: &Path, send_github_headers: bool) -> Result
             bail!("curl.exe failed for {url}: {stderr}");
         }
 
-        let ps_script = "$ProgressPreference = 'SilentlyContinue'; \
+        let ps_script = "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; \
+            $ProgressPreference = 'SilentlyContinue'; \
             $headers = @{ 'User-Agent' = $env:TES_DL_UA }; \
             if ($env:TES_DL_ACCEPT) { $headers['Accept'] = $env:TES_DL_ACCEPT }; \
             if ($env:TES_DL_AUTH) { $headers['Authorization'] = $env:TES_DL_AUTH }; \
@@ -665,6 +809,8 @@ fn download_to_file(url: &str, dest: &Path, send_github_headers: bool) -> Result
 
         let mut cmd = Command::new("powershell");
         cmd.args(["-NoProfile", "-NonInteractive", "-Command", ps_script])
+            .env_remove("TES_DL_ACCEPT")
+            .env_remove("TES_DL_AUTH")
             .env("TES_DL_URL", url)
             .env("TES_DL_DEST", dest)
             .env("TES_DL_UA", &user_agent);
@@ -729,11 +875,24 @@ fn download_to_file(url: &str, dest: &Path, send_github_headers: bool) -> Result
             bail!("wget failed for {url}: {stderr}");
         }
 
-        if cfg!(any(
-            target_os = "freebsd",
-            target_os = "openbsd",
-            target_os = "macos"
-        )) {
+        if cfg!(target_os = "freebsd") {
+            if let Ok(out) = Command::new("fetch")
+                .arg("-q")
+                .arg("-o")
+                .arg(dest)
+                .arg(url)
+                .output()
+            {
+                if out.status.success() && dest.is_file() {
+                    return Ok(());
+                }
+
+                let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                bail!("fetch failed for {url}: {stderr}");
+            }
+        }
+
+        if cfg!(any(target_os = "openbsd", target_os = "macos")) {
             if let Ok(out) = Command::new("ftp")
                 .arg("-V")
                 .arg("-o")
@@ -1068,11 +1227,17 @@ pub fn extract_from_tar_gz(archive_path: &Path, binary_name: &str) -> Result<Vec
             break;
         }
 
-        let name = parse_tar_path(&header)?;
         let size = parse_tar_octal(&header[124..136])?;
         let typeflag = header[156];
         let padded_remainder = ((512 - (size % 512)) % 512) as usize;
 
+        if matches!(typeflag, b'x' | b'g') {
+            let skip_total = size.saturating_add(padded_remainder as u64);
+            discard_exact(&mut decoder, skip_total)?;
+            continue;
+        }
+
+        let name = parse_tar_path(&header)?;
         let normalized = name.trim_start_matches("./");
         let is_regular = typeflag == b'0' || typeflag == 0;
 
@@ -1136,7 +1301,7 @@ fn discard_exact<R: Read>(reader: &mut R, mut count: u64) -> io::Result<()> {
     let mut scratch = [0u8; 4096];
 
     while count > 0 {
-        let want = (count as usize).min(scratch.len());
+        let want = count.min(scratch.len() as u64) as usize;
         reader.read_exact(&mut scratch[..want])?;
         count -= want as u64;
     }
@@ -1144,7 +1309,7 @@ fn discard_exact<R: Read>(reader: &mut R, mut count: u64) -> io::Result<()> {
     Ok(())
 }
 
-/// Extracts and validates the path from a 512-byte POSIX ustar header.
+/// Extracts and validates the path from a 512-byte POSIX ustar or GNU tar header.
 fn parse_tar_path(header: &[u8; 512]) -> Result<String> {
     let name_bytes = header[0..100]
         .split(|&b| b == 0)
@@ -1152,11 +1317,15 @@ fn parse_tar_path(header: &[u8; 512]) -> Result<String> {
         .unwrap_or(&header[0..100]);
     let name = std::str::from_utf8(name_bytes).context("non-UTF-8 path in tar header")?;
 
-    let prefix_bytes = header[345..500]
-        .split(|&b| b == 0)
-        .next()
-        .unwrap_or(&header[345..500]);
-    let prefix = std::str::from_utf8(prefix_bytes).context("non-UTF-8 prefix in tar header")?;
+    let prefix = if &header[257..263] == b"ustar\0" {
+        let prefix_bytes = header[345..500]
+            .split(|&b| b == 0)
+            .next()
+            .unwrap_or(&header[345..500]);
+        std::str::from_utf8(prefix_bytes).context("non-UTF-8 prefix in tar header")?
+    } else {
+        ""
+    };
 
     let full = if prefix.is_empty() {
         name.to_string()
@@ -1186,8 +1355,17 @@ fn parse_tar_octal(field: &[u8]) -> Result<u64> {
 }
 
 /// Extracts `binary_name` from a `.zip` release archive in memory using the Central Directory,
-/// verifying CRC-32 and rejecting path traversal, symlinks, and unsupported compression methods.
+/// verifying CRC-32 and rejecting path traversal, symlinks, zip bombs, and unsupported compression methods.
 pub fn extract_from_zip(archive_path: &Path, binary_name: &str) -> Result<Vec<u8>> {
+    extract_from_zip_with_limit(archive_path, binary_name, MAX_BINARY_BYTES)
+}
+
+/// Extracts `binary_name` from a `.zip` archive enforcing an upper decompressed byte bound `max_bytes`.
+fn extract_from_zip_with_limit(
+    archive_path: &Path,
+    binary_name: &str,
+    max_bytes: u64,
+) -> Result<Vec<u8>> {
     let data = fs::read(archive_path)
         .with_context(|| format!("failed to read zip archive '{}'", archive_path.display()))?;
 
@@ -1271,7 +1449,7 @@ pub fn extract_from_zip(archive_path: &Path, binary_name: &str) -> Result<Vec<u8
                 bail!("refusing to extract symlink entry '{raw_name}' from zip archive");
             }
 
-            if (uncomp_size as u64) > MAX_BINARY_BYTES {
+            if (uncomp_size as u64) > max_bytes {
                 bail!("zip entry '{raw_name}' exceeds maximum permitted size");
             }
 
@@ -1298,12 +1476,26 @@ pub fn extract_from_zip(archive_path: &Path, binary_name: &str) -> Result<Vec<u8
 
             let compressed = &data[data_start..data_end];
             let payload = match method {
-                0 => compressed.to_vec(),
+                0 => {
+                    if (compressed.len() as u64) > max_bytes {
+                        bail!("zip entry '{raw_name}' exceeds maximum permitted size");
+                    }
+
+                    compressed.to_vec()
+                }
                 8 => {
-                    let mut dec = DeflateDecoder::new(compressed);
-                    let mut out = Vec::with_capacity(uncomp_size);
-                    dec.read_to_end(&mut out)
+                    let mut bounded = DeflateDecoder::new(compressed).take(max_bytes + 1);
+                    let mut out = Vec::with_capacity(uncomp_size.min(4 * 1024 * 1024));
+                    bounded
+                        .read_to_end(&mut out)
                         .with_context(|| format!("failed to inflate zip entry '{raw_name}'"))?;
+
+                    if (out.len() as u64) > max_bytes {
+                        bail!(
+                            "zip entry '{raw_name}' decompressed payload exceeds maximum permitted size"
+                        );
+                    }
+
                     out
                 }
                 other => bail!("unsupported zip compression method {other} for '{raw_name}'"),
@@ -1494,14 +1686,45 @@ pub fn replace_executable(target_exe: &Path, new_bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Creates a unique temporary directory for download and verification artifacts.
+/// Creates a unique, private temporary directory for download and verification artifacts
+/// using atomic directory creation (`fs::create_dir` / `DirBuilder::mode(0o700)`) so
+/// pre-created directories are never silently reused.
 fn create_upgrade_temp_dir() -> Result<PathBuf> {
-    let seq = TEMP_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
+    let base = std::env::temp_dir();
     let pid = std::process::id();
-    let dir = std::env::temp_dir().join(format!("tes-upgrade-{pid}-{seq}"));
-    fs::create_dir_all(&dir)
-        .with_context(|| format!("failed to create temp directory '{}'", dir.display()))?;
-    Ok(dir)
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+
+    for attempt in 0..64u32 {
+        let seq = TEMP_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
+        let dir = base.join(format!("tes-upgrade-{pid}-{nanos}-{seq}-{attempt}"));
+
+        #[cfg(unix)]
+        let create_res = {
+            use std::os::unix::fs::DirBuilderExt;
+
+            let mut builder = fs::DirBuilder::new();
+            builder.mode(0o700);
+            builder.create(&dir)
+        };
+
+        #[cfg(not(unix))]
+        let create_res = fs::create_dir(&dir);
+
+        match create_res {
+            Ok(()) => return Ok(dir),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("failed to create temp directory '{}'", dir.display())
+                });
+            }
+        }
+    }
+
+    bail!("failed to create a unique temporary upgrade directory after 64 attempts")
 }
 
 /// RAII cleanup guard removing temporary upgrade artifacts on drop.
@@ -1754,5 +1977,144 @@ mod tests {
         )
         .unwrap();
         assert!(extract_from_zip(&symlink_zip, "tes.exe").is_err());
+    }
+
+    #[test]
+    fn tar_gz_skips_pax_extended_headers_and_handles_gnu_tar_headers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pax_payload = b"#!/bin/sh\necho pax-ok\n";
+        let pax_tgz = tmp.path().join("pax.tar.gz");
+        fs::write(
+            &pax_tgz,
+            build_tar_gz(&[
+                ("tes", b'x', b"20 mtime=1700000000\n"),
+                ("tes", b'0', pax_payload),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(extract_from_tar_gz(&pax_tgz, "tes").unwrap(), pax_payload);
+
+        // GNU tar writes `"ustar "` (trailing space) at bytes 257..263 and stores non-prefix
+        // metadata in bytes 345..500; `parse_tar_path` must not prepend bytes 345..500.
+        let gnu_payload = b"#!/bin/sh\necho gnu-ok\n";
+        let mut gnu_header = [0u8; 512];
+        gnu_header[..3].copy_from_slice(b"tes");
+        gnu_header[100..107].copy_from_slice(b"0000755");
+        let size_oct = format!("{:011o}", gnu_payload.len());
+        gnu_header[124..135].copy_from_slice(size_oct.as_bytes());
+        gnu_header[156] = b'0';
+        gnu_header[257..263].copy_from_slice(b"ustar ");
+        gnu_header[263..265].copy_from_slice(b" \0");
+        gnu_header[345..356].copy_from_slice(b"17000000000");
+        gnu_header[148..156].fill(b' ');
+        let csum: u32 = gnu_header.iter().map(|&b| u32::from(b)).sum();
+        let csum_oct = format!("{csum:06o}\0 ");
+        gnu_header[148..156].copy_from_slice(csum_oct.as_bytes());
+
+        let mut tar_bytes = Vec::new();
+        tar_bytes.extend_from_slice(&gnu_header);
+        tar_bytes.extend_from_slice(gnu_payload);
+        let pad = (512 - (gnu_payload.len() % 512)) % 512;
+        tar_bytes.resize(tar_bytes.len() + pad + 1024, 0);
+
+        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+        gz.write_all(&tar_bytes).unwrap();
+        let gnu_tgz_bytes = gz.finish().unwrap();
+
+        let gnu_tgz = tmp.path().join("gnu.tar.gz");
+        fs::write(&gnu_tgz, gnu_tgz_bytes).unwrap();
+        assert_eq!(extract_from_tar_gz(&gnu_tgz, "tes").unwrap(), gnu_payload);
+    }
+
+    #[test]
+    fn zip_extractor_rejects_deflate_zip_bomb_exceeding_bound() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real_uncompressed = vec![0u8; 8192];
+        let mut enc = DeflateEncoder::new(Vec::new(), Compression::best());
+        enc.write_all(&real_uncompressed).unwrap();
+        let compressed = enc.finish().unwrap();
+
+        let mut crc = Crc::new();
+        crc.update(&real_uncompressed);
+        let crc_val = crc.sum();
+
+        let name = "tes.exe";
+        let spoofed_uncomp_size = 16u32;
+
+        let mut out = Vec::new();
+        out.extend_from_slice(b"PK\x03\x04");
+        out.extend_from_slice(&20u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&8u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&crc_val.to_le_bytes());
+        out.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
+        out.extend_from_slice(&spoofed_uncomp_size.to_le_bytes());
+        out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(&compressed);
+
+        let cd_offset = out.len() as u32;
+        out.extend_from_slice(b"PK\x01\x02");
+        out.extend_from_slice(&0x031eu16.to_le_bytes());
+        out.extend_from_slice(&20u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&8u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&crc_val.to_le_bytes());
+        out.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
+        out.extend_from_slice(&spoofed_uncomp_size.to_le_bytes());
+        out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&(0o100_755u32 << 16).to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(name.as_bytes());
+        let cd_size = (out.len() as u32) - cd_offset;
+
+        out.extend_from_slice(b"PK\x05\x06");
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&cd_size.to_le_bytes());
+        out.extend_from_slice(&cd_offset.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+
+        let bomb_zip = tmp.path().join("bomb.zip");
+        fs::write(&bomb_zip, out).unwrap();
+
+        let err = extract_from_zip_with_limit(&bomb_zip, "tes.exe", 1024).unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds maximum permitted size"),
+            "expected zip-bomb bound error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn redirect_output_parser_and_atomic_temp_dir_work() {
+        let wget_stderr = "HTTP/1.1 302 Found\n  Location: https://github.com/tessera-vcs/tessera/releases/tag/v0.1.2\n";
+        let loc = extract_redirect_url_from_output(wget_stderr).unwrap();
+        assert_eq!(
+            extract_tag_from_redirect_url(&loc).unwrap(),
+            SemVer::parse("0.1.2").unwrap()
+        );
+
+        let dir = create_upgrade_temp_dir().unwrap();
+        assert!(dir.is_dir());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "temp dir must have 0o700 permissions on Unix");
+        }
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

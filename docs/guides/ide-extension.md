@@ -4,10 +4,11 @@ The Tessera extension (`tessera-vscode.vsix`) works in **VS Code** and all **VS 
 
 ## Status Bar
 
-When you open a repository initialized with `tes init`, two items appear on the left side of the status bar:
+When you open a repository initialized with `tes init`, two persistent items appear on the left side of the status bar (plus a third conflict badge whenever conflicts exist):
 
 1. **Current Branch (`main`)**: Displays the branch currently checked out in your editor working tree. Click it at any time to switch your editor to another branch.
-2. **`Graph` / `N Conflicts`**: Opens the Branch Graph. If any unresolved conflicts exist, this item highlights in red (`N Conflicts`) and opens the Conflict Resolver when clicked.
+2. **`Graph`**: Stays visible whenever Tessera is initialized and opens the 2D Branch Graph.
+3. **`1 Conflict` / `N Conflicts`** *(shown alongside `Graph` when conflicts exist)*: Appears as a separate error-styled status bar item and opens the Conflict Resolver when clicked.
 
 > **Note:** In workspaces that have not been initialized with `tes init`, the Tessera status bar items stay hidden automatically.
 

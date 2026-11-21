@@ -17,6 +17,10 @@ use crate::drivers::{
 };
 use crate::rename::{RenameMatch, detect_renames};
 
+/// Minimum byte length required for exact-OID binary rename matching so tiny placeholder
+/// blobs are not falsely paired across unrelated paths.
+const MIN_EXACT_BINARY_BYTES: usize = 16;
+
 /// Result of a full 3-way repository tree merge.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TreeMergeOutcome {
@@ -205,7 +209,7 @@ pub fn merge_trees_3way(
             continue;
         }
 
-        if base_files.contains_key(old_path) {
+        if let Some(base_entry) = base_files.get(old_path) {
             if let Some(right_old) = right_files.remove(old_path) {
                 right_files.insert(rm.new_path.clone(), right_old);
 
@@ -214,6 +218,37 @@ pub fn merge_trees_3way(
                 }
 
                 renames_applied.push(rm.clone());
+            } else {
+                // Rename/delete conflict: left renamed `old_path -> new_path` while right deleted `old_path`.
+                let base_oid = Some(base_entry.blob_id);
+                let left_oid = left_files.get(&rm.new_path).map(|e| e.blob_id);
+                let blob_merge = Merge {
+                    removes: vec![base_oid],
+                    adds: vec![left_oid, None],
+                };
+                let symbol = Some("rename/delete".to_string());
+                let cid = ConflictRecord::compute_id(old_path, symbol.as_deref(), &blob_merge);
+                let mut intents = BTreeMap::new();
+                intents.insert(left_agent_id.to_string(), left_intent.to_string());
+                intents.insert(right_agent_id.to_string(), right_intent.to_string());
+
+                conflicts.push(ConflictRecord {
+                    id: cid,
+                    path: old_path.clone(),
+                    symbol,
+                    kind: ConflictKind::DeleteModify,
+                    merge: blob_merge,
+                    agent_intents: intents,
+                    base_snippet: format!("original path: {old_path}"),
+                    left_snippet: format!("renamed to: {}", rm.new_path),
+                    right_snippet: "<deleted>".to_string(),
+                    diagnostics: Some(format!(
+                        "Rename/delete conflict: '{old_path}' renamed to '{}' while deleted on the other side",
+                        rm.new_path
+                    )),
+                    created_at_ms: now_millis(),
+                });
+                effective_base.remove(old_path);
             }
         }
     }
@@ -228,7 +263,7 @@ pub fn merge_trees_3way(
             continue;
         }
 
-        if base_files.contains_key(old_path) {
+        if let Some(base_entry) = base_files.get(old_path) {
             if let Some(left_old) = left_files.remove(old_path) {
                 left_files.insert(rm.new_path.clone(), left_old);
 
@@ -237,6 +272,37 @@ pub fn merge_trees_3way(
                 }
 
                 renames_applied.push(rm.clone());
+            } else {
+                // Rename/delete conflict: right renamed `old_path -> new_path` while left deleted `old_path`.
+                let base_oid = Some(base_entry.blob_id);
+                let right_oid = right_files.get(&rm.new_path).map(|e| e.blob_id);
+                let blob_merge = Merge {
+                    removes: vec![base_oid],
+                    adds: vec![None, right_oid],
+                };
+                let symbol = Some("rename/delete".to_string());
+                let cid = ConflictRecord::compute_id(old_path, symbol.as_deref(), &blob_merge);
+                let mut intents = BTreeMap::new();
+                intents.insert(left_agent_id.to_string(), left_intent.to_string());
+                intents.insert(right_agent_id.to_string(), right_intent.to_string());
+
+                conflicts.push(ConflictRecord {
+                    id: cid,
+                    path: old_path.clone(),
+                    symbol,
+                    kind: ConflictKind::DeleteModify,
+                    merge: blob_merge,
+                    agent_intents: intents,
+                    base_snippet: format!("original path: {old_path}"),
+                    left_snippet: "<deleted>".to_string(),
+                    right_snippet: format!("renamed to: {}", rm.new_path),
+                    diagnostics: Some(format!(
+                        "Rename/delete conflict: '{old_path}' renamed to '{}' while deleted on the other side",
+                        rm.new_path
+                    )),
+                    created_at_ms: now_millis(),
+                });
+                effective_base.remove(old_path);
             }
         }
     }
@@ -898,7 +964,11 @@ fn find_side_renames(
             continue;
         }
 
-        if !is_binary_bytes(&sample_bytes) {
+        if is_binary_bytes(&sample_bytes) {
+            if sample_bytes.len() < MIN_EXACT_BINARY_BYTES {
+                continue;
+            }
+        } else {
             let token_count = std::str::from_utf8(&sample_bytes)
                 .map(|s| s.split_whitespace().take(3).count())
                 .unwrap_or(0);
@@ -1595,5 +1665,253 @@ mod tests {
             outcome_ra.merged_files.get("src/a.rs").map(|e| e.blob_id),
             Some(right_edited_a)
         );
+    }
+
+    #[test]
+    fn rename_vs_delete_records_conflict_while_clean_rename_succeeds() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let git = GitBackend::init_or_open(tmp.path()).expect("init git");
+
+        let keep_blob = git
+            .write_blob(b"pub fn keep() -> i32 { 1 }\n")
+            .expect("keep");
+        let keep_edited = git
+            .write_blob(b"pub fn keep() -> i32 { 2 }\n")
+            .expect("keep edited");
+        let orig_blob = git
+            .write_blob(b"pub fn alpha(x: i32) -> i32 {\n    x + 1\n}\n")
+            .expect("orig");
+
+        let mut base_map = BTreeMap::new();
+        base_map.insert(
+            "src/keep.rs".to_string(),
+            FileEntry::regular(keep_blob, false),
+        );
+        base_map.insert(
+            "src/old.rs".to_string(),
+            FileEntry::regular(orig_blob, false),
+        );
+
+        let mut left_renamed = BTreeMap::new();
+        left_renamed.insert(
+            "src/keep.rs".to_string(),
+            FileEntry::regular(keep_blob, false),
+        );
+        left_renamed.insert(
+            "src/new.rs".to_string(),
+            FileEntry::regular(orig_blob, false),
+        );
+
+        let mut right_deleted = BTreeMap::new();
+        right_deleted.insert(
+            "src/keep.rs".to_string(),
+            FileEntry::regular(keep_blob, false),
+        );
+
+        let base_tree = git.write_tree_from_map(&base_map).expect("base");
+        let left_tree = git.write_tree_from_map(&left_renamed).expect("left");
+        let right_tree = git.write_tree_from_map(&right_deleted).expect("right");
+
+        // Left renames src/old.rs -> src/new.rs while right explicitly deletes src/old.rs.
+        let outcome_lr = merge_trees_3way(
+            &git,
+            &base_tree,
+            &left_tree,
+            &right_tree,
+            "agent-rename",
+            "rename old -> new",
+            "agent-delete",
+            "delete old",
+        )
+        .expect("merge left rename vs right delete");
+
+        assert_eq!(outcome_lr.conflicts.len(), 1);
+        assert_eq!(outcome_lr.conflicts[0].path, "src/old.rs");
+        assert_eq!(
+            outcome_lr.conflicts[0].symbol.as_deref(),
+            Some("rename/delete")
+        );
+        assert!(
+            outcome_lr.conflicts[0]
+                .diagnostics
+                .as_deref()
+                .is_some_and(|d| d.contains("Rename/delete conflict"))
+        );
+        assert!(outcome_lr.merged_files.contains_key("src/new.rs"));
+
+        // Symmetric case: left explicitly deletes src/old.rs while right renames src/old.rs -> src/new.rs.
+        let outcome_rl = merge_trees_3way(
+            &git,
+            &base_tree,
+            &right_tree,
+            &left_tree,
+            "agent-delete",
+            "delete old",
+            "agent-rename",
+            "rename old -> new",
+        )
+        .expect("merge left delete vs right rename");
+
+        assert_eq!(outcome_rl.conflicts.len(), 1);
+        assert_eq!(outcome_rl.conflicts[0].path, "src/old.rs");
+        assert_eq!(
+            outcome_rl.conflicts[0].symbol.as_deref(),
+            Some("rename/delete")
+        );
+        assert!(
+            outcome_rl.conflicts[0]
+                .diagnostics
+                .as_deref()
+                .is_some_and(|d| d.contains("Rename/delete conflict"))
+        );
+        assert!(outcome_rl.merged_files.contains_key("src/new.rs"));
+
+        // Clean rename: right keeps src/old.rs untouched and only edits src/keep.rs.
+        let mut right_untouched_old = BTreeMap::new();
+        right_untouched_old.insert(
+            "src/keep.rs".to_string(),
+            FileEntry::regular(keep_edited, false),
+        );
+        right_untouched_old.insert(
+            "src/old.rs".to_string(),
+            FileEntry::regular(orig_blob, false),
+        );
+        let right_clean_tree = git
+            .write_tree_from_map(&right_untouched_old)
+            .expect("right clean");
+
+        let outcome_clean = merge_trees_3way(
+            &git,
+            &base_tree,
+            &left_tree,
+            &right_clean_tree,
+            "agent-rename",
+            "rename old -> new",
+            "agent-keep",
+            "edit keep",
+        )
+        .expect("merge clean rename");
+
+        assert!(outcome_clean.conflicts.is_empty());
+        assert_eq!(outcome_clean.renames_applied.len(), 1);
+        assert!(!outcome_clean.merged_files.contains_key("src/old.rs"));
+        assert!(outcome_clean.merged_files.contains_key("src/new.rs"));
+    }
+
+    #[test]
+    fn tiny_binary_placeholders_are_not_paired_as_exact_renames() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let git = GitBackend::init_or_open(tmp.path()).expect("init git");
+
+        let keep_blob = git
+            .write_blob(b"pub fn keep() -> i32 { 1 }\n")
+            .expect("keep");
+        let keep_edited = git
+            .write_blob(b"pub fn keep() -> i32 { 2 }\n")
+            .expect("keep edited");
+        let tiny_bin = git.write_blob(b"\x00\x01\x02\x03").expect("tiny bin");
+        let large_bin = git
+            .write_blob(b"\x89PNG\r\n\x1a\n0123456789abcdef")
+            .expect("large bin");
+
+        let mut base_map = BTreeMap::new();
+        base_map.insert(
+            "src/keep.rs".to_string(),
+            FileEntry::regular(keep_blob, false),
+        );
+        base_map.insert(
+            "assets/old.bin".to_string(),
+            FileEntry::regular(tiny_bin, false),
+        );
+
+        let mut left_map = BTreeMap::new();
+        left_map.insert(
+            "src/keep.rs".to_string(),
+            FileEntry::regular(keep_blob, false),
+        );
+        left_map.insert(
+            "assets/new.bin".to_string(),
+            FileEntry::regular(tiny_bin, false),
+        );
+
+        let mut right_map = BTreeMap::new();
+        right_map.insert(
+            "src/keep.rs".to_string(),
+            FileEntry::regular(keep_edited, false),
+        );
+        right_map.insert(
+            "assets/old.bin".to_string(),
+            FileEntry::regular(tiny_bin, false),
+        );
+
+        let base_tree = git.write_tree_from_map(&base_map).expect("base");
+        let left_tree = git.write_tree_from_map(&left_map).expect("left");
+        let right_tree = git.write_tree_from_map(&right_map).expect("right");
+
+        let outcome_tiny = merge_trees_3way(
+            &git,
+            &base_tree,
+            &left_tree,
+            &right_tree,
+            "a",
+            "replace tiny placeholder",
+            "b",
+            "edit keep",
+        )
+        .expect("merge tiny bin");
+
+        assert!(
+            outcome_tiny.renames_applied.is_empty(),
+            "tiny <16-byte binary placeholder must not be paired as a rename"
+        );
+
+        let mut base_large = BTreeMap::new();
+        base_large.insert(
+            "src/keep.rs".to_string(),
+            FileEntry::regular(keep_blob, false),
+        );
+        base_large.insert(
+            "assets/logo_old.png".to_string(),
+            FileEntry::regular(large_bin, false),
+        );
+
+        let mut left_large = BTreeMap::new();
+        left_large.insert(
+            "src/keep.rs".to_string(),
+            FileEntry::regular(keep_blob, false),
+        );
+        left_large.insert(
+            "assets/logo_new.png".to_string(),
+            FileEntry::regular(large_bin, false),
+        );
+
+        let mut right_large = BTreeMap::new();
+        right_large.insert(
+            "src/keep.rs".to_string(),
+            FileEntry::regular(keep_edited, false),
+        );
+        right_large.insert(
+            "assets/logo_old.png".to_string(),
+            FileEntry::regular(large_bin, false),
+        );
+
+        let base_large_tree = git.write_tree_from_map(&base_large).expect("base large");
+        let left_large_tree = git.write_tree_from_map(&left_large).expect("left large");
+        let right_large_tree = git.write_tree_from_map(&right_large).expect("right large");
+
+        let outcome_large = merge_trees_3way(
+            &git,
+            &base_large_tree,
+            &left_large_tree,
+            &right_large_tree,
+            "a",
+            "move logo",
+            "b",
+            "edit keep",
+        )
+        .expect("merge large bin");
+
+        assert_eq!(outcome_large.renames_applied.len(), 1);
+        assert!(outcome_large.conflicts.is_empty());
     }
 }

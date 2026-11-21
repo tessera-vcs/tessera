@@ -86,7 +86,7 @@ Open a new terminal tab (or reload your shell profile) to activate the prompt in
 | **Elvish** (`--elvish`) | Yes | No | Use `tes exec [-b <branch>] -- <cmd>` |
 
 > [!INFO]
-> Environment variables (`TES_PORT`, `PORT` when `port_isolation = true`, `TES_BRANCH`, `TES_DB_NAME`, and locally configured `DATABASE_URL`) work cross-platform across macOS, Linux, BSD, and Windows. Executable CLI port-wrapper shims (`TES_SHIM_BIN`) are POSIX-only (macOS, Linux, BSD, and WSL).
+> `tes env` exports `TES_BRANCH` and `TES_PORT` across all supported shells (including PowerShell and Elvish), while automatic `PORT` and framework port variable export in shell hooks applies to POSIX (`zsh`, `bash`, `sh`), Fish, `tcsh`, and Nushell. On Windows (or in Elvish), use `tes exec [-b <branch>] -- <cmd>` for isolated `PORT`, framework port variables, `TES_DB_NAME`, and locally configured `DATABASE_URL`. Executable CLI port-wrapper shims (`TES_SHIM_BIN`) are POSIX-only (macOS, Linux, BSD, and WSL).
 
 ### Manual Shell Setup
 
@@ -211,7 +211,7 @@ Remove-Item -Force "$HOME\.local\bin\tes.exe"
 
 ### 3. Clean Up Repository State (Optional)
 
-Inside any repository where you ran `tes init`, Tessera stores its metadata and sandboxes in `.git/tessera` (and Git hooks that automatically no-op when `tes` is not installed). To remove the local Tessera state from a repository, delete `.git/tessera`.
+Inside any repository where you ran `tes init`, Tessera stores repository metadata in `.git/tessera` (plus Git hooks that automatically no-op when `tes` is not installed), while branch Copy-on-Write sandboxes live in the OS cache directory (`~/Library/Caches/tessera/workspaces/` on macOS, `~/.cache/tessera/workspaces/` or `/var/tmp/tessera-workspaces-<uid>/` on Linux, and `%LOCALAPPDATA%\tessera\workspaces\` on Windows). To remove local Tessera state completely, delete `.git/tessera` inside the repository and remove the corresponding workspace cache directory.
 
 ---
 
