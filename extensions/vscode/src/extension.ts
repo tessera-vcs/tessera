@@ -3,13 +3,16 @@
  * Registers tree views, status bar items, editor decorations, and command handlers.
  */
 
-import { execFileSync } from "child_process";
+import { execFile } from "child_process";
 import * as fs from "fs";
 import * as path from "path";
+import { promisify } from "util";
 import * as vscode from "vscode";
 import {
   CliClient,
+  isSyntheticConflictPath,
   isValidRefName,
+  isValidSafeIdentifier,
   resolveConfinedPath,
   WorkspaceStateSnapshot,
 } from "./client";
@@ -26,30 +29,44 @@ import {
 } from "./views";
 import { StateWatcher } from "./watcher";
 
+const execFileAsync = promisify(execFile);
+
 /**
- * Collects `startPid` and up to 6 ancestor PIDs (stopping before `stopPid` or PID <= 1)
- * for integrated terminal matching.
+ * Collects `startPid` and up to 6 ancestor PIDs asynchronously (stopping before `stopPid`
+ * or PID <= 1) for integrated terminal matching without blocking the extension host thread.
  *
  * @param startPid The starting process ID (typically the shell PID).
  * @param stopPid Optional ancestor PID at which traversal should stop.
  * @returns A set of collected ancestor process IDs.
  */
-function collectAncestorPids(
-  startPid: number | null | undefined,
-  stopPid?: number | null
-): Set<number> {
+async function collectAncestorPids(
+  startPid: unknown,
+  stopPid?: unknown
+): Promise<Set<number>> {
   const pids = new Set<number>();
 
-  if (startPid === undefined || startPid === null || startPid <= 1) {
+  if (
+    typeof startPid !== "number" ||
+    !Number.isSafeInteger(startPid) ||
+    startPid <= 1
+  ) {
     return pids;
   }
+
+  const validStopPid =
+    typeof stopPid === "number" &&
+    Number.isSafeInteger(stopPid) &&
+    stopPid > 1
+      ? stopPid
+      : undefined;
 
   let curr = startPid;
 
   for (let i = 0; i < 6; i++) {
     if (
+      !Number.isSafeInteger(curr) ||
       curr <= 1 ||
-      (stopPid !== undefined && stopPid !== null && curr === stopPid)
+      (validStopPid !== undefined && curr === validStopPid)
     ) {
       break;
     }
@@ -57,8 +74,10 @@ function collectAncestorPids(
     pids.add(curr);
 
     try {
+      let stdout: string;
+
       if (process.platform === "win32") {
-        const out = execFileSync(
+        const res = await execFileAsync(
           "powershell",
           [
             "-NoProfile",
@@ -66,28 +85,28 @@ function collectAncestorPids(
             "-Command",
             `(Get-CimInstance Win32_Process -Filter 'ProcessId = ${curr}').ParentProcessId`,
           ],
-          { encoding: "utf8", timeout: 800 }
-        ).trim();
-        const next = Number.parseInt(out, 10);
-
-        if (Number.isNaN(next) || next <= 1 || next === curr) {
-          break;
-        }
-
-        curr = next;
+          { encoding: "utf8", timeout: 800, windowsHide: true }
+        );
+        stdout = res.stdout.trim();
       } else {
-        const out = execFileSync("ps", ["-o", "ppid=", "-p", String(curr)], {
+        const res = await execFileAsync("ps", ["-o", "ppid=", "-p", String(curr)], {
           encoding: "utf8",
           timeout: 500,
-        }).trim();
-        const next = Number.parseInt(out, 10);
-
-        if (Number.isNaN(next) || next <= 1 || next === curr) {
-          break;
-        }
-
-        curr = next;
+        });
+        stdout = res.stdout.trim();
       }
+
+      if (!/^\d+$/.test(stdout)) {
+        break;
+      }
+
+      const next = Number.parseInt(stdout, 10);
+
+      if (!Number.isSafeInteger(next) || next <= 1 || next === curr) {
+        break;
+      }
+
+      curr = next;
     } catch {
       break;
     }
@@ -101,24 +120,33 @@ interface SessionTerminalLink extends vscode.TerminalLink {
 }
 
 const SESSION_ID_LINK_PATTERN =
-  /\b(?:antigravity|claude|codex|cursor|windsurf|kiro|opencode|copilot|term|session|mcp)-[a-z0-9][a-z0-9_-]{2,63}\b/g;
+  /(?<![A-Za-z0-9_-])(?:antigravity|claude|codex|cursor|windsurf|kiro|opencode|copilot|gemini|aider|amp|goose|augment|term|session|mcp)-(?:\d{2,10}|(?=[0-9a-f_-]*\d)[0-9a-f][0-9a-f_-]{3,63})(?![A-Za-z0-9_-])/g;
 
 /**
- * Returns true if `text` still contains standard Git conflict markers (`<<<<<<<`, `=======`, `>>>>>>>`).
+ * Returns true if `ch` is a session/identifier character (`[A-Za-z0-9_-]`).
+ *
+ * @param ch A single character from the terminal line, or `undefined` at string boundaries.
+ * @returns True if `ch` is part of an identifier token.
+ */
+function isIdentifierChar(ch: string | undefined): boolean {
+  return ch !== undefined && /[A-Za-z0-9_-]/.test(ch);
+}
+
+/**
+ * Returns true if `text` contains any standard or leftover Git/diff3 conflict markers
+ * (`<<<<<<<`, `=======`, `>>>>>>>`, `|||||||`).
  *
  * @param text The document text content to inspect.
- * @returns True if a complete Git conflict marker block is present.
+ * @returns True if any conflict marker line is present.
  */
 function hasGitConflictMarkers(text: string): boolean {
-  let hasOpen = false;
-  let hasSep = false;
-
   for (const line of text.split(/\r?\n/)) {
-    if (line.startsWith("<<<<<<< ")) {
-      hasOpen = true;
-    } else if (hasOpen && line === "=======") {
-      hasSep = true;
-    } else if (hasOpen && hasSep && line.startsWith(">>>>>>> ")) {
+    if (
+      /^<{7}(?:\s|$)/.test(line) ||
+      /^={7}$/.test(line) ||
+      /^>{7}(?:\s|$)/.test(line) ||
+      /^\|{7}(?:\s|$)/.test(line)
+    ) {
       return true;
     }
   }
@@ -127,35 +155,189 @@ function hasGitConflictMarkers(text: string): boolean {
 }
 
 /**
+ * Formats a shell command to invoke `tes switch -- <branch>` cleanly across
+ * Windows `cmd.exe`, PowerShell, Fish, and POSIX shells.
+ *
+ * @param binPath The resolved `tes` executable path or binary name.
+ * @param branch The validated Git branch name.
+ * @returns A shell-safe command line string for `Terminal.sendText`.
+ */
+function formatSwitchTerminalCommand(binPath: string, branch: string): string {
+  const shellLower = (vscode.env.shell || "").toLowerCase();
+
+  if (process.platform === "win32") {
+    if (shellLower.endsWith("cmd.exe") || shellLower.endsWith("cmd")) {
+      const cmdBin =
+        binPath === "tes" ? "tes" : `"${binPath.replace(/"/g, '""')}"`;
+      return `${cmdBin} switch -- "${branch}"`;
+    }
+
+    if (
+      shellLower.includes("bash") ||
+      shellLower.includes("zsh") ||
+      shellLower.endsWith("sh.exe")
+    ) {
+      const posixBin =
+        binPath === "tes"
+          ? "tes"
+          : `'${binPath.replace(/'/g, "'\\''")}'`;
+      const posixBranch = `'${branch.replace(/'/g, "'\\''")}'`;
+      return `${posixBin} switch -- ${posixBranch}`;
+    }
+
+    const psBin =
+      binPath === "tes" ? "tes" : `& '${binPath.replace(/'/g, "''")}'`;
+    const psBranch = `'${branch.replace(/'/g, "''")}'`;
+    return `${psBin} switch -- ${psBranch}`;
+  }
+
+  if (shellLower.endsWith("fish")) {
+    const fishBin =
+      binPath === "tes"
+        ? "tes"
+        : `'${binPath.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}'`;
+    const fishBranch = `'${branch.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}'`;
+    return `${fishBin} switch -- ${fishBranch}`;
+  }
+
+  const posixBin =
+    binPath === "tes" ? "tes" : `'${binPath.replace(/'/g, "'\\''")}'`;
+  const posixBranch = `'${branch.replace(/'/g, "'\\''")}'`;
+  return `${posixBin} switch -- ${posixBranch}`;
+}
+
+/**
+ * Formats an unknown error value into a concise single-line message and detailed log string.
+ *
+ * @param err The caught error object.
+ * @returns Tuple of `[conciseMessage, detailedLogMessage]`.
+ */
+function formatErrorDetails(err: unknown): readonly [string, string] {
+  if (typeof err === "object" && err !== null) {
+    const rec = err as { readonly message?: unknown; readonly stderr?: unknown };
+    const stderr =
+      typeof rec.stderr === "string" ? rec.stderr.trim() : "";
+    const msg =
+      typeof rec.message === "string" ? rec.message.trim() : String(err);
+    const concise = stderr || msg;
+    const detail = stderr && stderr !== msg ? `${msg}\n${stderr}` : msg;
+    return [concise, detail] as const;
+  }
+
+  const text = String(err);
+  return [text, text] as const;
+}
+
+/**
+ * Selects the primary workspace folder to bind, preferring the first folder initialized with Tessera.
+ *
+ * @returns The selected `WorkspaceFolder`, or `undefined` when no folder is open.
+ */
+function pickPrimaryWorkspaceFolder(): vscode.WorkspaceFolder | undefined {
+  const folders = vscode.workspace.workspaceFolders;
+
+  if (!folders || folders.length === 0) {
+    return undefined;
+  }
+
+  for (const folder of folders) {
+    if (new CliClient(folder.uri.fsPath).isInitialized()) {
+      return folder;
+    }
+  }
+
+  return folders[0];
+}
+
+let activeWorkspaceCleanup: (() => void) | undefined;
+
+/**
  * Activates the multi-agent and branch control extension.
  *
  * @param context The VS Code extension context used to register disposables.
  */
 export function activate(context: vscode.ExtensionContext): void {
+  const outputChannel = vscode.window.createOutputChannel("Tessera");
   const statusBar = new StatusBarController();
-  context.subscriptions.push(statusBar);
-
-  const folder = vscode.workspace.workspaceFolders?.[0];
-
-  if (!folder) {
-    return;
-  }
-
-  const client = new CliClient(folder.uri.fsPath);
-  const repoRoot = client.getRepoRoot();
-  const watcher = new StateWatcher(repoRoot);
-
   const branchesProvider = new BranchesTreeProvider();
   const sessionsProvider = new SessionsTreeProvider();
   const conflictsProvider = new ConflictsAndCheckpointsTreeProvider();
-  const contentProvider = new BranchContentProvider(client);
-  const decorationController = new AgentDecorationController(repoRoot);
 
-  let latestSnapshot: WorkspaceStateSnapshot | undefined;
-  const revealedConflicts = new Set<string>();
+  context.subscriptions.push(
+    outputChannel,
+    statusBar,
+    branchesProvider,
+    sessionsProvider,
+    conflictsProvider,
+    vscode.window.registerTreeDataProvider("branches", branchesProvider),
+    vscode.window.registerTreeDataProvider("scmBranches", branchesProvider),
+    vscode.window.registerTreeDataProvider("sessions", sessionsProvider),
+    vscode.window.registerTreeDataProvider("conflicts", conflictsProvider)
+  );
 
   /**
-   * Opens a conflicted file in the editor and positions the cursor at the first `<<<<<<< ` marker.
+   * Logs an error with timestamp and stderr details to the Tessera output channel.
+   *
+   * @param scope The operation or component where the error occurred.
+   * @param err The caught error object.
+   * @returns A concise user-facing error message.
+   */
+  const logError = (scope: string, err: unknown): string => {
+    const [concise, detail] = formatErrorDetails(err);
+    outputChannel.appendLine(`[${new Date().toISOString()}] ${scope}: ${detail}`);
+    return concise;
+  };
+
+  let client: CliClient | undefined;
+  let repoRoot = "";
+  let contentProvider: BranchContentProvider | undefined;
+  let decorationController: AgentDecorationController | undefined;
+  let latestSnapshot: WorkspaceStateSnapshot | undefined;
+  const revealedConflicts = new Set<string>();
+  const workspaceDisposables: vscode.Disposable[] = [];
+  let isRefreshing = false;
+  let refreshQueued = false;
+
+  /**
+   * Clears all UI surfaces when the workspace is untrusted, closed, or uninitialized.
+   */
+  const clearAllViews = (): void => {
+    latestSnapshot = undefined;
+    revealedConflicts.clear();
+    branchesProvider.setSnapshot(undefined);
+    sessionsProvider.setSnapshot(undefined);
+    conflictsProvider.setSnapshot(undefined);
+    decorationController?.setSnapshot(undefined);
+    statusBar.hide();
+  };
+
+  /**
+   * Disposes all workspace-scoped watchers, providers, and open webview panels.
+   */
+  const disposeWorkspaceBindings = (): void => {
+    VisualGraphPanel.disposeCurrent();
+    ConflictStudioPanel.disposeCurrent();
+
+    while (workspaceDisposables.length > 0) {
+      const d = workspaceDisposables.pop();
+
+      if (d) {
+        d.dispose();
+      }
+    }
+
+    contentProvider = undefined;
+    decorationController = undefined;
+    client = undefined;
+    repoRoot = "";
+    clearAllViews();
+  };
+
+  activeWorkspaceCleanup = disposeWorkspaceBindings;
+  context.subscriptions.push({ dispose: disposeWorkspaceBindings });
+
+  /**
+   * Opens a conflicted file in the editor and positions the cursor at the first `<<<<<<<` marker.
    *
    * @param relPath The repository-relative path of the conflicted file.
    * @returns True if the file was found and opened in the editor.
@@ -163,7 +345,7 @@ export function activate(context: vscode.ExtensionContext): void {
   const openConflictedFileInEditor = async (
     relPath: string
   ): Promise<boolean> => {
-    if (!relPath || relPath === "<speculative-verify>") {
+    if (!repoRoot || !relPath || isSyntheticConflictPath(relPath)) {
       return false;
     }
 
@@ -186,7 +368,7 @@ export function activate(context: vscode.ExtensionContext): void {
       let conflictLine = 0;
 
       for (let i = 0; i < doc.lineCount; i++) {
-        if (doc.lineAt(i).text.startsWith("<<<<<<< ")) {
+        if (doc.lineAt(i).text.startsWith("<<<<<<<")) {
           conflictLine = i;
           break;
         }
@@ -199,36 +381,22 @@ export function activate(context: vscode.ExtensionContext): void {
       });
 
       return true;
-    } catch {
+    } catch (err: unknown) {
+      logError(`openConflictedFileInEditor(${relPath})`, err);
       return false;
     }
   };
 
-  context.subscriptions.push(
-    watcher,
-    decorationController,
-    vscode.languages.registerCodeLensProvider(
-      { scheme: "file" },
-      decorationController
-    ),
-    vscode.workspace.registerTextDocumentContentProvider(
-      BranchContentProvider.scheme,
-      contentProvider
-    ),
-    vscode.window.registerTreeDataProvider("branches", branchesProvider),
-    vscode.window.registerTreeDataProvider("scmBranches", branchesProvider),
-    vscode.window.registerTreeDataProvider("sessions", sessionsProvider),
-    vscode.window.registerTreeDataProvider("conflicts", conflictsProvider)
-  );
-
-  let isRefreshing = false;
-  let refreshQueued = false;
-
   /**
-   * Fetches the latest repository state snapshot and refreshes all views, decorations, and webviews.
-   * Coalesces concurrent refresh triggers so at most one snapshot batch runs at a time.
+   * Fetches the latest repository state snapshot and refreshes all views, decorations,
+   * open virtual diffs, and webviews. Coalesces concurrent triggers.
    */
   const refreshAll = async (): Promise<void> => {
+    if (!vscode.workspace.isTrusted || !client) {
+      clearAllViews();
+      return;
+    }
+
     if (isRefreshing) {
       refreshQueued = true;
       return;
@@ -239,27 +407,28 @@ export function activate(context: vscode.ExtensionContext): void {
     try {
       do {
         refreshQueued = false;
+        const activeClient: CliClient | undefined = client;
 
-        if (!client.isInitialized()) {
-          latestSnapshot = undefined;
-          revealedConflicts.clear();
-          branchesProvider.setSnapshot(undefined);
-          sessionsProvider.setSnapshot(undefined);
-          conflictsProvider.setSnapshot(undefined);
-          decorationController.setSnapshot(undefined);
-          statusBar.hide();
+        if (!activeClient || !activeClient.isInitialized()) {
+          clearAllViews();
           return;
         }
 
         try {
-          const snapshot = await client.fetchSnapshot();
+          const snapshot = await activeClient.fetchSnapshot();
+
+          if (client !== activeClient) {
+            return;
+          }
+
           latestSnapshot = snapshot;
 
           branchesProvider.setSnapshot(snapshot);
           sessionsProvider.setSnapshot(snapshot);
           conflictsProvider.setSnapshot(snapshot);
-          decorationController.setSnapshot(snapshot);
+          decorationController?.setSnapshot(snapshot);
           statusBar.update(snapshot);
+          contentProvider?.notifyDidChange();
           VisualGraphPanel.updateIfVisible(snapshot);
           ConflictStudioPanel.updateIfVisible(snapshot);
 
@@ -279,15 +448,11 @@ export function activate(context: vscode.ExtensionContext): void {
               void openConflictedFileInEditor(c.path);
             }
           }
-        } catch {
-          if (!client.isInitialized()) {
-            latestSnapshot = undefined;
-            revealedConflicts.clear();
-            branchesProvider.setSnapshot(undefined);
-            sessionsProvider.setSnapshot(undefined);
-            conflictsProvider.setSnapshot(undefined);
-            decorationController.setSnapshot(undefined);
-            statusBar.hide();
+        } catch (err: unknown) {
+          logError("refreshAll", err);
+
+          if (!activeClient.isInitialized()) {
+            clearAllViews();
           }
         }
       } while (refreshQueued);
@@ -297,21 +462,130 @@ export function activate(context: vscode.ExtensionContext): void {
   };
 
   /**
+   * Binds watchers, decoration controllers, and virtual content providers to the active workspace folder.
+   */
+  const initializeWorkspace = (): void => {
+    disposeWorkspaceBindings();
+
+    if (!vscode.workspace.isTrusted) {
+      outputChannel.appendLine(
+        `[${new Date().toISOString()}] Tessera paused in Restricted Mode until workspace trust is granted.`
+      );
+      return;
+    }
+
+    const folder = pickPrimaryWorkspaceFolder();
+
+    if (!folder) {
+      return;
+    }
+
+    const nextClient = new CliClient(folder.uri.fsPath);
+    const nextRepoRoot = nextClient.getRepoRoot();
+    const nextWatcher = new StateWatcher(nextRepoRoot);
+    const nextContentProvider = new BranchContentProvider(nextClient, logError);
+    const nextDecorationController = new AgentDecorationController(nextRepoRoot);
+
+    client = nextClient;
+    repoRoot = nextRepoRoot;
+    contentProvider = nextContentProvider;
+    decorationController = nextDecorationController;
+
+    workspaceDisposables.push(
+      nextWatcher,
+      nextContentProvider,
+      nextDecorationController,
+      nextWatcher.onDidChange(() => {
+        void refreshAll();
+      }),
+      vscode.languages.registerCodeLensProvider(
+        { scheme: "file" },
+        nextDecorationController
+      ),
+      vscode.workspace.registerTextDocumentContentProvider(
+        BranchContentProvider.scheme,
+        nextContentProvider
+      )
+    );
+
+    void refreshAll();
+  };
+
+  /**
+   * Ensures the workspace is trusted and bound to a `CliClient` before running a command.
+   *
+   * @returns The active `CliClient`, or `undefined` after showing a user notification.
+   */
+  const requireTrustedClient = (): CliClient | undefined => {
+    if (!vscode.workspace.isTrusted) {
+      void vscode.window.showWarningMessage(
+        "Tessera is disabled in Restricted Mode. Trust this workspace to run Tessera commands."
+      );
+      return undefined;
+    }
+
+    if (!client) {
+      void vscode.window.showWarningMessage(
+        "Open a workspace folder to use Tessera."
+      );
+      return undefined;
+    }
+
+    return client;
+  };
+
+  /**
    * Switches the active editor working tree to `branch` and refreshes all UI surfaces.
    *
    * @param branch The target branch name.
    */
   const switchEditorBranch = async (branch: string): Promise<void> => {
-    await client.switchEditorBranch(branch);
+    const activeClient = requireTrustedClient();
+
+    if (!activeClient) {
+      return;
+    }
+
+    await activeClient.switchEditorBranch(branch);
     await refreshAll();
   };
 
+  /**
+   * Registers a command handler wrapped in standardized error logging and user notification.
+   *
+   * @param commandId The VS Code command identifier.
+   * @param handler The async or sync command callback.
+   * @returns A disposable for the command registration.
+   */
+  const registerSafeCommand = <TArgs extends unknown[]>(
+    commandId: string,
+    handler: (...args: TArgs) => Promise<void> | void
+  ): vscode.Disposable =>
+    vscode.commands.registerCommand(commandId, async (...args: TArgs) => {
+      try {
+        await handler(...args);
+      } catch (err: unknown) {
+        const message = logError(commandId, err);
+        void vscode.window.showErrorMessage(`Tessera: ${message}`);
+      }
+    });
+
   context.subscriptions.push(
-    watcher.onDidChange(() => {
-      void refreshAll();
+    vscode.workspace.onDidGrantWorkspaceTrust(() => {
+      initializeWorkspace();
+    }),
+    vscode.workspace.onDidChangeWorkspaceFolders(() => {
+      initializeWorkspace();
     }),
     vscode.workspace.onDidSaveTextDocument(async (doc) => {
-      if (!latestSnapshot || latestSnapshot.conflicts.length === 0) {
+      if (
+        !vscode.workspace.isTrusted ||
+        !client ||
+        !repoRoot ||
+        !latestSnapshot ||
+        latestSnapshot.conflicts.length === 0 ||
+        doc.uri.scheme !== "file"
+      ) {
         return;
       }
 
@@ -327,21 +601,31 @@ export function activate(context: vscode.ExtensionContext): void {
         try {
           await client.resolveConflict(relPath, "working");
           await refreshAll();
-        } catch {
-          // Ignore if already resolved concurrently
+        } catch (err: unknown) {
+          logError(`onDidSaveTextDocument.resolveConflict(${relPath})`, err);
         }
       }
     })
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand("tes.refresh", async () => {
+    registerSafeCommand("tes.refresh", async () => {
+      if (!requireTrustedClient()) {
+        return;
+      }
+
       await refreshAll();
     }),
 
-    vscode.commands.registerCommand(
+    registerSafeCommand(
       "tes.switchEditorBranch",
       async (arg?: string | SidebarNode) => {
+        const activeClient = requireTrustedClient();
+
+        if (!activeClient) {
+          return;
+        }
+
         const directBranch =
           typeof arg === "string"
             ? arg
@@ -354,7 +638,7 @@ export function activate(context: vscode.ExtensionContext): void {
           return;
         }
 
-        const snap = await client.fetchSnapshot();
+        const snap = await activeClient.fetchSnapshot();
         latestSnapshot = snap;
         statusBar.update(snap);
 
@@ -385,23 +669,50 @@ export function activate(context: vscode.ExtensionContext): void {
       }
     ),
 
-    vscode.commands.registerCommand("tes.createBranch", async () => {
+    registerSafeCommand("tes.createBranch", async () => {
+      const activeClient = requireTrustedClient();
+
+      if (!activeClient) {
+        return;
+      }
+
       const name = await vscode.window.showInputBox({
         prompt: "New branch name",
         placeHolder: "feature/my-branch",
+        validateInput: (val) => {
+          const trimmed = val.trim();
+
+          if (!trimmed) {
+            return "Branch name cannot be empty.";
+          }
+
+          if (!isValidRefName(trimmed)) {
+            return "Invalid Git branch name.";
+          }
+
+          return undefined;
+        },
       });
 
       if (!name || !name.trim()) {
         return;
       }
 
-      await switchEditorBranch(name.trim());
+      await activeClient.createBranch(name.trim());
+      await refreshAll();
     }),
 
-    vscode.commands.registerCommand(
+    registerSafeCommand(
       "tes.mergeBranch",
       async (arg?: string | SidebarNode) => {
-        const snap = latestSnapshot ?? (await client.fetchSnapshot());
+        const activeClient = requireTrustedClient();
+
+        if (!activeClient) {
+          return;
+        }
+
+        const snap = latestSnapshot ?? (await activeClient.fetchSnapshot());
+        const trunk = snap.branchReport.trunk_branch || "main";
         let sourceBranch =
           typeof arg === "string"
             ? arg
@@ -411,8 +722,16 @@ export function activate(context: vscode.ExtensionContext): void {
 
         if (!sourceBranch) {
           const candidates = snap.branchReport.branches.filter(
-            (b) => b !== "main"
+            (b) => b !== trunk
           );
+
+          if (candidates.length === 0) {
+            void vscode.window.showInformationMessage(
+              "No non-trunk branches available to merge."
+            );
+            return;
+          }
+
           sourceBranch = await vscode.window.showQuickPick(candidates, {
             placeHolder: "Select branch to merge",
           });
@@ -422,12 +741,32 @@ export function activate(context: vscode.ExtensionContext): void {
           return;
         }
 
-        const targetBranch = await vscode.window.showQuickPick(
-          snap.branchReport.branches,
-          {
-            placeHolder: `Merge '${sourceBranch}' into target branch`,
-          }
+        const targetCandidates = snap.branchReport.branches.filter(
+          (b) => b !== sourceBranch
         );
+
+        if (targetCandidates.length === 0) {
+          void vscode.window.showInformationMessage(
+            `No other branch available as a merge target for '${sourceBranch}'.`
+          );
+          return;
+        }
+
+        const orderedTargets = [...targetCandidates].sort((a, b) => {
+          if (a === trunk) {
+            return -1;
+          }
+
+          if (b === trunk) {
+            return 1;
+          }
+
+          return a.localeCompare(b);
+        });
+
+        const targetBranch = await vscode.window.showQuickPick(orderedTargets, {
+          placeHolder: `Merge '${sourceBranch}' into target branch`,
+        });
 
         if (!targetBranch) {
           return;
@@ -442,130 +781,294 @@ export function activate(context: vscode.ExtensionContext): void {
           return;
         }
 
-        await client.mergeInto([sourceBranch], targetBranch, msg);
+        await activeClient.mergeInto([sourceBranch], targetBranch, msg);
         await refreshAll();
       }
     ),
 
-    vscode.commands.registerCommand(
+    registerSafeCommand(
       "tes.restoreBranch",
       async (arg?: string | SidebarNode) => {
-        const snap = latestSnapshot ?? (await client.fetchSnapshot());
-        const targetBranch =
-          arg instanceof SidebarNode && arg.branchName
-            ? arg.branchName
-            : snap.branchReport.editor_branch;
+        const activeClient = requireTrustedClient();
 
-        if (arg instanceof SidebarNode && arg.checkpointLabel) {
-          await client.restoreBranch(targetBranch, arg.checkpointLabel);
-          await refreshAll();
+        if (!activeClient) {
           return;
         }
 
-        const items: vscode.QuickPickItem[] = [];
+        const snap = latestSnapshot ?? (await activeClient.fetchSnapshot());
+        let targetBranch = snap.branchReport.editor_branch;
+        let selectedRev: string | undefined;
 
-        for (const cp of snap.checkpoints) {
-          items.push({
-            label: cp.label,
-            description: `checkpoint (${cp.opId.slice(0, 8)})`,
+        if (typeof arg === "string" && arg.trim().length > 0) {
+          const trimmedArg = arg.trim();
+
+          if (snap.checkpoints.some((cp) => cp.label === trimmedArg)) {
+            selectedRev = trimmedArg;
+          } else if (snap.branchReport.branches.includes(trimmedArg)) {
+            targetBranch = trimmedArg;
+          } else {
+            selectedRev = trimmedArg;
+          }
+        } else if (arg instanceof SidebarNode) {
+          if (arg.branchName) {
+            targetBranch = arg.branchName;
+          }
+
+          if (arg.checkpointLabel) {
+            selectedRev = arg.checkpointLabel;
+          }
+        }
+
+        if (!selectedRev) {
+          const items: vscode.QuickPickItem[] = [];
+
+          for (const cp of snap.checkpoints) {
+            items.push({
+              label: cp.label,
+              description: `checkpoint (${cp.opId.slice(0, 8)})`,
+            });
+          }
+
+          for (const c of snap.branchReport.commit_graph) {
+            items.push({
+              label: c.short_sha,
+              description: c.subject,
+              detail: `${c.author} · ${c.refs.join(", ")}`,
+            });
+          }
+
+          const picked = await vscode.window.showQuickPick(items, {
+            placeHolder: `Restore '${targetBranch}' to commit or checkpoint`,
           });
+
+          if (!picked) {
+            return;
+          }
+
+          selectedRev = picked.label;
         }
 
-        for (const c of snap.branchReport.commit_graph) {
-          items.push({
-            label: c.short_sha,
-            description: c.subject,
-            detail: `${c.author} · ${c.refs.join(", ")}`,
-          });
+        const choice = await vscode.window.showWarningMessage(
+          `Restore branch '${targetBranch}' to '${selectedRev}'? Uncommitted changes may be overwritten.`,
+          { modal: true },
+          "Restore"
+        );
+
+        if (choice !== "Restore") {
+          return;
         }
 
-        const picked = await vscode.window.showQuickPick(items, {
-          placeHolder: `Restore '${targetBranch}' to commit or checkpoint`,
-        });
-
-        if (picked) {
-          await client.restoreBranch(targetBranch, picked.label);
-          await refreshAll();
-        }
+        await activeClient.restoreBranch(targetBranch, selectedRev);
+        await refreshAll();
       }
     ),
 
-    vscode.commands.registerCommand("tes.createCheckpoint", async () => {
+    registerSafeCommand("tes.createCheckpoint", async () => {
+      const activeClient = requireTrustedClient();
+
+      if (!activeClient) {
+        return;
+      }
+
       const label = await vscode.window.showInputBox({
         prompt: "Checkpoint name",
         placeHolder: "before-refactor",
+        validateInput: (val) => {
+          const trimmed = val.trim();
+
+          if (!trimmed) {
+            return "Checkpoint name cannot be empty.";
+          }
+
+          if (!isValidRefName(trimmed)) {
+            return "Invalid checkpoint name.";
+          }
+
+          return undefined;
+        },
       });
 
       if (!label || !label.trim()) {
         return;
       }
 
-      await client.createCheckpoint(label.trim());
+      await activeClient.createCheckpoint(label.trim());
       await refreshAll();
     }),
 
-    vscode.commands.registerCommand(
+    registerSafeCommand(
       "tes.pushBranch",
       async (arg?: string | SidebarNode) => {
-        const snap = latestSnapshot ?? (await client.fetchSnapshot());
+        const activeClient = requireTrustedClient();
+
+        if (!activeClient) {
+          return;
+        }
+
+        const snap = latestSnapshot ?? (await activeClient.fetchSnapshot());
         const branch =
           typeof arg === "string"
             ? arg
             : arg instanceof SidebarNode && arg.branchName
               ? arg.branchName
               : snap.branchReport.editor_branch;
-        await client.pushBranch(branch);
+
+        await vscode.window.withProgress(
+          {
+            location: vscode.ProgressLocation.Notification,
+            title: `Pushing branch '${branch}' to origin...`,
+            cancellable: false,
+          },
+          async () => {
+            await activeClient.pushBranch(branch);
+          }
+        );
+
+        void vscode.window.showInformationMessage(
+          `Pushed branch '${branch}' to origin.`
+        );
+        await refreshAll();
       }
     ),
 
-    vscode.commands.registerCommand(
+    registerSafeCommand(
       "tes.openBranchTerminal",
       (arg?: string | SidebarNode) => {
+        const activeClient = requireTrustedClient();
+
+        if (!activeClient) {
+          return;
+        }
+
+        const trunk = latestSnapshot?.branchReport.trunk_branch || "main";
         const rawBranch =
           typeof arg === "string"
             ? arg
             : arg instanceof SidebarNode
               ? arg.branchName
-              : latestSnapshot?.branchReport.editor_branch ?? "main";
-        const branch = rawBranch && isValidRefName(rawBranch) ? rawBranch : "main";
-        const quotedBranch = `'${branch.replace(/'/g, "'\\''")}'`;
+              : (latestSnapshot?.branchReport.editor_branch ?? trunk);
+        const branch =
+          rawBranch && isValidRefName(rawBranch) ? rawBranch : trunk;
+        const binPath = activeClient.resolveBinPath();
+        const commandText = formatSwitchTerminalCommand(binPath, branch);
         const term = vscode.window.createTerminal({
           name: branch,
-          cwd: repoRoot,
+          cwd: activeClient.getRepoRoot(),
         });
         term.show();
-        term.sendText(`tes switch -- ${quotedBranch}`);
+        term.sendText(commandText);
       }
     ),
 
-    vscode.commands.registerCommand(
+    registerSafeCommand(
       "tes.openBranchPort",
       async (arg?: number | SidebarNode) => {
-        const port =
-          typeof arg === "number"
-            ? arg
-            : arg instanceof SidebarNode && arg.port !== undefined
-              ? arg.port
-              : 3000;
+        const activeClient = requireTrustedClient();
+
+        if (!activeClient) {
+          return;
+        }
+
+        let port: number | undefined;
+
+        if (
+          typeof arg === "number" &&
+          Number.isInteger(arg) &&
+          arg > 0 &&
+          arg <= 65535
+        ) {
+          port = arg;
+        } else if (
+          arg instanceof SidebarNode &&
+          arg.port !== undefined &&
+          Number.isInteger(arg.port) &&
+          arg.port > 0 &&
+          arg.port <= 65535
+        ) {
+          port = arg.port;
+        } else {
+          const snap = latestSnapshot ?? (await activeClient.fetchSnapshot());
+          const activeDetail =
+            snap.branchReport.branch_details.find((b) => b.is_editor_branch) ??
+            snap.branchReport.branch_details.find(
+              (b) => b.name === snap.branchReport.editor_branch
+            );
+          port = activeDetail?.port;
+        }
+
+        if (!port || !Number.isInteger(port) || port <= 0 || port > 65535) {
+          void vscode.window.showWarningMessage(
+            "No valid dev server port is configured for the active branch."
+          );
+          return;
+        }
+
         await vscode.env.openExternal(
           vscode.Uri.parse(`http://localhost:${port}`)
         );
       }
     ),
 
-    vscode.commands.registerCommand(
+    registerSafeCommand(
       "tes.diffBranchFile",
-      async (branch: string, relPath: string) => {
-        const cleanPath = (relPath.split("::")[0]?.trim() || relPath).replace(
-          /^\/+/,
-          ""
-        );
-        const trunkBranch =
-          latestSnapshot?.branchReport.trunk_branch || "main";
+      async (branch?: string, relPath?: string) => {
+        const activeClient = requireTrustedClient();
 
-        if (branch === trunkBranch) {
+        if (!activeClient) {
+          return;
+        }
+
+        const snap = latestSnapshot ?? (await activeClient.fetchSnapshot());
+        const trunkBranch = snap.branchReport.trunk_branch || "main";
+        const targetBranch =
+          typeof branch === "string" && branch.trim().length > 0
+            ? branch.trim()
+            : snap.branchReport.editor_branch;
+
+        let targetRelPath =
+          typeof relPath === "string" && relPath.trim().length > 0
+            ? relPath
+            : undefined;
+
+        if (!targetRelPath && vscode.window.activeTextEditor) {
+          const editorUri = vscode.window.activeTextEditor.document.uri;
+
+          if (editorUri.scheme === "file") {
+            const rel = path
+              .relative(activeClient.getRepoRoot(), editorUri.fsPath)
+              .split(path.sep)
+              .join("/");
+
+            if (rel && !rel.startsWith("..") && !path.isAbsolute(rel)) {
+              targetRelPath = rel;
+            }
+          }
+        }
+
+        if (!targetRelPath) {
+          void vscode.window.showInformationMessage(
+            "Select a modified file in the Tessera sidebar or open a repository file to diff."
+          );
+          return;
+        }
+
+        const rawClean = (
+          targetRelPath.split("::")[0]?.trim() || targetRelPath
+        ).replace(/^\/+/, "");
+        const confined = resolveConfinedPath(
+          activeClient.getRepoRoot(),
+          rawClean
+        );
+
+        if (!confined) {
+          throw new Error(`Invalid repository-relative file path '${rawClean}'`);
+        }
+
+        const [cleanPath, absPath] = confined;
+
+        if (targetBranch === trunkBranch) {
           const leftUri = BranchContentProvider.buildUri("HEAD", cleanPath);
-          const rightUri = vscode.Uri.file(path.join(repoRoot, cleanPath));
+          const rightUri = vscode.Uri.file(absPath);
           await vscode.commands.executeCommand(
             "vscode.diff",
             leftUri,
@@ -576,19 +1079,22 @@ export function activate(context: vscode.ExtensionContext): void {
         }
 
         const leftUri = BranchContentProvider.buildUri(trunkBranch, cleanPath);
-        const rightUri = BranchContentProvider.buildUri(branch, cleanPath);
+        const rightUri = BranchContentProvider.buildUri(
+          targetBranch,
+          cleanPath
+        );
         await vscode.commands.executeCommand(
           "vscode.diff",
           leftUri,
           rightUri,
-          `${cleanPath} (${trunkBranch} <-> ${branch})`
+          `${cleanPath} (${trunkBranch} <-> ${targetBranch})`
         );
       }
     ),
 
-    vscode.commands.registerCommand(
+    registerSafeCommand(
       "tes.openBranchDiff",
-      async (branch: string, relPath: string) => {
+      async (branch?: string, relPath?: string) => {
         await vscode.commands.executeCommand(
           "tes.diffBranchFile",
           branch,
@@ -597,17 +1103,20 @@ export function activate(context: vscode.ExtensionContext): void {
       }
     ),
 
-    vscode.commands.registerCommand(
-      "tes.dismissFileHighlights",
-      (relPath?: string) => {
-        decorationController.dismissForFile(relPath);
-      }
-    ),
+    registerSafeCommand("tes.dismissFileHighlights", (relPath?: string) => {
+      decorationController?.dismissForFile(relPath);
+    }),
 
-    vscode.commands.registerCommand(
+    registerSafeCommand(
       "tes.deleteBranch",
       async (arg?: string | SidebarNode) => {
-        const snap = latestSnapshot ?? (await client.fetchSnapshot());
+        const activeClient = requireTrustedClient();
+
+        if (!activeClient) {
+          return;
+        }
+
+        const snap = latestSnapshot ?? (await activeClient.fetchSnapshot());
         const trunk = snap.branchReport.trunk_branch || "main";
         let targetBranch =
           typeof arg === "string"
@@ -620,6 +1129,14 @@ export function activate(context: vscode.ExtensionContext): void {
           const candidates = snap.branchReport.branches.filter(
             (b) => b !== trunk
           );
+
+          if (candidates.length === 0) {
+            void vscode.window.showInformationMessage(
+              "No non-trunk branches available to delete."
+            );
+            return;
+          }
+
           targetBranch = await vscode.window.showQuickPick(candidates, {
             placeHolder: "Select branch to delete",
           });
@@ -641,10 +1158,13 @@ export function activate(context: vscode.ExtensionContext): void {
         }
 
         try {
-          await client.deleteBranch(targetBranch, choice === "Force Delete");
+          await activeClient.deleteBranch(
+            targetBranch,
+            choice === "Force Delete"
+          );
           await refreshAll();
         } catch (err: unknown) {
-          const message = err instanceof Error ? err.message : String(err);
+          const message = logError(`tes.deleteBranch(${targetBranch})`, err);
           const forceChoice = await vscode.window.showWarningMessage(
             `Could not safely delete '${targetBranch}': ${message}`,
             { modal: true },
@@ -652,17 +1172,23 @@ export function activate(context: vscode.ExtensionContext): void {
           );
 
           if (forceChoice === "Force Delete (-D)") {
-            await client.deleteBranch(targetBranch, true);
+            await activeClient.deleteBranch(targetBranch, true);
             await refreshAll();
           }
         }
       }
     ),
 
-    vscode.commands.registerCommand(
+    registerSafeCommand(
       "tes.discardWorkingChanges",
       async (arg?: string | SidebarNode) => {
-        const snap = latestSnapshot ?? (await client.fetchSnapshot());
+        const activeClient = requireTrustedClient();
+
+        if (!activeClient) {
+          return;
+        }
+
+        const snap = latestSnapshot ?? (await activeClient.fetchSnapshot());
         const targetBranch =
           typeof arg === "string"
             ? arg
@@ -680,15 +1206,21 @@ export function activate(context: vscode.ExtensionContext): void {
           return;
         }
 
-        await client.discardWorkingChanges(targetBranch);
+        await activeClient.discardWorkingChanges(targetBranch);
         await refreshAll();
       }
     ),
 
-    vscode.commands.registerCommand(
+    registerSafeCommand(
       "tes.focusSession",
       async (arg?: string | SidebarNode) => {
-        const snap = latestSnapshot ?? (await client.fetchSnapshot());
+        const activeClient = requireTrustedClient();
+
+        if (!activeClient) {
+          return;
+        }
+
+        const snap = latestSnapshot ?? (await activeClient.fetchSnapshot());
         let sessionId =
           typeof arg === "string"
             ? arg
@@ -733,7 +1265,7 @@ export function activate(context: vscode.ExtensionContext): void {
         const targetId = matchedAgent?.agent_id ?? resolvedSessionId;
         const waypoint = matchedAgent?.waypoint;
 
-        const ancestorPids = collectAncestorPids(
+        const ancestorPids = await collectAncestorPids(
           waypoint?.shell_pid,
           waypoint?.ide_pid
         );
@@ -757,7 +1289,7 @@ export function activate(context: vscode.ExtensionContext): void {
         }
 
         try {
-          const report = await client.focusSession(targetId);
+          const report = await activeClient.focusSession(targetId);
           const conversationId = waypoint?.conversation_id ?? undefined;
           const displayId = report.session_id || targetId;
 
@@ -814,7 +1346,7 @@ export function activate(context: vscode.ExtensionContext): void {
             }
           }
         } catch (err: unknown) {
-          const message = err instanceof Error ? err.message : String(err);
+          const message = logError(`tes.focusSession(${targetId})`, err);
           void vscode.window.showWarningMessage(
             `Could not focus session '${targetId}': ${message}`
           );
@@ -822,10 +1354,16 @@ export function activate(context: vscode.ExtensionContext): void {
       }
     ),
 
-    vscode.commands.registerCommand(
+    registerSafeCommand(
       "tes.closeSession",
       async (arg?: string | SidebarNode) => {
-        const sessionId =
+        const activeClient = requireTrustedClient();
+
+        if (!activeClient) {
+          return;
+        }
+
+        let sessionId =
           typeof arg === "string"
             ? arg
             : arg instanceof SidebarNode
@@ -833,81 +1371,215 @@ export function activate(context: vscode.ExtensionContext): void {
               : undefined;
 
         if (!sessionId) {
-          return;
+          const snap = latestSnapshot ?? (await activeClient.fetchSnapshot());
+          const activeAgents = snap.radarReport.active_agents.filter(
+            (a) => a.agent_id !== "editor"
+          );
+
+          if (activeAgents.length === 0) {
+            void vscode.window.showInformationMessage(
+              "No active sessions to close."
+            );
+            return;
+          }
+
+          const picked = await vscode.window.showQuickPick(
+            activeAgents.map((a) => ({
+              label: a.agent_id,
+              description: a.target_branch ?? snap.branchReport.editor_branch,
+              detail: a.intent,
+            })),
+            { placeHolder: "Select a session to close" }
+          );
+
+          if (!picked) {
+            return;
+          }
+
+          sessionId = picked.label;
         }
 
-        await client.closeSession(sessionId);
+        await activeClient.closeSession(sessionId);
         await refreshAll();
       }
     ),
 
-    vscode.commands.registerCommand("tes.clearSessions", async () => {
-      await client.clearSessions(false);
+    registerSafeCommand("tes.clearSessions", async () => {
+      const activeClient = requireTrustedClient();
+
+      if (!activeClient) {
+        return;
+      }
+
+      await activeClient.clearSessions(false);
       await refreshAll();
     }),
 
-    vscode.commands.registerCommand(
+    registerSafeCommand(
       "tes.popStash",
       async (arg?: number | SidebarNode) => {
-        const index =
-          typeof arg === "number"
-            ? arg
-            : arg instanceof SidebarNode && arg.stashIndex !== undefined
-              ? arg.stashIndex
-              : 0;
+        const activeClient = requireTrustedClient();
 
-        await client.popStash(index);
-        await refreshAll();
-      }
-    ),
-
-    vscode.commands.registerCommand(
-      "tes.dropStash",
-      async (arg?: number | SidebarNode) => {
-        const index =
-          typeof arg === "number"
-            ? arg
-            : arg instanceof SidebarNode && arg.stashIndex !== undefined
-              ? arg.stashIndex
-              : 0;
-
-        await client.dropStash(index);
-        await refreshAll();
-      }
-    ),
-
-    vscode.commands.registerCommand("tes.openGraph", async () => {
-      const snap = latestSnapshot ?? (await client.fetchSnapshot());
-      VisualGraphPanel.show(client, snap, switchEditorBranch, refreshAll);
-    }),
-
-    vscode.commands.registerCommand(
-      "tes.openConflictStudio",
-      async (focusPath?: string) => {
-        const snap = latestSnapshot ?? (await client.fetchSnapshot());
-        const targetPath =
-          typeof focusPath === "string" && focusPath.length > 0
-            ? focusPath
-            : snap.conflicts.find((c) => c.path !== "<speculative-verify>")
-                ?.path;
-
-        if (targetPath && (await openConflictedFileInEditor(targetPath))) {
+        if (!activeClient) {
           return;
         }
 
-        ConflictStudioPanel.show(client, snap, refreshAll, focusPath);
+        const snap = latestSnapshot ?? (await activeClient.fetchSnapshot());
+        let index: number | undefined;
+
+        if (typeof arg === "number" && Number.isInteger(arg) && arg >= 0) {
+          index = arg;
+        } else if (
+          arg instanceof SidebarNode &&
+          arg.stashIndex !== undefined
+        ) {
+          index = arg.stashIndex;
+        } else {
+          if (snap.stashes.length === 0) {
+            void vscode.window.showInformationMessage("No stashes available.");
+            return;
+          }
+
+          const picked = await vscode.window.showQuickPick(
+            snap.stashes.map((s, idx) => ({
+              label: `stash@{${idx}}: ${s.message}`,
+              description: `on ${s.branch}`,
+              index: idx,
+            })),
+            { placeHolder: "Select a stash to pop (3-way AST merge)" }
+          );
+
+          if (!picked) {
+            return;
+          }
+
+          index = picked.index;
+        }
+
+        const stashEntry = snap.stashes[index];
+        const stashDesc = stashEntry
+          ? `stash@{${index}} (${stashEntry.message})`
+          : `stash@{${index}}`;
+        const choice = await vscode.window.showWarningMessage(
+          `Pop ${stashDesc} onto the editor session? This modifies working tree files and removes the stash entry.`,
+          { modal: true },
+          "Pop Stash"
+        );
+
+        if (choice !== "Pop Stash") {
+          return;
+        }
+
+        await activeClient.popStash(index);
+        await refreshAll();
+      }
+    ),
+
+    registerSafeCommand(
+      "tes.dropStash",
+      async (arg?: number | SidebarNode) => {
+        const activeClient = requireTrustedClient();
+
+        if (!activeClient) {
+          return;
+        }
+
+        const snap = latestSnapshot ?? (await activeClient.fetchSnapshot());
+        let index: number | undefined;
+
+        if (typeof arg === "number" && Number.isInteger(arg) && arg >= 0) {
+          index = arg;
+        } else if (
+          arg instanceof SidebarNode &&
+          arg.stashIndex !== undefined
+        ) {
+          index = arg.stashIndex;
+        } else {
+          if (snap.stashes.length === 0) {
+            void vscode.window.showInformationMessage("No stashes available.");
+            return;
+          }
+
+          const picked = await vscode.window.showQuickPick(
+            snap.stashes.map((s, idx) => ({
+              label: `stash@{${idx}}: ${s.message}`,
+              description: `on ${s.branch}`,
+              index: idx,
+            })),
+            { placeHolder: "Select a stash to permanently drop" }
+          );
+
+          if (!picked) {
+            return;
+          }
+
+          index = picked.index;
+        }
+
+        const stashEntry = snap.stashes[index];
+        const stashDesc = stashEntry
+          ? `stash@{${index}} (${stashEntry.message})`
+          : `stash@{${index}}`;
+        const choice = await vscode.window.showWarningMessage(
+          `Permanently drop ${stashDesc}?`,
+          { modal: true },
+          "Drop Stash"
+        );
+
+        if (choice !== "Drop Stash") {
+          return;
+        }
+
+        await activeClient.dropStash(index);
+        await refreshAll();
+      }
+    ),
+
+    registerSafeCommand("tes.openGraph", async () => {
+      const activeClient = requireTrustedClient();
+
+      if (!activeClient) {
+        return;
+      }
+
+      const snap = latestSnapshot ?? (await activeClient.fetchSnapshot());
+      VisualGraphPanel.show(activeClient, snap, switchEditorBranch, refreshAll);
+    }),
+
+    registerSafeCommand(
+      "tes.openConflictStudio",
+      async (arg?: string | SidebarNode) => {
+        const activeClient = requireTrustedClient();
+
+        if (!activeClient) {
+          return;
+        }
+
+        const snap = latestSnapshot ?? (await activeClient.fetchSnapshot());
+        const focusPath =
+          typeof arg === "string" && arg.length > 0
+            ? arg
+            : arg instanceof SidebarNode
+              ? (arg.filePath ?? arg.conflict?.path)
+              : undefined;
+
+        ConflictStudioPanel.show(activeClient, snap, refreshAll, focusPath);
       }
     ),
 
     vscode.window.registerUriHandler({
       handleUri(uri: vscode.Uri): vscode.ProviderResult<void> {
+        if (!vscode.workspace.isTrusted) {
+          return;
+        }
+
         const params = new URLSearchParams(uri.query);
         const sessionId = params.get("session")?.trim();
 
         if (
           (uri.path === "/focus" || uri.path === "/session") &&
           sessionId &&
-          isValidRefName(sessionId)
+          isValidSafeIdentifier(sessionId)
         ) {
           void vscode.commands.executeCommand("tes.focusSession", sessionId);
         }
@@ -922,9 +1594,9 @@ export function activate(context: vscode.ExtensionContext): void {
         const links: SessionTerminalLink[] = [];
         const seenRanges = new Set<string>();
         const activeIds = new Set<string>(
-          (latestSnapshot?.radarReport.active_agents ?? []).map(
-            (a) => a.agent_id
-          )
+          (latestSnapshot?.radarReport.active_agents ?? [])
+            .map((a) => a.agent_id)
+            .filter((id) => id.length > 0 && id !== "editor")
         );
 
         for (const activeId of activeIds) {
@@ -937,16 +1609,21 @@ export function activate(context: vscode.ExtensionContext): void {
               break;
             }
 
-            const key = `${idx}:${activeId.length}`;
+            const prevCh = idx > 0 ? line[idx - 1] : undefined;
+            const nextCh = line[idx + activeId.length];
 
-            if (!seenRanges.has(key)) {
-              seenRanges.add(key);
-              links.push({
-                startIndex: idx,
-                length: activeId.length,
-                tooltip: `Focus session '${activeId}' in Tessera`,
-                sessionId: activeId,
-              });
+            if (!isIdentifierChar(prevCh) && !isIdentifierChar(nextCh)) {
+              const key = `${idx}:${activeId.length}`;
+
+              if (!seenRanges.has(key)) {
+                seenRanges.add(key);
+                links.push({
+                  startIndex: idx,
+                  length: activeId.length,
+                  tooltip: `Focus session '${activeId}' in Tessera`,
+                  sessionId: activeId,
+                });
+              }
             }
 
             searchFrom = idx + activeId.length;
@@ -978,7 +1655,10 @@ export function activate(context: vscode.ExtensionContext): void {
       },
 
       handleTerminalLink(link: SessionTerminalLink): vscode.ProviderResult<void> {
-        if (isValidRefName(link.sessionId)) {
+        if (
+          vscode.workspace.isTrusted &&
+          isValidSafeIdentifier(link.sessionId)
+        ) {
           void vscode.commands.executeCommand(
             "tes.focusSession",
             link.sessionId
@@ -988,12 +1668,18 @@ export function activate(context: vscode.ExtensionContext): void {
     })
   );
 
-  void refreshAll();
+  initializeWorkspace();
 }
 
 /**
- * Deactivates the extension; all registered disposables are cleaned up via `context.subscriptions`.
+ * Deactivates the extension and disposes open webview panels and workspace-scoped listeners.
  */
 export function deactivate(): void {
-  // Disposables are cleaned up via context.subscriptions
+  if (activeWorkspaceCleanup) {
+    activeWorkspaceCleanup();
+    activeWorkspaceCleanup = undefined;
+  }
+
+  VisualGraphPanel.disposeCurrent();
+  ConflictStudioPanel.disposeCurrent();
 }

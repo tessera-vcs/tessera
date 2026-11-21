@@ -84,7 +84,7 @@ tes switch feat/faq
 ```
 
 ### **Instant Sandboxes**
-Run builds, tests, and dev servers on any branch without reinstalling dependencies. Tessera clones `node_modules`, `target`, and `.venv` using filesystem copy-on-write and assigns each session its own port and test database.
+Run builds, tests, and dev servers on any branch without reinstalling dependencies. Tessera clones `node_modules`, `target`, and `.venv` using filesystem copy-on-write, assigns each session a `TES_PORT` slot (enable full dev-server port isolation with `tes config set port_isolation true` or `TES_PORT_ISOLATION=1`; defaults to `false`), and isolates locally configured test database URLs.
 
 ```bash
 # Run builds or dev servers in isolated Copy-on-Write branch sandboxes
@@ -113,8 +113,9 @@ tes radar
 ### 2. Per-Terminal Branches
 
 ```bash
-# Enable (tes:<branch>) in your shell prompt
+# Enable (tes:<branch>) in your shell prompt and opt into dev-server port isolation
 tes env --install
+tes config set port_isolation true
 
 # Terminal 1: run feat/pricing on port 3100
 tes switch feat/pricing
@@ -137,6 +138,28 @@ tes merge feat/pricing feat/faq --into main -m "feat: add pricing and faq"
 
 # Push to remote
 tes push
+```
+
+---
+
+# TL;DR
+
+Tessera coordinates multiple AI agents and terminal sessions in the same Git checkout on separate branches or the same branch. Each session gets its own branch state, Copy-on-Write sandbox, and `TES_PORT` slot inside one repository folder (enable automatic dev-server port isolation with `tes config set port_isolation true` or `TES_PORT_ISOLATION=1`; it defaults to `false`). `tes init` writes instruction and hook files (Antigravity by default, plus auto-detected Claude Code, Cursor, Windsurf, Kiro, OpenCode, Codex, and VS Code, or `--harness all`) so your agents use `tes` automatically. Pass `tes init --local` on mixed teams to add installed rule files to `.git/info/exclude`.
+
+## Install
+
+**macOS, Linux, and BSD:**
+
+```bash
+curl -fsSL https://tessera.getlunaris.dev/install.sh | sh
+tes init
+```
+
+**Windows (PowerShell):**
+
+```powershell
+irm https://tessera.getlunaris.dev/install.ps1 | iex
+tes init
 ```
 
 ---
@@ -176,7 +199,7 @@ Navigate to any project directory and run `tes init`:
 tes init
 ```
 
-This creates `.git/tessera` and installs workspace rules for your AI coding editors.
+This creates `.git/tessera`, installs Git sync hooks (`post-commit`, `post-merge`, and `post-checkout`), and installs workspace rules for your AI coding editors (Antigravity by default, plus auto-detected Claude Code, Cursor, Windsurf, Kiro, OpenCode, Codex, and VS Code, or specify `--harness all|<list>`). Pass `tes init --local` on mixed teams to exclude installed rule files via `.git/info/exclude`.
 
 > **Note:** If the directory is not yet a Git repository, `tes init` runs `git init` and creates an initial commit from your existing files before setting up Tessera.
 
@@ -197,8 +220,8 @@ tes merge feat/pricing --into main -m "feat: add pricing calculator"
 tes init
 ```
 
-- Sets up `.git/tessera` inside your existing Git repository
-- Installs instruction rules (`AGENTS.md`, `.agents/rules/tessera.md`, `.cursor/rules`, `CLAUDE.md`) so your AI coding agents coordinate through Tessera
+- Sets up `.git/tessera` and Git sync hooks (`.git/hooks/post-commit`, `post-merge`, and `post-checkout`) inside your existing Git repository
+- Installs instruction rules for Antigravity (`.agents/rules/tessera.md`) by default plus auto-detected AI editors (`CLAUDE.md`, `.claude/settings.json`, `.cursor/rules/tessera.mdc`, `AGENTS.md`, and more; use `--harness all` to install all, or `--local` to add them to `.git/info/exclude`)
 
 ```bash
 tes switch feat/pricing
@@ -216,9 +239,12 @@ tes merge feat/pricing --into main -m "feat: add pricing calculator"
 
 ## Working in a Single Folder
 
-In a standard Git checkout, every terminal tab and AI agent shares `.git/HEAD` and the working tree on disk. Tessera isolates each session inside a **single repository folder** with its own branch state and port slot:
+In a standard Git checkout, every terminal tab and AI agent shares `.git/HEAD` and the working tree on disk. Tessera isolates each session inside a **single repository folder** with its own branch state and `TES_PORT` slot. When running concurrent dev servers on separate branches, enable `port_isolation` (defaults to `false`) with `tes config set port_isolation true` or `TES_PORT_ISOLATION=1`:
 
 ```bash
+# Enable automatic dev-server port isolation (defaults to false)
+tes config set port_isolation true
+
 # Terminal 1 works on feat/pricing (assigned port 3100)
 tes switch feat/pricing
 npm run dev
@@ -280,15 +306,15 @@ Tessera lets multiple AI agents and terminal tabs work in the **same repository 
 
 When an agent claims a branch like `feat/pricing`, Tessera isolates that session inside `.git/tessera/` without changing `.git/HEAD` for the rest of your workspace. Concurrent agents can edit `src/App.vue` on their own branches in `~/acme-web` at the same time without touching each other's uncommitted files.
 
-When you want to build, test, or preview a branch, `tes exec -b feat/pricing -- npm run dev` executes inside a Copy-on-Write sandbox. It clones your existing `node_modules`, `target`, or `.venv` directories (including monorepo workspace symlinks), preserves your untracked `.env*` secrets and `.gitignore`d local files (such as local SQLite databases or `.dev.vars`), and assigns each branch its own port (`localhost:3100`, `localhost:3200`) and local database slot so you can run multiple branches side by side.
+When you want to build, test, or preview a branch, `tes exec -b feat/pricing -- npm run dev` executes inside a Copy-on-Write sandbox. It clones your existing `node_modules`, `target`, or `.venv` directories (including monorepo workspace symlinks), preserves your untracked `.env*` secrets and `.gitignore`d local files (such as local SQLite databases or `.dev.vars`), assigns each branch its own `TES_PORT` slot (`3100`, `3200`; enable full dev-server `PORT` isolation and POSIX port shims with `tes config set port_isolation true`, which defaults to `false`), and isolates locally configured `DATABASE_URL` / `TEST_DATABASE_URL` database names with `_slot_<N>` so you can run multiple branches side by side.
 
 ## Structural Merging Across Code, Configs, and Lockfiles
 
-When you run `tes merge feat/pricing feat/faq --into main`, Tessera merges changes at the syntax-tree level rather than line by line:
+When you run `tes merge feat/pricing feat/faq --into main`, Tessera merges changes using language-aware parsers and format-preserving drivers with fail-safe fallbacks:
 
-- **Source code**: Parses modules with Tree-sitter to merge functions, class methods, imports, and JSX/Vue templates.
-- **Manifests and lockfiles**: Merges JSON, TOML, `Cargo.lock`, `pnpm-lock.yaml`, `yarn.lock`, and `poetry.lock` blocks by key and stanza.
-- **Universal block structure**: Recognizes braced blocks (`{ ... }`), HTML/XML tags, indentation-scoped blocks (YAML, Python), keyword-delimited blocks (`def ... end`, `if ... fi`), and `[section]` stanzas so compatible additions merge across any language or configuration format.
+- **Tree-sitter AST merging (6 grammars + SFCs)**: Uses Tree-sitter grammars for **Rust** (`.rs`), **TypeScript** (`.ts`, `.mts`, `.cts`), **TSX** (`.tsx`), **JavaScript / JSX** (`.js`, `.jsx`, `.mjs`, `.cjs`), **Python** (`.py`, `.pyi`), and **Go** (`.go`), plus `<script>` blocks in **Vue** and **Svelte** single-file components (SFCs), to merge functions, class and `impl` methods, imports, and signatures structurally.
+- **Format-preserving manifest and lockfile drivers**: Structurally merges `Cargo.toml`, `Cargo.lock`, `*.toml`, and `*.json` (including `package.json`) by key and stanza while preserving formatting and flagging conflicting scalar values cleanly.
+- **Fail-safe fallback and binary/symlink/submodule safety**: Other languages and text formats fall back to structural and strict line 3-way diff3 merging. Binary files, tracked symbolic links (`120000`), and Git submodule gitlinks (`160000`) are never text-merged blindly and instead preserve modes or record first-class conflicts when both sides diverge.
 
 ## Editing on the Same Branch
 
@@ -386,7 +412,23 @@ Run `tes env --install` once to configure your shell profiles (`~/.zshrc`, `~/.b
 tes env --install
 ```
 
-Open a new terminal tab (or reload your shell profile) to activate the prompt indicator and `<TAB>` auto-completion for branch names, commit SHAs, and checkpoints.
+Open a new terminal tab (or reload your shell profile) to activate the prompt indicator, environment variable sync, and tab completion.
+
+### Shell Capabilities
+
+| Shell | Prompt & Env Sync | Dynamic `<TAB>` Completion | Automatic Branch Sandbox Command Routing |
+| ----- | ----------------- | -------------------------- | ---------------------------------------- |
+| **Zsh** (`--zsh`) | Yes | Yes | Yes (`preexec` / `precmd`) |
+| **Bash** (`--bash`) | Yes | Yes | Yes (`DEBUG` trap / `PROMPT_COMMAND`) |
+| **Fish** (`--fish`) | Yes | Yes | Yes (`fish_preexec` / `fish_prompt`) |
+| **PowerShell** (`--pwsh`) | Yes | Yes | Use `tes exec [-b <branch>] -- <cmd>` |
+| **POSIX `sh` / `dash` / `ksh` / `mksh` / `oksh` / `yash`** (`--sh`) | Yes | No | Use `tes exec [-b <branch>] -- <cmd>` |
+| **`tcsh` / BSD `csh`** (`--tcsh`) | Yes | No | Use `tes exec [-b <branch>] -- <cmd>` |
+| **Nushell** (`--nu`) | Yes | No | Use `tes exec [-b <branch>] -- <cmd>` |
+| **Elvish** (`--elvish`) | Yes | No | Use `tes exec [-b <branch>] -- <cmd>` |
+
+> [!INFO]
+> Environment variables (`TES_PORT`, `PORT` when `port_isolation = true`, `TES_BRANCH`, `TES_DB_NAME`, and locally configured `DATABASE_URL`) work cross-platform across macOS, Linux, BSD, and Windows. Executable CLI port-wrapper shims (`TES_SHIM_BIN`) are POSIX-only (macOS, Linux, BSD, and WSL).
 
 ### Manual Shell Setup
 
@@ -449,7 +491,7 @@ Inside any project directory, run:
 tes init
 ```
 
-By default, `tes init` auto-detects which AI coding tools you use and generates their instruction files and hooks. To target a specific editor, pass `--harness`:
+By default, `tes init` installs `.agents/rules/tessera.md` (Antigravity), Git sync hooks (`.git/hooks/post-commit`, `post-merge`, and `post-checkout`), and auto-detected integrations for Claude Code, Cursor, Windsurf, Kiro, OpenCode, Codex, and VS Code when their repository files or environment variables are present. To target specific editors or install all of them, pass `--harness`:
 
 ```bash
 tes init --harness antigravity
@@ -461,6 +503,13 @@ tes init --harness opencode
 tes init --harness codex
 tes init --harness vscode
 tes init --harness all
+```
+
+On mixed teams where not every contributor uses Tessera, pass `--local` so installed agent rule and harness files are added to `.git/info/exclude` instead of appearing as untracked files in `git status`:
+
+```bash
+tes init --local
+tes init --local --harness claude,cursor
 ```
 
 ## Uninstalling Tessera
@@ -530,7 +579,7 @@ In this guide, you will initialize Tessera in a project, work across two feature
 
 ## 1. Initialize the Repository
 
-Start by running `tes init` in your project root:
+Start by running `tes init` in your project root (pass `tes init --local` on mixed teams to add installed agent rule files to `.git/info/exclude`):
 
 ```bash
 tes init
@@ -540,6 +589,12 @@ If you have not already enabled shell prompt integration, run:
 
 ```bash
 tes env --install
+```
+
+If you plan to run multiple dev servers side by side on separate branches, enable automatic port isolation (`port_isolation` defaults to `false`):
+
+```bash
+tes config set port_isolation true
 ```
 
 ## 2. Work on Two Branches in Parallel
@@ -717,6 +772,8 @@ When two agents work on the **same branch** (for example, both editing on `main`
 - **Vue and Svelte Components**: Concurrent edits to `<script setup>`, `<template>`, and `<style scoped>` blocks merge cleanly.
 - **Manifests and Lockfiles**: Concurrent additions to `package.json`, `Cargo.toml`, and `Cargo.lock` are merged structurally.
 
+> **Dirty Claim Auto-Isolation (`auto_isolate_dirty_claims`):** By default (`auto_isolate_dirty_claims = true`), if a fresh session runs `tes claim` *without* `--branch` on a file that already has uncommitted changes from you or another session, Tessera automatically isolates that new session onto `agent/<session_id>` so it does not mix edits into in-progress work. To collaborate directly on the same branch, pass `--branch <branch>` explicitly (for example, `tes claim --branch main --intent "..." src/currency.ts`), or disable auto-isolation with `tes config set auto_isolate_dirty_claims false`.
+
 ### Separate Branches
 
 When you ask Agent 1 to work on `feat/pricing` and Agent 2 to work on `feat/faq`, both agents may touch shared files like `src/App.vue` or `index.html` at the same time.
@@ -810,7 +867,7 @@ tes switch feat/pricing-tiers --from feat/pricing
 
 In a switched terminal tab:
 - Your shell prompt displays `(tes:feat/pricing)` so you always see which branch that tab is on.
-- Commands you run in that terminal (`npm test`, `npm run build`, `npm run dev`, `cargo test`) execute inside that branch's Copy-on-Write sandbox while your terminal prompt stays in your project folder.
+- In Zsh, Bash, and Fish, commands you run in that terminal (`npm test`, `npm run build`, `npm run dev`, `cargo test`) execute automatically inside that branch's Copy-on-Write sandbox while your terminal prompt stays in your project folder (in other shells, run `tes exec -- <command>`).
 - Other open terminals and your code editor remain untouched.
 
 ## Switching the Editor Branch
@@ -893,7 +950,7 @@ tes push -u origin feat/pricing
 
 # Sandboxes
 
-Tessera creates Copy-on-Write branch sandboxes that reuse your existing dependencies, preserve your untracked `.env*` secrets and `.gitignore`d files, and assign each branch its own port (`localhost:3100`, `localhost:3200`) and local database slot.
+Tessera creates Copy-on-Write branch sandboxes that reuse your existing dependencies, preserve your untracked `.env*` secrets and `.gitignore`d files, assign each branch its own `TES_PORT` slot (`3100`, `3200`; enable full dev-server `PORT` isolation via `tes config set port_isolation true`, which defaults to `false`), and isolate locally configured test database URLs.
 
 ## Running Commands
 
@@ -971,32 +1028,44 @@ When `tes exec` runs:
 
 ## Dependency Caches
 
-Tessera clones and synchronizes dependency and build caches across major ecosystems:
+Tessera clones and synchronizes default dependency and build caches across major ecosystems (`cow_cache_dirs`):
 
-| Ecosystem | Cached Directories |
-|-----------|--------------------|
-| **JavaScript / TypeScript** | `node_modules`, `.pnpm-store`, `.next`, `.nuxt`, `.svelte-kit`, `.turbo`, `.parcel-cache`, `.vite` |
-| **Rust** | `target` (plus shared `CARGO_TARGET_DIR` support) |
-| **Python** | `.venv`, `venv`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `.tox` |
-| **Go / PHP / Ruby** | `vendor`, `.bundle` |
+| Ecosystem | Default Cached Directories |
+|-----------|----------------------------|
+| **JavaScript / TypeScript** | `node_modules`, `.pnpm-store`, `.turbo`, `.next`, `.nuxt`, `.svelte-kit`, `dist`, `build` |
+| **Rust** | `target` (plus `CARGO_TARGET_DIR` when `Cargo.toml` is present) |
+| **Python** | `.venv`, `venv`, `__pycache__`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache` |
+| **Go / PHP / Ruby** | `vendor` |
 | **Elixir / Erlang** | `_build`, `deps` |
-| **JVM / Swift / C++** | `.gradle`, `build`, `.build`, `cmake-build-debug`, `cmake-build-release` |
-| **Zig / .NET / Dart** | `.zig-cache`, `zig-out`, `bin`, `obj`, `.dart_tool` |
+| **JVM / Swift / C++** | `.gradle`, `.build`, `cmake-build-debug`, `cmake-build-release` |
+| **Zig / Dart** | `.zig-cache`, `zig-out`, `.dart_tool` |
+
+To add extra project-specific cache folders (such as `.nx`, `.vite`, or `.tox`), run `tes config add-cache-dir <dir...>`.
 
 > **Tip:** If you run `npm install` in your project root *after* a branch sandbox was already created, Tessera syncs the newly installed `node_modules` into the branch sandbox on the next `tes exec` run.
 
-## Environment Variables
+## Environment Variables and Database Isolation
 
 Each session slot (`1`, `2`, `3`, ...) receives non-overlapping environment variables:
 
 | Variable | Slot 1 | Slot 2 | Description |
 |----------|--------|--------|-------------|
-| `TES_PORT` (`PORT` when `port_isolation = true`) | `3100` | `3200` | Calculated as `base_port + (slot * port_stride)` |
+| `TES_PORT` | `3100` | `3200` | Always exported; calculated as `base_port + (slot * port_stride)` |
+| `PORT` (plus framework vars) | `3100` | `3200` | Exported when `port_isolation = true` or `TES_PORT_ISOLATION=1` (defaults to `false`) |
 | `TES_BRANCH` | `feat/pricing` | `feat/faq` | Target branch name for the session |
-| `TES_DB_NAME` | `tessera_slot_1` | `tessera_slot_2` | Isolated database name for integration tests |
-| `DATABASE_URL` | `sqlite:///.../tessera_slot_1.db` | `sqlite:///.../tessera_slot_2.db` | Isolated database connection URL |
+| `TES_DB_NAME` | `test_slot_1` | `test_slot_2` | Isolated database name identifier for integration tests |
+| `DATABASE_URL` / `TEST_DATABASE_URL` | `.../<db>_slot_1` | `.../<db>_slot_2` | Suffixed only when a local network database URL is already configured |
 
-To customize `base_port`, `port_stride`, `port_isolation`, or custom environment variable templates, see the [Configuration Guide](/guides/configuration).
+### How `DATABASE_URL` Isolation Works
+
+Tessera does **not** fabricate a fake `DATABASE_URL` or SQLite URL when none is configured:
+
+- **Local network databases**: If `DATABASE_URL` or `TEST_DATABASE_URL` is set in the environment or in `.env.development.local`, `.env.local`, `.env.development`, or `.env` and points to a local database host (`localhost`, `127.0.0.1`, `[::1]`, `0.0.0.0`, `host.docker.internal`, or `*.localhost`), Tessera appends `_slot_<N>` to the database name (for example, `postgres://localhost:5432/myapp` becomes `postgres://localhost:5432/myapp_slot_1`), preserving query parameters and fragments and avoiding double-suffixing.
+- **SQLite, file-based, and remote/cloud databases**: File-based URLs (`sqlite:`, `sqlite3:`, `sqlite+*:`, `file:`, `duckdb:`, `*.db`, `*.sqlite*`, `:memory:`), Redis/HTTP/WebSocket URLs, and remote or cloud database URLs (such as Neon, Supabase, or RDS) are left completely untouched.
+
+> **Platform Note:** Environment variable isolation works across macOS, Linux, BSD, and Windows. Executable CLI port-wrapper shims (`TES_SHIM_BIN`, used when `port_isolation = true`) are POSIX-only (macOS, Linux, BSD, and WSL).
+
+To customize `base_port`, `port_stride`, `port_isolation`, `cow_cache_dirs`, or custom environment variable templates, see the [Configuration Guide](/guides/configuration).
 
 ---
 
@@ -1013,9 +1082,9 @@ When a merge conflict occurs while using the Tessera IDE extension (in VS Code, 
 1. Tessera writes standard Git conflict markers (`<<<<<<<`, `=======`, `>>>>>>>`) into the file.
 2. The extension opens the conflicted file in your editor and jumps to the `<<<<<<<` line.
 3. Edit the file to keep the code you want, remove the conflict markers, and save (`Cmd+S` / `Ctrl+S`).
-4. As soon as the file is saved without conflict markers, Tessera resolves the conflict and updates the branch commit.
+4. As soon as the file is saved without conflict markers, Tessera resolves the conflict, updates the working tree and sandbox, and records the resolution on the active branch.
 
-You can also click **`N Conflicts`** in the bottom status bar to open the **Conflict Resolver** panel and resolve with a single click (`AST Union`, `Keep Ours`, `Keep Theirs`, or `Keep Working File`).
+You can also click **`N Conflicts`** in the bottom status bar (or run **`Tessera: Open Conflict Resolver`**) to inspect competing agent intents, `Base` / `Ours` / `Theirs` snippets, and verification `diagnostics`, edit the `AST-Union Preview`, click **`Open in Editor`**, or resolve with **`Accept AST-Union`**, **`Accept Ours`**, **`Accept Theirs`**, **`Keep Working File`**, or **`Save Custom`**.
 
 ## Inspecting Conflicts
 
@@ -1025,7 +1094,7 @@ To list any unresolved conflicts in your repository:
 tes conflicts
 ```
 
-Pass `--json` to inspect the base, ours, and theirs snippets along with the participating session IDs:
+Pass `--json` to inspect the base, ours, and theirs snippets, `ast_union_preview`, `diagnostics`, and participating session IDs:
 
 ```bash
 tes conflicts --json
@@ -1033,7 +1102,7 @@ tes conflicts --json
 
 ## Resolving from the CLI
 
-Resolve a conflicted file using one of four strategies:
+Resolve a conflicted file using one of five strategies:
 
 ```bash
 # Combine both sides' AST declarations and statements in order
@@ -1047,6 +1116,9 @@ tes resolve src/App.vue --strategy theirs
 
 # Use the file as currently edited and saved on disk
 tes resolve src/App.vue --strategy working
+
+# Write explicit resolved content inline or from a file
+tes resolve src/App.vue --strategy content --content-file resolved-app.vue
 ```
 
 ## Checkpoints
@@ -1121,12 +1193,12 @@ When you open a repository initialized with `tes init`, two items appear on the 
 
 ## Live Attribution
 
-When two or more AI agents work on the same file on your active editor branch, the extension highlights each agent's lines in real time:
+Whenever any active session has uncommitted edits in a file on your active editor branch (whether a single session or multiple concurrent agents), the extension highlights each session's lines in real time:
 
-1. **File Summary CodeLens**: Appears at line 1 whenever two or more agents are concurrently editing the file (`2 agents concurrently editing this file (main): antigravity-a1b2 · claude-c3d4`).
-2. **Hunk CodeLens (`Jump to Session`)**: Appears directly above the start line of each agent's modified section (`<agent_id> · L<start>-L<end>: <intent> · Jump to Session`). Clicking the CodeLens focuses the originating integrated terminal tab, terminal multiplexer pane (`tmux`, `WezTerm`, `kitty`), external macOS terminal tab (`Terminal.app`, `iTerm2`), or IDE agent conversation.
-3. **Gutter Borders and Line Highlights**: Each agent session receives a distinct 3px left border and line highlight along with a matching marker on the scrollbar overview ruler.
-4. **Inline Labels and Hover Cards**: The first line of each agent's section displays an italic inline label (`<agent_id>: <intent>`), and hovering any highlighted line shows a card with the agent ID, branch, line range, task intent, and a clickable **`Jump to Session`** action link.
+1. **Top-of-File CodeLenses**: Shows a **`Dismiss Highlights`** CodeLens whenever highlights are active, plus a file summary CodeLens at line 1 whenever two or more sessions are concurrently editing the file (`2 agents concurrently editing this file (main): antigravity-a1b2 · claude-c3d4`).
+2. **Hunk CodeLens**: Appears directly above the start line of each session's modified section (`<agent_id> · L<start>-L<end>: <intent>`). For terminal and CLI sessions with a navigable terminal waypoint (`term-*`, TTY, `tmux`, `WezTerm`, `kitty`, `Terminal.app`, or `iTerm2`), the CodeLens appends a clickable **`· Jump to Terminal`** link that focuses that terminal tab or pane.
+3. **Gutter Borders and Line Highlights**: Each session slot receives a distinct 3px left border and line highlight along with a matching marker on the scrollbar overview ruler (overlapping lines from multiple sessions use an error highlight).
+4. **Inline Labels and Hover Cards**: The first line of each session's section displays an italic inline label (`<agent_id>: <intent>`), and hovering any highlighted line shows a card with the session ID, branch, line range, task intent, a **`Jump to Terminal`** link (when navigable), and a **`Branch Graph`** link.
 
 ```ts
 // Live Multi-Agent Attribution in src/currency.ts (main):
@@ -1151,32 +1223,34 @@ export function formatCompact(cents: number) {
 
 ## Branch Graph
 
-Click **`Graph`** in the status bar (or run **`tes: Open Branch Graph`** from the Command Palette) to open the commit graph:
+Click **`Graph`** in the status bar (or run **`Tessera: Open Branch Graph`** from the Command Palette) to open the 2D commit graph:
 
-- **Branch Column Headers**: Shows each branch's name, current commit hash, sandbox port, modified file count, and active agent sessions, with action buttons to **Switch**, **Merge**, or **Restore**.
-- **Commit History**: Displays the commit history across parallel branch lanes with merge nodes, author names, and timestamps. Conflicted merge nodes are highlighted with a red border and a `Conflict` badge.
+- **Branch Column Headers**: Sticky headers at the top of each branch lane show the branch name, **`Active`** / **`Switch`** status badge (clicking the header switches the editor working tree to that branch), a delete button (`×` on non-trunk branches), a **`Default`** or **`Branch`** badge, and the branch's assigned port (`:<port>`).
+- **Topbar Actions**: Includes one-click buttons to **`Resolve Conflict`** (when conflicts exist), **`Merge into <trunk>`**, **`Collapse Linear`** / **`Expand All`**, and **`Refresh`**.
+- **Newest-First Commit History**: Renders commit and merge cards newest-first so **`Working`** and **`HEAD`** nodes stay immediately visible beneath the sticky column headers. Consecutive commits with matching conventional topics group horizontally, long linear chains collapse into expandable pills, file chips open diffs or conflicted files, **`Working`** cards include a **`Discard`** button, and conflicted nodes are highlighted with a red border.
 
 ## Sidebar Views
 
 Clicking the Tessera icon in the Activity Bar opens three sidebar views (plus a **Branches** view inside the Source Control sidebar):
 
 ### Branches
-Lists every branch in the repository with its short commit SHA and modified file count ahead of `main`. Expanding a branch lets you:
+Lists every branch in the repository with its short commit SHA, active marker, port (`:<port>`), and modified file count ahead of `main`. Expanding a branch lets you:
 - Switch your editor to that branch
 - Open the branch's assigned dev server (`localhost:<port>`)
 - Click any modified file (`M`) to open a side-by-side diff against `main`
 
 ### Sessions
-Displays all active AI agent and terminal sessions (`antigravity-*`, `claude-*`, `codex-*`, `cursor-*`, `term-*`), their target branch, and their current task intent. Clicking the **Jump to Session** inline button (or running `tes session focus <session-id>` from a terminal) navigates directly to that session's terminal tab, multiplexer pane, or IDE window. Expanding a session shows claimed symbols and modified files.
+Displays all active AI agent and terminal sessions (`antigravity-*`, `claude-*`, `codex-*`, `cursor-*`, `term-*`), their target branch, and their current task intent. Expanding a terminal session provides a **`Jump to Terminal`** action (and the inline **Jump to Session** button or `tes session focus <session-id>` focuses the session's terminal tab, multiplexer pane, or IDE window), along with branch switching, claimed symbols, and modified files.
 
-### Checkpoints
-Lists active conflicts alongside saved checkpoints (`tes checkpoint`), with toolbar actions to create a new checkpoint or open the Conflict Resolver.
+### Conflicts & Checkpoints
+Lists active conflicts, saved checkpoints (`tes checkpoint`), and stashes (`stash@{0}`, expandable to view stashed files with inline **Pop Stash** and **Drop Stash** actions), with toolbar actions to create a new checkpoint or open the Conflict Resolver.
 
 ## Conflict Resolution
 
 When a merge conflict occurs:
 1. The extension opens the conflicted file in your editor at the `<<<<<<<` conflict marker.
-2. Resolve the conflict by editing the file and saving (`Cmd+S` / `Ctrl+S` resolves once markers are removed) or by using the **Conflict Resolver** panel (`AST Union`, `Keep Ours`, `Keep Theirs`, `Keep Working File`).
+2. Resolve the conflict by editing the file and saving (`Cmd+S` / `Ctrl+S` resolves once markers are removed) or by opening the **Conflict Resolver** panel (click **`N Conflicts`** in the status bar or run **`Tessera: Open Conflict Resolver`**).
+3. Each conflict card displays competing agent intents, **`Verification Diagnostics`** (when `diagnostics` is present, such as from a failed `--verify` check), **`Base`** (when `base_snippet` is present), **`Ours`**, and **`Theirs`** snippets, an editable **`AST-Union Preview`** box, an **`Open in Editor`** button, and one-click actions: **`Accept AST-Union`**, **`Accept Ours`**, **`Accept Theirs`**, **`Keep Working File`**, and **`Save Custom`**.
 
 ## See Also
 
@@ -1210,7 +1284,9 @@ trunk_branch = "main"
 base_port = 3000
 port_stride = 100
 port_isolation = true
-verify_command = "npm run build"
+auto_isolate_dirty_claims = true
+watch_interval_ms = 75
+watch_timeout_secs = 90
 
 cow_cache_dirs = [
   "node_modules",
@@ -1221,11 +1297,22 @@ cow_cache_dirs = [
   "vendor"
 ]
 
+package_globs = [
+  "crates/*",
+  "packages/*",
+  "apps/*",
+  "services/*"
+]
+
+# Execution-sensitive fields below require `tes config trust`
+verify_command = "npm run build"
+pager = "less -FRX"
+
 extra_bin_dirs = [
-  "node_modules/.bin",
   ".venv/bin",
-  "vendor/bin",
-  "bin"
+  "venv/bin",
+  "node_modules/.bin",
+  "vendor/bin"
 ]
 
 [custom_env]
@@ -1236,7 +1323,9 @@ VITE_PORT = "{port}"
 
 ## Configuration Options
 
-### Core Settings
+### Declarative Settings (Loaded Automatically)
+
+These settings are declarative and load automatically from `.git/tessera/config.toml` and any checked-in `tessera.toml`.
 
 #### `trunk_branch`
 
@@ -1258,7 +1347,7 @@ tes config set trunk_branch main
 
 - **Type:** `number`
 - **Default:** `3000`
-- **Description:** Starting port used when calculating isolated session ports (`PORT = base_port + slot * port_stride`).
+- **Description:** Starting port used when calculating isolated session ports (`PORT = base_port + slot * port_stride`). Must be `>= 1024` in `tessera.toml`.
 
 ```toml
 base_port = 3000
@@ -1274,7 +1363,7 @@ tes config set base_port 3000
 
 - **Type:** `number`
 - **Default:** `100`
-- **Description:** Port increment between session slots (e.g., Slot 1 receives `3100`, Slot 2 receives `3200`).
+- **Description:** Port increment between session slots (for example, Slot 1 receives `3100`, Slot 2 receives `3200`). Must be `>= 25` in `tessera.toml`.
 
 ```toml
 port_stride = 100
@@ -1290,7 +1379,7 @@ tes config set port_stride 100
 
 - **Type:** `boolean`
 - **Default:** `false`
-- **Description:** When enabled (`true`) or when `TES_PORT_ISOLATION=1` is set in the environment, `tes env` and `tes exec` automatically export `PORT` and framework port environment variables (`VITE_PORT`, `PORT`, `FLASK_RUN_PORT`, etc.) and prepend CLI port-wrapper shims (`TES_SHIM_BIN`) for each session slot.
+- **Description:** When enabled (`true`) or when `TES_PORT_ISOLATION=1` is set in the environment, `tes env` and `tes exec` automatically export `PORT` and framework port environment variables (`VITE_PORT`, `FLASK_RUN_PORT`, `UVICORN_PORT`, `RAILS_PORT`, and more) and prepend POSIX CLI port-wrapper shims (`TES_SHIM_BIN`) for each session slot.
 
 ```toml
 port_isolation = true
@@ -1302,22 +1391,52 @@ Update via CLI:
 tes config set port_isolation true
 ```
 
-#### `verify_command`
+#### `auto_isolate_dirty_claims`
 
-- **Type:** `string | null`
-- **Default:** `null`
-- **Description:** Optional verification command executed automatically when running `tes merge --verify` or `tes commit --verify`.
+- **Type:** `boolean`
+- **Default:** `true`
+- **Description:** When `true`, running `tes claim` without `--branch` on a file that already has uncommitted changes from the user or a peer session automatically isolates the new session onto `agent/<session_id>` instead of mixing edits into in-progress work. Pass `--branch <branch>` explicitly when same-branch collaboration is intended, or set this option to `false`.
 
 ```toml
-verify_command = "npm test"
+auto_isolate_dirty_claims = true
 ```
 
 Update via CLI:
 
 ```bash
-tes config set verify_command "npm test"
-# or using the shorthand flag:
-tes config --verify-cmd "npm test"
+tes config set auto_isolate_dirty_claims false
+```
+
+#### `watch_interval_ms`
+
+- **Type:** `number`
+- **Default:** `75`
+- **Description:** Polling interval in milliseconds for the background write watcher started on `tes claim` (clamped to a minimum of `15` ms in `tessera.toml`).
+
+```toml
+watch_interval_ms = 75
+```
+
+Update via CLI:
+
+```bash
+tes config set watch_interval_ms 75
+```
+
+#### `watch_timeout_secs`
+
+- **Type:** `number`
+- **Default:** `90`
+- **Description:** Idle timeout in seconds before the background write watcher exits automatically (clamped to a minimum of `5` seconds in `tessera.toml`).
+
+```toml
+watch_timeout_secs = 90
+```
+
+Update via CLI:
+
+```bash
+tes config set watch_timeout_secs 90
 ```
 
 #### `co_author`
@@ -1353,6 +1472,52 @@ Update via CLI:
 tes config set co_author_trailer "Tessera <noreply@tessera.getlunaris.dev>"
 ```
 
+#### `cow_cache_dirs`
+
+- **Type:** `string[]`
+- **Default:** `["target", "node_modules", ".pnpm-store", ".turbo", ".next", ".nuxt", ".svelte-kit", "dist", "build", ".venv", "venv", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", "vendor", "_build", "deps", ".gradle", ".build", ".zig-cache", "zig-out", ".dart_tool", "cmake-build-debug", "cmake-build-release"]`
+- **Description:** Untracked dependency and build cache directories cloned via Copy-on-Write into every branch sandbox.
+
+Add directories via CLI:
+
+```bash
+tes config add-cache-dir .nx .angular
+```
+
+#### `package_globs`
+
+- **Type:** `string[]`
+- **Default:** `["crates/*", "packages/*", "apps/*", "services/*"]`
+- **Description:** Monorepo workspace or package glob patterns scanned when discovering nested dependency caches.
+
+Add package globs via CLI:
+
+```bash
+tes config add-package-glob "modules/*" "plugins/*"
+```
+
+### Trust-Gated Execution Settings
+
+Because these settings influence executed commands, `PATH` resolution, or runtime environment variables, values defined in a checked-in `tessera.toml` are ignored until you explicitly run `tes config trust`. Local overrides set directly via `tes config` in `.git/tessera/config.toml` take effect immediately.
+
+#### `verify_command`
+
+- **Type:** `string | null`
+- **Default:** `null`
+- **Description:** Optional verification command executed when running `tes merge --verify` or `tes commit --verify` (and over MCP when `verify: true` is passed).
+
+```toml
+verify_command = "npm test"
+```
+
+Update via CLI:
+
+```bash
+tes config set verify_command "npm test"
+# or using the shorthand flag:
+tes config --verify-cmd "npm test"
+```
+
 #### `pager`
 
 - **Type:** `string | null`
@@ -1369,51 +1534,23 @@ Update via CLI:
 tes config set pager "delta --paging=always"
 ```
 
-### Sandbox Options
-
-#### `cow_cache_dirs`
-
-- **Type:** `string[]`
-- **Default:** `["node_modules", ".pnpm-store", ".next", ".nuxt", ".svelte-kit", ".turbo", ".parcel-cache", ".vite", "target", ".venv", "venv", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox", "vendor", ".bundle", "_build", "deps", ".gradle", "build", ".build", "cmake-build-debug", "cmake-build-release", ".zig-cache", "zig-out", "bin", "obj", ".dart_tool"]`
-- **Description:** Dependency and build cache directories cloned via Copy-on-Write into every branch sandbox.
-
-Add directories via CLI:
-
-```bash
-tes config add-cache-dir .nx .angular
-```
-
 #### `extra_bin_dirs`
 
 - **Type:** `string[]`
-- **Default:** `["node_modules/.bin", ".venv/bin", "venv/bin", "vendor/bin", "bin"]`
-- **Description:** Relative directories inside the branch sandbox prepended to `PATH` during `tes exec`.
+- **Default:** `[".venv/bin", "venv/bin", "node_modules/.bin", "vendor/bin"]`
+- **Description:** Relative directories inside the branch sandbox prepended to `PATH` during `tes exec`. Generic project directories such as `bin` and `.bin` are excluded from the untrusted defaults for security so cloned repositories cannot shadow standard system utilities; add them explicitly via `tes config add-bin-dir` or a trusted `tessera.toml`.
 
 Add binary directories via CLI:
 
 ```bash
-tes config add-bin-dir ./scripts ./tools/bin
+tes config add-bin-dir scripts/bin tools/bin
 ```
-
-#### `package_globs`
-
-- **Type:** `string[]`
-- **Default:** `["crates/*", "packages/*", "apps/*", "services/*", "libs/*"]`
-- **Description:** Monorepo workspace or package glob patterns scanned when discovering nested dependency caches.
-
-Add package globs via CLI:
-
-```bash
-tes config add-package-glob "modules/*" "plugins/*"
-```
-
-### Environment Variables
 
 #### `[custom_env]`
 
 - **Type:** `table`
 - **Default:** `{}`
-- **Description:** Custom environment variables injected into `tes exec` and switched terminals. Supports `{slot}`, `{port}`, `{branch}`, and `{agent_id}` placeholders.
+- **Description:** Custom environment variable templates injected into `tes exec`. Supports `{slot}`, `{port}`, `{branch}`, and `{agent_id}` placeholders (interpolated in a single pass). Sensitive loader, shell, proxy, and toolchain injection keys (such as `LD_PRELOAD`, `DYLD_INSERT_LIBRARIES`, `COMSPEC`, `NODE_EXTRA_CA_CERTS`, `HTTP_PROXY`, and `SSH_AUTH_SOCK`) are rejected automatically.
 
 ```toml
 [custom_env]
@@ -1430,17 +1567,19 @@ tes config set-env APP_URL "http://localhost:{port}"
 
 ### Repository Trust (`tessera.toml`)
 
-When cloning an external repository that includes a checked-in `tessera.toml`, non-executable settings (`trunk_branch`, `base_port`, `port_stride`, `co_author`, `co_author_trailer`, `cow_cache_dirs`, and safe `custom_env` templates) are loaded automatically.
+When cloning an external repository that includes a checked-in `tessera.toml`, declarative settings (`trunk_branch`, `base_port`, `port_stride`, `watch_interval_ms`, `watch_timeout_secs`, `auto_isolate_dirty_claims`, `co_author`, `co_author_trailer`, `port_isolation`, `cow_cache_dirs`, and `package_globs`) are loaded automatically.
 
-To prevent untrusted repositories from executing arbitrary commands or overriding system binaries automatically, `verify_command`, `pager`, and `extra_bin_dirs` in `tessera.toml` require explicit repository trust:
+To prevent untrusted repositories from executing arbitrary commands, shadowing binaries, or injecting environment variables automatically, `verify_command`, `pager`, `extra_bin_dirs`, and `custom_env` in `tessera.toml` are ignored until you explicitly trust the current file digest:
 
 ```bash
-# trust the repository's tessera.toml
+# trust the repository's current tessera.toml
 tes config trust
 
 # revoke trust for tessera.toml
 tes config untrust
 ```
+
+If `tessera.toml` changes later (for example, after a `tes pull`), its Blake3 digest changes and execution-sensitive fields remain inactive until you review the file and run `tes config trust` again.
 
 ## See Also
 
@@ -1471,7 +1610,11 @@ tes env --install
 
 ### Switch Terminals to Different Branches
 
+Enable `port_isolation` (defaults to `false`; or set `TES_PORT_ISOLATION=1`) when running dev servers side by side on separate branches:
+
 ```bash
+tes config set port_isolation true
+
 # Terminal 1
 tes switch feat/pricing
 npm run dev
@@ -1521,10 +1664,12 @@ Open two AI agent tabs and give both a prompt that modifies `formatCurrency`:
 
 ## How It Works
 
-1. Both agents claim `src/currency.ts` against the same starting commit on `main`.
+1. Both agents claim `src/currency.ts` against the same starting commit on `main` using `--branch main` (`tes claim --branch main --intent "..." src/currency.ts`).
 2. Agent 1 writes its edit and runs `tes hook post-tool --path src/currency.ts`.
 3. Agent 2 writes its edit and runs `tes hook post-tool --path src/currency.ts`.
 4. Tessera parses the base version and both agents' versions using Tree-sitter and merges the parameter list and function body automatically.
+
+> **Note:** Because `auto_isolate_dirty_claims` defaults to `true`, omitting `--branch` on `tes claim` when `src/currency.ts` already has uncommitted edits automatically isolates the second session onto `agent/<session_id>`. Passing `--branch main` explicitly opts into same-branch collaboration (or set `auto_isolate_dirty_claims = false` in `tessera.toml` / via `tes config set auto_isolate_dirty_claims false`).
 
 ## Merged Result
 
@@ -1731,8 +1876,8 @@ The `tes` CLI provides commands for initializing repositories, coordinating mult
 
 | Command | Purpose |
 |---------|---------|
-| [tes init](/cli/init) | Initialize Tessera in a Git repository and install AI editor rules |
-| [tes env](/cli/env) | Configure shell prompt integration (`(tes:<branch>)`) and tab completion |
+| [tes init](/cli/init) | Initialize Tessera in a Git repository, install Git hooks, and configure AI editor rules (`--harness`, `--local`) |
+| [tes env](/cli/env) | Configure shell prompt integration (`(tes:<branch>)`), tab completion, and sandbox routing |
 | [tes switch](/cli/switch) | Switch the active terminal session or editor working tree to a branch |
 | [tes branch](/cli/branch) | List (`-l`, `-v`), create, rename (`-m`), or delete (`-d`/`-D`) branches and sandboxes |
 | [tes claim](/cli/claim) | Claim a task intent, target branch, and file paths for an agent session |
@@ -1741,19 +1886,25 @@ The `tes` CLI provides commands for initializing repositories, coordinating mult
 | [tes stash](/cli/stash) | Session-isolated AST stash (`push`, `pop`, `apply`, `list`, `drop`, `clear`) |
 | [tes radar](/cli/radar) | Show all active AI agent and terminal sessions in real time |
 | [tes exec](/cli/exec) | Run a build, test, or server command inside a branch's Copy-on-Write sandbox |
-| [tes merge](/cli/merge) | Semantically merge sessions or multiple feature branches into a target branch |
-| [tes cherry-pick](/cli/cherry-pick) | Apply a commit (`<rev>`) onto the active branch via 3-way AST merge |
+| [tes merge](/cli/merge) | Semantically merge sessions or multiple feature branches into a target branch (`--dry-run`, `--verify`) |
+| [tes cherry-pick](/cli/cherry-pick) | Apply a commit (`<commit>`) onto the active branch via 3-way AST merge |
 | [tes commit](/cli/commit) | Commit the active session's changes onto its target branch (`-m`, `--amend`, `--no-edit`, `--author`, `--co-author`) |
 | [tes pull](/cli/pull) | Fetch and fast-forward or 3-way AST-merge a remote branch while rebasing sessions |
 | [tes push](/cli/push) | Synchronize session changes and push a branch to a Git remote |
 | [tes log](/cli/log) | Show commit history with branch refs, patches (`-p`), diffstats (`--stat`), graphs (`--graph`), filters (`--grep`, `-S`, `--author`), and pathspecs (`-- <paths...>`) |
 | [tes conflicts](/cli/conflicts) | List unresolved merge conflicts |
-| [tes resolve](/cli/resolve) | Resolve a conflicted file using `ast-union`, `ours`, `theirs`, or `working` |
+| [tes resolve](/cli/resolve) | Resolve a conflicted file using `ast-union`, `ours`, `theirs`, `working`, or `content` (`--content`, `--content-file`) |
 | [tes checkpoint](/cli/checkpoint) | Save a named checkpoint in the operation log |
 | [tes restore](/cli/restore) | Restore a branch or specific files to a checkpoint, commit, or branch |
-| [tes undo](/cli/undo) | Undo the most recent operation or roll back to a specific operation ID |
-| [tes config](/cli/config) | View or update repository configuration settings |
-| `tes session focus <id>` | Focus the originating terminal tab, multiplexer pane, or IDE window for an active session |
+| [tes oplog](/cli/oplog) | Inspect the content-addressed Operation Log history |
+| [tes undo](/cli/undo) | Undo the most recent operation or roll back to a specific operation ID or checkpoint |
+| [tes sync](/cli/sync) | Auto-rebase all active sessions onto the latest trunk commit |
+| [tes gc](/cli/gc) | Compact ephemeral micro-snapshot operations in `.git/tessera/oplog/` |
+| [tes watch](/cli/watch) | Watch the working tree and auto-reconcile edits for hookless editors or harnesses |
+| [tes agent](/cli/agent) (`session`) | Spawn, list, focus (`tes session focus <id>`), exec, close, or clear sessions |
+| [tes config](/cli/config) | View or update repository configuration settings and trust (`tessera.toml`) |
+| [tes doctor](/cli/doctor) | Run repository health, config trust, filesystem CoW, hook, and session diagnostics |
+| [tes mcp](/cli/mcp) | Start the built-in Model Context Protocol (MCP) JSON-RPC 2.0 server over `stdio` |
 
 ---
 
@@ -1776,24 +1927,39 @@ By default, `tes diff`, `tes log`, `tes oplog`, `tes branch` (when listing), and
 
 ## MCP Server
 
-For AI coding editors that support the Model Context Protocol (MCP), `tes mcp` starts a JSON-RPC 2.0 server over `stdio` exposing the following tools:
+For AI coding editors that support the Model Context Protocol (MCP), [tes mcp](/cli/mcp) starts a JSON-RPC 2.0 server over `stdio` exposing the following tools, resources, and prompts:
 
-| Tool | Description |
-|------|-------------|
-| `claim` | Claim a task intent, target branch (`branch`), and file/symbol list (`symbols`) |
-| `status` | Reconcile edits and return session status and branch state |
-| `radar` | Return all active agent sessions, target branches, and claimed symbols |
-| `branch` | List, delete (`delete` / `force_delete`), or rename (`rename`) branches |
-| `stash` | Session-isolated AST stash (`push`, `pop`, `apply`, `list`, `drop`, `clear`) |
-| `pull` | Fetch and fast-forward or 3-way AST-merge a remote branch and rebase sessions |
-| `cherry-pick` | 3-way AST cherry-pick a commit (`rev`) onto a target branch |
-| `conflicts` | List active structural conflicts with base, ours, and theirs snippets |
-| `resolve` | Resolve a conflict using `ast-union`, `ours`, `theirs`, or `working` |
-| `checkpoint` | Create a named checkpoint in the operation log |
-| `restore` | Restore a branch or file paths to a commit, branch, or checkpoint |
-| `undo` | Roll back the latest operation or restore to a specific `op_id` |
-| `sync` | Synchronize the current session with the latest branch `HEAD` |
-| `merge` | Commit the session or AST-merge multiple branches into a target branch |
+### Tools
+
+| Tool | Input Schema | Description |
+|------|--------------|-------------|
+| `status` | `{ agent_id? }` | Snapshot and return session status, branch state, and claimed symbols |
+| `radar` | `{}` | Return all active agent sessions, target branches, and overlapping edits |
+| `claim` | `{ intent?, branch?, from?, symbols?, agent_id? }` | Claim a task intent, optional target branch and parent base, and file/symbol list |
+| `commit` | `{ message?, branch?, amend?, author?, co_author?, no_co_author?, verify?, agent_id? }` | Commit the session's isolated changes onto its target branch |
+| `diff` | `{ branch?, staged?, rev_range?, paths?, agent_id? }` | Inspect unified diffs for the session, staged edits, branch, or revision range |
+| `log` | `{ branch?, limit? }` | Return commit history for a branch |
+| `oplog` | `{ limit? }` | Return recent entries from the Operation Log |
+| `push` | `{ remote?, branch?, force?, tags?, dry_run?, agent_id? }` | Push the active (or specified) branch to a Git remote |
+| `pull` | `{ remote?, branch?, agent_id? }` | Fetch and fast-forward or 3-way AST-merge a remote branch and rebase sessions |
+| `checkpoint` | `{ label, agent_id? }` | Create a named atomic checkpoint in the Operation Log |
+| `restore` | `{ source?, branch?, paths?, agent_id? }` | Restore a branch or file paths to a commit, branch, or checkpoint |
+| `branch` | `{ action?: "list"\|"switch"\|"delete"\|"rename", branch?, new_branch?, from?, force?, agent_id? }` | List, switch, delete, or rename branches across Git refs, sandboxes, and sessions |
+| `stash` | `{ action?: "push"\|"pop"\|"apply"\|"list"\|"drop"\|"clear", message?, branch?, paths?, index?, agent_id? }` | Session-isolated AST stash operations |
+| `cherry-pick` | `{ commit, branch?, agent_id? }` | 3-way AST cherry-pick a commit onto a target branch |
+| `conflicts` | `{}` | List active structural conflicts with base, ours, and theirs snippets |
+| `resolve` | `{ path, strategy: "ours"\|"theirs"\|"ast-union"\|"working"\|"content", content? }` | Resolve a conflict at `path` using the chosen strategy |
+| `sync` | `{}` | Non-blocking auto-rebase of active sessions onto the latest trunk commit |
+| `undo` | `{ op?, checkpoint? }` | Atomically roll back to the previous operation, an `OpId` prefix, or a checkpoint |
+| `merge` | `{ agents?, into?, message?, verify?, keep_open?, dry_run?, author?, co_author?, no_co_author? }` | Commit the session or AST-merge multiple branches into a target branch |
+| `agent` | `{ action?: "list"\|"close"\|"clear", agent_id?, force? }` | List, close, or clear active agent sessions |
+| `config` | `{ action?: "show" }` | Inspect effective repository configuration |
+| `doctor` | `{}` | Run repository health, config trust, filesystem, and integration diagnostics |
+
+### Resources & Prompts
+
+- **Resources**: `tessera://status`, `tessera://radar`, `tessera://conflicts`
+- **Prompt**: `resolve-conflicts`
 
 ---
 
@@ -1812,27 +1978,31 @@ Initialize Tessera in a project directory and install AI editor rules.
 ## Usage
 
 ```bash
-tes init [options]
+tes init [path] [options]
 ```
 
 ## Options
 
-- `-b, --branch <BRANCH>` - Default trunk branch name (default: `main`).
+- `-b, --branch <BRANCH>` - Default trunk branch name (defaults to the active Git branch or `init.defaultBranch`, falling back to `main`).
 - `--harness <LIST>` - Comma-separated list of AI editors/harnesses to configure (`antigravity`, `claude`, `cursor`, `windsurf`, `kiro`, `opencode`, `codex`, `vscode`, or `all`).
+- `--local` - Add installed AI agent rule and harness files to `.git/info/exclude` so they stay ignored locally without modifying `.gitignore` or polluting `git status` on mixed teams.
 
 ## Description
 
 The `init` command sets up Tessera inside your project by:
 1. Initializing `.git` and creating an initial commit if the directory is not already a Git repository.
-2. Creating the `.git/tessera` store and default configuration.
-3. Installing workspace rules and MCP configuration for detected or specified AI editors (`.agents/rules/tessera.md`, `.cursor/rules/tessera.mdc`, `.windsurf/rules/tessera.md`, `.kiro/steering/tessera.md`, `CLAUDE.md`, `AGENTS.md`, `.codex/config.toml`, `.codex/hooks.json`) so AI coding agents coordinate through Tessera automatically.
-4. Installing lightweight Git `post-commit` and `post-merge` hooks to keep `.git/tessera` synchronized with native `git` commands.
+2. Creating the `.git/tessera` store and default configuration (and excluding `.tessera/` in `.git/info/exclude`).
+3. Installing workspace rules and MCP configuration for AI coding editors: by default, `tes init` installs Antigravity (`.agents/rules/tessera.md`) plus any auto-detected editors (`claude`, `cursor`, `windsurf`, `kiro`, `opencode`, `codex`, `vscode`) whose repository files or environment variables are present. Pass `--harness <list>` or `--harness all` to install specific or all supported harnesses (`.agents/rules/tessera.md`, `.claude/settings.json`, `.mcp.json`, `CLAUDE.md`, `.cursor/mcp.json`, `.cursor/rules/tessera.mdc`, `.windsurf/rules/tessera.md`, `.kiro/steering/tessera.md`, `.kiro/settings/mcp.json`, `opencode.json`, `.codex/config.toml`, `.codex/hooks.json`, `.vscode/mcp.json`, `AGENTS.md`).
+4. Installing lightweight Git `post-commit`, `post-merge`, and `post-checkout` hooks (`.git/hooks/post-commit`, `.git/hooks/post-merge`, `.git/hooks/post-checkout`) to keep `.git/tessera` synchronized with native `git` commands.
 
 ## Examples
 
 ```bash
-# initialize in current directory (auto-detects AI editors)
+# initialize in current directory (Antigravity + auto-detected AI editors)
 tes init
+
+# initialize locally on a mixed team (adds installed rule files to .git/info/exclude)
+tes init --local
 
 # initialize with a specific default branch
 tes init --branch main
@@ -1870,7 +2040,22 @@ tes env [options]
 
 ## Description
 
-The `env` command configures your shell so each terminal tab displays its active Tessera branch (`(tes:<branch>)`) in the prompt, enables `<TAB>` completion for subcommands, branches, and checkpoints, and routes commands in switched terminals to the active branch's Copy-on-Write sandbox.
+The `env` command configures your shell so each terminal tab displays its active Tessera branch (`(tes:<branch>)`) in the prompt, syncs session environment variables (`TES_BRANCH`, `TES_PORT`, `TES_WORKSPACE`, `TES_REPO_ROOT`, plus `PORT` and framework port variables when `port_isolation = true`), and enables dynamic `<TAB>` completion and automatic sandbox command routing where supported by the shell.
+
+### Per-Shell Capabilities
+
+| Shell | Prompt & Env Sync | Dynamic `<TAB>` Completion | Automatic Branch Sandbox Command Routing |
+| ----- | ----------------- | -------------------------- | ---------------------------------------- |
+| **Zsh** (`--zsh`) | Yes | Yes | Yes (`preexec` / `precmd`) |
+| **Bash** (`--bash`) | Yes | Yes | Yes (`DEBUG` trap / `PROMPT_COMMAND`) |
+| **Fish** (`--fish`) | Yes | Yes | Yes (`fish_preexec` / `fish_prompt`) |
+| **PowerShell** (`--pwsh`) | Yes | Yes | No (use `tes exec [-b <branch>] -- <cmd>`) |
+| **POSIX `sh` / `dash` / `ksh` / `mksh` / `oksh` / `yash`** (`--sh`) | Yes | No | No (use `tes exec [-b <branch>] -- <cmd>`) |
+| **`tcsh` / BSD `csh`** (`--tcsh`) | Yes | No | No (use `tes exec [-b <branch>] -- <cmd>`) |
+| **Nushell** (`--nu`) | Yes | No | No (use `tes exec [-b <branch>] -- <cmd>`) |
+| **Elvish** (`--elvish`) | Yes | No | No (use `tes exec [-b <branch>] -- <cmd>`) |
+
+> **Platform Note:** Environment variable syncing (`TES_BRANCH`, `TES_PORT`, and `PORT` when `port_isolation = true`) works cross-platform across macOS, Linux, BSD, and Windows. Executable CLI port-wrapper shims (`TES_SHIM_BIN`) are POSIX-only (macOS, Linux, BSD, and WSL).
 
 Even without `tes env` installed in your shell profile, Tessera automatically isolates terminal tabs across macOS, Linux, FreeBSD, OpenBSD, and Windows using terminal session environment variables (`TERM_SESSION_ID`, `ITERM_SESSION_ID`, `TMUX_PANE`, `ZELLIJ_PANE_ID`, `WEZTERM_PANE`, `KITTY_WINDOW_ID`, `GHOSTTY_SURFACE_ID`, `ALACRITTY_WINDOW_ID`, `GNOME_TERMINAL_SCREEN`, `KONSOLE_DBUS_SESSION`, `TILIX_ID`, `WT_SESSION`), POSIX session leader (`getsid(0)`), and Windows console/process tree tracking.
 
@@ -2030,6 +2215,8 @@ AI agents run `tes claim` before modifying files. The command records the starti
 
 If `--branch` does not exist yet and `--from <base-branch>` is passed, Tessera forks the new branch from `<base-branch>` and stages the base branch's baseline for claimed files so IDE tools read and edit the parent branch's state.
 
+When `--branch` is omitted and any claimed file already has uncommitted changes from the user or another session, Tessera automatically isolates the fresh session onto `agent/<session_id>` (controlled by `auto_isolate_dirty_claims = true` by default). Pass `--branch <branch>` explicitly (for example, `tes claim --branch main ...`) when same-branch collaboration is intended, or disable auto-isolation via `tes config set auto_isolate_dirty_claims false`.
+
 ## Examples
 
 ```bash
@@ -2153,12 +2340,14 @@ tes stash [subcommand] [options]
 
 ## Subcommands
 
-- `tes stash [push] [-m <msg>] [-a <ID>] [paths...]` - Save the current session's (or working tree's) uncommitted changes onto the stash stack and restore the stashed files to the branch base. Optionally pass `<paths...>` to stash only specific files.
+- `tes stash [push] [-m <msg>] [-b <branch>] [-a <ID>] [paths...]` - Save the current session's (or working tree's) uncommitted changes onto the stash stack and restore the stashed files to the branch base. Optionally pass `<paths...>` to stash only specific files.
 - `tes stash pop [index] [-a <ID>]` - 3-way AST-merge `stash@{index}` (default `0`) onto the current branch/session and remove it from the stash stack.
 - `tes stash apply [index] [-a <ID>]` - 3-way AST-merge `stash@{index}` (default `0`) onto the current branch/session while keeping it in the stash stack.
 - `tes stash list` - List all stash entries (`stash@{0}`, `stash@{1}`, ...).
-- `tes stash drop [index]` - Delete a single stash entry (default `0`).
-- `tes stash clear` - Remove all entries from the stash stack.
+- `tes stash drop [index] [-a <ID>]` - Delete a single stash entry (default `0`).
+- `tes stash clear [-a <ID>]` - Remove all entries from the stash stack.
+
+> **Note:** `-a` / `--agent <ID>` is accepted both **before** and **after** subcommands (for example, `tes stash -a antigravity-1 pop` and `tes stash pop -a antigravity-1` are equivalent).
 
 ## Examples
 
@@ -2228,7 +2417,11 @@ tes exec [-b <branch>] -- <command...>
 
 ## Description
 
-`tes exec` materializes the target branch's files into a Copy-on-Write sandbox, clones dependency and build caches (`node_modules`, `target`, `.venv`, `vendor`), prepends `<sandbox>/node_modules/.bin` to `PATH`, and exports isolated `PORT`, `TES_PORT`, `TES_BRANCH`, and `DATABASE_URL` environment variables.
+`tes exec` materializes the target branch's files into a Copy-on-Write sandbox, clones configured dependency and build caches (`cow_cache_dirs`: `node_modules`, `target`, `.venv`, `vendor`, and more), prepends `extra_bin_dirs` (`.venv/bin`, `venv/bin`, `node_modules/.bin`, `vendor/bin` by default) to `PATH`, and exports session environment variables:
+
+- Always exported: `TES_PORT`, `TES_BRANCH`, `TES_DB_NAME` (`test_slot_<N>`), `TES_AGENT_ID`, `TES_AGENT_SLOT`, `TES_CHANGE_ID`, `TES_INTENT`, and `TMPDIR` (plus `CARGO_TARGET_DIR` when `Cargo.toml` is present).
+- Exported when `port_isolation = true` (or `TES_PORT_ISOLATION=1`; defaults to `false`): `PORT`, polyglot framework port variables, and POSIX CLI port-wrapper shims (`TES_SHIM_BIN`).
+- Suffixed only when already configured locally: if `DATABASE_URL` or `TEST_DATABASE_URL` is set in the environment or `.env*` and points to a local database host (`localhost`, `127.0.0.1`, `[::1]`, `0.0.0.0`), Tessera appends `_slot_<N>`. Unset variables are not fabricated, and SQLite (`sqlite:`, `file:`) and remote/cloud URLs are left untouched.
 
 ## Examples
 
@@ -2261,6 +2454,7 @@ tes merge [branches_or_sessions...] [options]
 - `--into <BRANCH>` - Target branch to merge into (defaults to the active session's branch or `main`).
 - `-m, --message <MSG>` - Commit message for the merge commit.
 - `--verify <CMD>` - Verification command to run before finalizing the merge.
+- `--dry-run` - Preview the full semantic merge in memory (reporting files that would change and any conflicts that would occur) without advancing branch refs, modifying working-tree files, or recording an operation log entry.
 - `--keep-open` - Keep agent sessions open after merging.
 - `--co-author [=<NAME <EMAIL>>]` - Append a `Co-authored-by:` trailer to the merge commit (defaults to configured `co_author_trailer` when passed without a value; repeatable).
 - `--no-co-author` - Omit `Co-authored-by:` trailers even if `co_author = true` in repository config.
@@ -2279,6 +2473,9 @@ Merge commits record your active Git/system user as the commit `Author` (or `--a
 ```bash
 # commit the current session onto its target branch
 tes merge -m "feat(pricing): add pricing calculator"
+
+# preview a multi-branch merge without mutating refs or the working tree
+tes merge feat/pricing feat/faq --into main --dry-run
 
 # merge two feature branches into main
 tes merge feat/pricing feat/faq --into main -m "feat: add pricing and faq"
@@ -2530,21 +2727,29 @@ Resolve a merge conflict in a file using a specified strategy.
 ## Usage
 
 ```bash
-tes resolve <path> --strategy <strategy>
+tes resolve <path> --strategy <strategy> [options]
 ```
 
 ## Options
 
-- `--strategy <STRATEGY>` - Resolution strategy (`ast-union`, `ours`, `theirs`, `working`, or `content`).
+- `--strategy <STRATEGY>` - Resolution strategy (`ast-union`, `ours`, `theirs`, `working`, or `content`; defaults to `working`).
+- `--content <TEXT>` - Inline resolved file content when `--strategy content` is selected.
+- `--content-file <PATH>` - Read resolved file content from `<PATH>` when `--strategy content` is selected (useful for multi-line or large files).
 
 ## Description
 
-The `resolve` command clears the conflict record for `<path>`, writes the chosen resolution to disk and the target branch, and replaces any intermediate conflict commit cleanly:
+The `resolve` command clears the active conflict record for `<path>` and writes the resolved content to the active branch's working tree and sandbox:
 
-- `ast-union` - Combine both sides' AST declarations and statements in order.
+- When no active sessions hold uncommitted changes on `<path>` for the active branch, Tessera records a new resolution commit (`Resolve conflict in <path>`) on top of the active branch tip and updates its ref, Git index (if checked out), and branch sandbox.
+- When active sessions hold uncommitted edits on `<path>`, Tessera updates the working file, sandbox, and active session baselines so those sessions can continue editing and commit cleanly.
+
+Supported strategies:
+
+- `ast-union` - Combine both sides' AST declarations and statements in order (rejected on binary files).
 - `ours` - Keep the first session or branch's version.
 - `theirs` - Keep the second session or branch's version.
-- `working` - Use the file as currently edited and saved on disk.
+- `working` - Use the file as currently edited and saved on disk (fails if Git conflict markers `<<<<<<<` / `=======` / `>>>>>>>` still remain).
+- `content` - Write explicit resolved content supplied via `--content <TEXT>` or `--content-file <PATH>`.
 
 ## Examples
 
@@ -2560,6 +2765,9 @@ tes resolve src/App.vue --strategy theirs
 
 # resolve using the manually edited file on disk
 tes resolve src/App.vue --strategy working
+
+# resolve with explicit content from a file
+tes resolve src/App.vue --strategy content --content-file resolved-app.vue
 ```
 
 ---
@@ -2636,6 +2844,42 @@ tes restore --source main src/App.vue
 
 ---
 
+# tes oplog
+
+Inspect the lock-free, content-addressed Operation Log history.
+
+## Usage
+
+```bash
+tes oplog [options]
+```
+
+## Options
+
+- `-n, --limit <N>` - Maximum number of operations to display (default: `20`).
+- `--json` - Emit structured JSON operation entries.
+
+## Description
+
+Every state transition in `.git/tessera` (initialization, session claims, file reconciliations, checkpoints, commits, stashes, restores, and merges) is recorded as an immutable Blake3-hashed operation in `.git/tessera/oplog/`.
+
+`tes oplog` lists recent operations newest-first, showing each operation's short `OpId`, session ID, classification (`milestone` or `ephemeral`), and description. Pass any `OpId` prefix to `tes undo --op <op-id>` to roll back repository state atomically.
+
+## Examples
+
+```bash
+# view the 20 most recent operations
+tes oplog
+
+# view the last 50 operations without paging
+tes -P oplog -n 50
+
+# emit operation history as JSON
+tes oplog --json
+```
+
+---
+
 # tes undo
 
 Undo the most recent operation or roll back to a specific operation ID.
@@ -2673,6 +2917,146 @@ tes undo --checkpoint before-refactor
 
 ---
 
+# tes sync
+
+Auto-rebase all active agent sessions onto the latest trunk commit using 3-way Tree-sitter AST merge.
+
+## Usage
+
+```bash
+tes sync [options]
+```
+
+## Options
+
+- `--json` - Emit structured JSON output listing the rebased sessions.
+
+## Description
+
+`tes sync` performs a non-blocking auto-rebase of active sessions onto the latest branch/trunk commit using Tessera's 3-way Tree-sitter AST merge engine, preserving each session's stable reverse-hex `ChangeId` and recording any overlapping edits as first-class conflicts rather than aborting other sessions.
+
+## Examples
+
+```bash
+# rebase all active sessions onto the latest commits
+tes sync
+
+# emit sync results as JSON
+tes sync --json
+```
+
+---
+
+# tes gc
+
+Compact ephemeral working-copy micro-snapshot operations in `.git/tessera/oplog/`.
+
+## Usage
+
+```bash
+tes gc [options]
+```
+
+## Options
+
+- `--json` - Emit structured JSON output (`{ "compacted_operations": <N> }`).
+
+## Description
+
+High-frequency working-tree snapshots recorded while agents edit files are marked as `ephemeral` in the Operation Log. Running `tes gc` compacts those ephemeral micro-snapshots to keep `.git/tessera/oplog/` small while preserving all milestone operations, commits, merges, and named checkpoints (`tes checkpoint`).
+
+## Examples
+
+```bash
+# compact ephemeral micro-snapshots
+tes gc
+
+# run compaction with JSON output
+tes gc --json
+```
+
+---
+
+# tes watch
+
+Continuously watch the working tree and auto-reconcile edits for hookless editors or AI harnesses.
+
+## Usage
+
+```bash
+tes watch [options]
+```
+
+## Options
+
+- `-a, --agent <ID>` - Explicit agent or session ID (auto-detected if omitted).
+- `--interval-ms <N>` - Polling interval in milliseconds (default: `250`, minimum: `50`).
+- `--once` - Run a single watch scan tick and exit (useful for scripts and tests).
+- `--json` - Emit structured JSON watch outcomes.
+
+## Description
+
+AI harnesses that support post-tool hooks (such as Claude Code and Codex) or follow Tessera's rule instructions run `tes hook post-tool` automatically after file writes. For hookless editors or custom tools, `tes watch` polls claimed paths in the working tree, snapshots writes, and reconciles concurrent edits automatically.
+
+## Examples
+
+```bash
+# watch the working tree every 250ms for the current session
+tes watch
+
+# run a single reconciliation pass and exit
+tes watch --once --json
+
+# watch with a custom polling interval for a specific session
+tes watch --agent custom-worker --interval-ms 150
+```
+
+---
+
+# tes agent
+
+Manage active agent and terminal sessions and isolated Copy-on-Write workspaces.
+
+## Usage
+
+```bash
+tes agent <subcommand> [arguments]
+```
+
+Alias: `tes session <subcommand>`
+
+## Subcommands
+
+- `tes agent spawn <name> [--intent <TEXT>] [--scope <PREFIX>...]` - Spawn an isolated Copy-on-Write workspace at `.tessera/workspaces/<name>` (optionally restricted to `--scope` directory prefixes).
+- `tes agent list` - List all active agent and terminal sessions with their slot number, reverse-hex Change-ID, head commit, and intent.
+- `tes agent focus <name>` (alias: `goto`) - Focus the originating terminal tab, multiplexer pane (`tmux`, `zellij`, `WezTerm`, `kitty`), or IDE window for a session ID, conversation ID, or unique prefix.
+- `tes agent exec <name> -- <command...>` - Run a command inside an agent's workspace with isolated `TES_PORT` (`PORT` when `port_isolation = true`), `TES_DB_NAME`, and `TMPDIR`.
+- `tes agent close [name] [--all]` - Close a specific agent session (defaults to the current session if `<name>` is omitted, or all sessions with `--all`) and remove its isolated Copy-on-Write workspace.
+- `tes agent clear [-f | --force]` (alias: `prune`) - Clear idle or finished sessions. Pass `-f` / `--force` to also clear sessions with uncommitted changes.
+
+## Examples
+
+```bash
+# list all active sessions
+tes agent list
+
+# jump directly to a terminal or IDE session
+tes session focus term-48210
+
+# spawn an isolated CoW workspace for a background task
+tes agent spawn docs-worker --intent "Update API reference" --scope docs
+
+# run tests inside a spawned agent workspace
+tes agent exec docs-worker -- npm test
+
+# close a specific session or prune idle sessions
+tes agent close docs-worker
+tes agent clear
+tes agent clear --force
+```
+
+---
+
 # tes config
 
 View or update repository configuration settings.
@@ -2685,13 +3069,13 @@ tes config <subcommand> [arguments]
 
 ## Subcommands
 
-- `show` - Display the effective configuration for the repository.
+- `show` - Display the effective configuration for the repository (combining `.git/tessera/config.toml` and `tessera.toml`).
 - `set <KEY> <VALUE>` - Update `trunk_branch`, `base_port`, `port_stride`, `port_isolation`, `verify_command`, `watch_interval_ms`, `watch_timeout_secs`, `co_author`, `co_author_trailer`, `auto_isolate_dirty_claims`, or `pager`.
-- `trust` - Trust the repository's `tessera.toml` so `verify_command`, `pager`, `extra_bin_dirs`, and `custom_env` defined in `tessera.toml` are allowed to execute.
-- `untrust` - Revoke trust for the repository's `tessera.toml`.
+- `trust` - Trust the current digest of the repository's checked-in `tessera.toml` so its execution-sensitive settings (`verify_command`, `pager`, `extra_bin_dirs`, and `custom_env`) are honored.
+- `untrust` - Revoke local trust for the repository's `tessera.toml`.
 - `add-cache-dir <DIRS...>` - Add directories to `cow_cache_dirs`.
-- `add-bin-dir <DIRS...>` - Add directories to `extra_bin_dirs`.
-- `add-package-glob <GLOBS...>` - Add monorepo package glob patterns to `package_globs`.
+- `add-bin-dir <DIRS...>` - Add relative binary directories to `extra_bin_dirs` (defaults to `.venv/bin`, `venv/bin`, `node_modules/.bin`, `vendor/bin`; `bin` and `.bin` are excluded by default for security).
+- `add-package-glob <GLOBS...>` - Add monorepo package glob patterns to `package_globs` (defaults to `crates/*`, `packages/*`, `apps/*`, `services/*`).
 - `set-env <KEY> <TEMPLATE>` - Set a custom environment variable template (`{slot}`, `{port}`, `{branch}`, `{agent_id}`).
 
 ## Options
@@ -2728,3 +3112,98 @@ tes config set-env DATABASE_URL "postgres://localhost:5432/app_slot_{slot}"
 ## See Also
 
 - [Configuration Guide](/guides/configuration) - Full `tessera.toml` reference
+
+---
+
+# tes doctor
+
+Run repository health, configuration, filesystem, and integration diagnostics.
+
+## Usage
+
+```bash
+tes doctor [options]
+```
+
+## Options
+
+- `--json` - Emit structured JSON diagnostic checks and status summary.
+
+## Description
+
+`tes doctor` inspects the current repository and local environment and reports actionable pass/warn/fail checks across:
+
+1. **Git and `.git/tessera` State**: Verifies the Git repository, `.git/tessera` store initialization, operation log heads, and branch reference consistency.
+2. **Configuration and Trust**: Validates `.git/tessera/config.toml` and any checked-in `tessera.toml`, reporting whether execution-sensitive fields (`verify_command`, `pager`, `extra_bin_dirs`, `custom_env`) are trusted via `tes config trust`.
+3. **Copy-on-Write Filesystem Support**: Checks whether the repository filesystem supports native Copy-on-Write clones (`clonefile` on macOS APFS, `FICLONE` on Linux Btrfs/XFS/bcachefs) or uses the portable fallback.
+4. **Hooks, Harnesses, and Shell Integration**: Checks installed Git sync hooks (`.git/hooks/post-commit`, `post-merge`, `post-checkout`), AI editor rule files, and shell prompt integration (`tes env`).
+5. **Sessions, Sandboxes, and Conflicts**: Surfaces active conflicts, stale or orphaned sessions, and sandbox health.
+
+## Examples
+
+```bash
+# run repository and environment health checks
+tes doctor
+
+# output structured diagnostics as JSON for scripts or AI agents
+tes doctor --json
+```
+
+---
+
+# tes mcp
+
+Start the built-in Model Context Protocol (MCP) JSON-RPC 2.0 server over `stdio`.
+
+## Usage
+
+```bash
+tes mcp
+```
+
+## Description
+
+`tes mcp` exposes Tessera's multi-agent coordination, branch lifecycle, conflict resolution, and diagnostics capabilities as a local MCP server over `stdin`/`stdout`. `tes init` automatically registers `tes mcp` in supported editor configurations (`.mcp.json`, `.cursor/mcp.json`, `.kiro/settings/mcp.json`, `opencode.json`, `.codex/config.toml`, and `.vscode/mcp.json`).
+
+> **Security Note:** To prevent untrusted MCP tool calls from executing arbitrary shell commands, `merge` and `commit` with `verify: true` only run the repository's configured and trusted `verify_command` (set via `tes config --verify-cmd` or trusted `tessera.toml`).
+
+## MCP Tools
+
+| Tool | Input Schema | Description |
+| ---- | ------------ | ----------- |
+| `status` | `{ agent_id? }` | Snapshot and return the session's status, Change-ID, commit SHA, intent, and claimed symbols |
+| `radar` | `{}` | Return live multi-agent radar showing active sessions, intents, and overlapping edits |
+| `claim` | `{ intent?, branch?, from?, symbols?, agent_id? }` | Claim a task intent, optional target branch and parent base (`from`), and file/symbol paths |
+| `commit` | `{ message?, branch?, amend?, author?, co_author?, no_co_author?, verify?, agent_id? }` | Commit the session's isolated changes onto its target branch |
+| `diff` | `{ branch?, staged?, rev_range?, paths?, agent_id? }` | Inspect unified diffs for the session, staged edits, branch, or revision range |
+| `log` | `{ branch?, limit? }` | Return commit history for a branch |
+| `oplog` | `{ limit? }` | Return recent entries from the lock-free Operation Log |
+| `push` | `{ remote?, branch?, force?, tags?, dry_run?, agent_id? }` | Push the session's active (or specified) branch to a Git remote |
+| `pull` | `{ remote?, branch?, agent_id? }` | Fetch and fast-forward or 3-way AST-merge a remote branch and rebase active sessions |
+| `checkpoint` | `{ label, agent_id? }` | Create a named atomic checkpoint in the Operation Log |
+| `restore` | `{ source?, branch?, paths?, agent_id? }` | Restore a branch or specific paths to a commit SHA, `HEAD~N`, branch, or checkpoint |
+| `branch` | `{ action?: "list"\|"switch"\|"delete"\|"rename", branch?, new_branch?, from?, force?, agent_id? }` | List, switch, delete, or rename branches across Git refs, sandboxes, and sessions |
+| `stash` | `{ action?: "push"\|"pop"\|"apply"\|"list"\|"drop"\|"clear", message?, branch?, paths?, index?, agent_id? }` | Save or reapply session-isolated uncommitted changes via 3-way AST merge |
+| `cherry-pick` | `{ commit, branch?, agent_id? }` | Apply the delta of an existing commit onto the target branch via 3-way AST merge |
+| `conflicts` | `{}` | Return all active first-class conflicts with AST snippets and competing intents |
+| `resolve` | `{ path, strategy: "ours"\|"theirs"\|"ast-union"\|"working"\|"content", content? }` | Resolve a conflict at `path` using the specified strategy |
+| `sync` | `{}` | Non-blocking auto-rebase of all active sessions onto the latest trunk commit |
+| `undo` | `{ op?, checkpoint? }` | Atomically roll back repository state to the previous operation, an `OpId` prefix, or a checkpoint |
+| `merge` | `{ agents?, into?, message?, verify?, keep_open?, dry_run?, author?, co_author?, no_co_author? }` | Semantically merge sessions or branches into a target branch (or preview with `dry_run`) |
+| `agent` | `{ action?: "list"\|"close"\|"clear", agent_id?, force? }` | List, close, or clear active agent sessions |
+| `config` | `{ action?: "show" }` | Inspect effective repository configuration |
+| `doctor` | `{}` | Run repository health, config trust, filesystem, and integration diagnostics |
+
+## MCP Resources
+
+The server also exposes read-only MCP resources via `resources/list` and `resources/read`:
+
+- `tessera://status` - Current session status and branch state snapshot.
+- `tessera://radar` - Live multi-agent symbol collision radar across all active sessions.
+- `tessera://conflicts` - Active first-class conflicts with snippets and competing agent intents.
+
+## MCP Prompts
+
+The server exposes reusable MCP prompts via `prompts/list` and `prompts/get`:
+
+- `resolve-conflicts` - Structured workflow prompt for inspecting active conflicts, comparing competing intents and snippets, and resolving them safely.

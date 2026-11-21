@@ -33,7 +33,7 @@ Navigate to any project directory and run `tes init`:
 tes init
 ```
 
-This creates `.git/tessera` and installs workspace rules for your AI coding editors.
+This creates `.git/tessera`, installs Git sync hooks (`post-commit`, `post-merge`, and `post-checkout`), and installs workspace rules for your AI coding editors (Antigravity by default, plus auto-detected Claude Code, Cursor, Windsurf, Kiro, OpenCode, Codex, and VS Code, or specify `--harness all|<list>`). Pass `tes init --local` on mixed teams to exclude installed rule files via `.git/info/exclude`.
 
 > **Note:** If the directory is not yet a Git repository, `tes init` runs `git init` and creates an initial commit from your existing files before setting up Tessera.
 
@@ -54,8 +54,8 @@ tes merge feat/pricing --into main -m "feat: add pricing calculator"
 tes init
 ```
 
-- Sets up `.git/tessera` inside your existing Git repository
-- Installs instruction rules (`AGENTS.md`, `.agents/rules/tessera.md`, `.cursor/rules`, `CLAUDE.md`) so your AI coding agents coordinate through Tessera
+- Sets up `.git/tessera` and Git sync hooks (`.git/hooks/post-commit`, `post-merge`, and `post-checkout`) inside your existing Git repository
+- Installs instruction rules for Antigravity (`.agents/rules/tessera.md`) by default plus auto-detected AI editors (`CLAUDE.md`, `.claude/settings.json`, `.cursor/rules/tessera.mdc`, `AGENTS.md`, and more; use `--harness all` to install all, or `--local` to add them to `.git/info/exclude`)
 
 ```bash:no-line-numbers
 tes switch feat/pricing
@@ -73,9 +73,12 @@ tes merge feat/pricing --into main -m "feat: add pricing calculator"
 
 ## Working in a Single Folder
 
-In a standard Git checkout, every terminal tab and AI agent shares `.git/HEAD` and the working tree on disk. Tessera isolates each session inside a **single repository folder** with its own branch state and port slot:
+In a standard Git checkout, every terminal tab and AI agent shares `.git/HEAD` and the working tree on disk. Tessera isolates each session inside a **single repository folder** with its own branch state and `TES_PORT` slot. When running concurrent dev servers on separate branches, enable `port_isolation` (defaults to `false`) with `tes config set port_isolation true` or `TES_PORT_ISOLATION=1`:
 
 ```bash:no-line-numbers
+# Enable automatic dev-server port isolation (defaults to false)
+tes config set port_isolation true
+
 # Terminal 1 works on feat/pricing (assigned port 3100)
 tes switch feat/pricing
 npm run dev

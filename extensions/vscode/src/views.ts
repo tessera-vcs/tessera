@@ -81,10 +81,10 @@ export class SidebarNode extends vscode.TreeItem {
 
 /**
  * TreeDataProvider for the "Branches" view.
- * Expanding a branch shows its modified files ahead of `main` and active sessions.
+ * Expanding a branch shows its modified files ahead of the trunk branch and quick actions.
  */
 export class BranchesTreeProvider
-  implements vscode.TreeDataProvider<SidebarNode>
+  implements vscode.TreeDataProvider<SidebarNode>, vscode.Disposable
 {
   private snapshot: WorkspaceStateSnapshot | undefined;
   private readonly onDidChangeTreeDataEmitter = new vscode.EventEmitter<
@@ -138,6 +138,7 @@ export class BranchesTreeProvider
         return [];
       }
 
+      const trunkBranch = this.snapshot.branchReport.trunk_branch || "main";
       const children: SidebarNode[] = [];
 
       children.push(
@@ -185,7 +186,7 @@ export class BranchesTreeProvider
             filePath: file,
             command: {
               command: "tes.diffBranchFile",
-              title: "Diff with main",
+              title: `Diff with ${trunkBranch}`,
               arguments: [detail.name, file],
             },
           })
@@ -230,13 +231,20 @@ export class BranchesTreeProvider
       }
     );
   }
+
+  /**
+   * Disposes the underlying tree data change emitter.
+   */
+  public dispose(): void {
+    this.onDidChangeTreeDataEmitter.dispose();
+  }
 }
 
 /**
  * TreeDataProvider for the "Sessions" view.
  */
 export class SessionsTreeProvider
-  implements vscode.TreeDataProvider<SidebarNode>
+  implements vscode.TreeDataProvider<SidebarNode>, vscode.Disposable
 {
   private snapshot: WorkspaceStateSnapshot | undefined;
   private readonly onDidChangeTreeDataEmitter = new vscode.EventEmitter<
@@ -302,8 +310,11 @@ export class SessionsTreeProvider
         return [];
       }
 
+      const trunkBranch = this.snapshot.branchReport.trunk_branch || "main";
       const branch =
-        agent.target_branch ?? this.snapshot.branchReport.editor_branch;
+        agent.target_branch ??
+        this.snapshot.branchReport.editor_branch ??
+        trunkBranch;
       const wp = agent.waypoint;
       const isIdeGui =
         wp?.ide_pid !== undefined && wp?.ide_pid !== null && !wp?.tty;
@@ -371,7 +382,7 @@ export class SessionsTreeProvider
             filePath: modFile,
             command: {
               command: "tes.diffBranchFile",
-              title: "Diff with main",
+              title: `Diff with ${trunkBranch}`,
               arguments: [branch, modFile],
             },
           })
@@ -397,6 +408,7 @@ export class SessionsTreeProvider
     const branch =
       agent.target_branch ??
       this.snapshot?.branchReport.editor_branch ??
+      this.snapshot?.branchReport.trunk_branch ??
       "main";
     const wp = agent.waypoint;
     const wpDetails: string[] = [];
@@ -432,13 +444,20 @@ export class SessionsTreeProvider
       }
     );
   }
+
+  /**
+   * Disposes the underlying tree data change emitter.
+   */
+  public dispose(): void {
+    this.onDidChangeTreeDataEmitter.dispose();
+  }
 }
 
 /**
  * TreeDataProvider for the "Conflicts & Checkpoints" view.
  */
 export class ConflictsAndCheckpointsTreeProvider
-  implements vscode.TreeDataProvider<SidebarNode>
+  implements vscode.TreeDataProvider<SidebarNode>, vscode.Disposable
 {
   private snapshot: WorkspaceStateSnapshot | undefined;
   private readonly onDidChangeTreeDataEmitter = new vscode.EventEmitter<
@@ -569,5 +588,12 @@ export class ConflictsAndCheckpointsTreeProvider
     }
 
     return items;
+  }
+
+  /**
+   * Disposes the underlying tree data change emitter.
+   */
+  public dispose(): void {
+    this.onDidChangeTreeDataEmitter.dispose();
   }
 }

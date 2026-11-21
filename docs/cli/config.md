@@ -10,13 +10,13 @@ tes config <subcommand> [arguments]
 
 ## Subcommands
 
-- `show` - Display the effective configuration for the repository.
+- `show` - Display the effective configuration for the repository (combining `.git/tessera/config.toml` and `tessera.toml`).
 - `set <KEY> <VALUE>` - Update `trunk_branch`, `base_port`, `port_stride`, `port_isolation`, `verify_command`, `watch_interval_ms`, `watch_timeout_secs`, `co_author`, `co_author_trailer`, `auto_isolate_dirty_claims`, or `pager`.
-- `trust` - Trust the repository's `tessera.toml` so `verify_command`, `pager`, `extra_bin_dirs`, and `custom_env` defined in `tessera.toml` are allowed to execute.
-- `untrust` - Revoke trust for the repository's `tessera.toml`.
+- `trust` - Trust the current digest of the repository's checked-in `tessera.toml` so its execution-sensitive settings (`verify_command`, `pager`, `extra_bin_dirs`, and `custom_env`) are honored.
+- `untrust` - Revoke local trust for the repository's `tessera.toml`.
 - `add-cache-dir <DIRS...>` - Add directories to `cow_cache_dirs`.
-- `add-bin-dir <DIRS...>` - Add directories to `extra_bin_dirs`.
-- `add-package-glob <GLOBS...>` - Add monorepo package glob patterns to `package_globs`.
+- `add-bin-dir <DIRS...>` - Add relative binary directories to `extra_bin_dirs` (defaults to `.venv/bin`, `venv/bin`, `node_modules/.bin`, `vendor/bin`; `bin` and `.bin` are excluded by default for security).
+- `add-package-glob <GLOBS...>` - Add monorepo package glob patterns to `package_globs` (defaults to `crates/*`, `packages/*`, `apps/*`, `services/*`).
 - `set-env <KEY> <TEMPLATE>` - Set a custom environment variable template (`{slot}`, `{port}`, `{branch}`, `{agent_id}`).
 
 ## Options

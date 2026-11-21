@@ -25,6 +25,30 @@ struct LineEdit {
     replacement: Vec<String>,
 }
 
+/// Cyclic boundary shift applied to normalize a structural diff hunk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CyclicRotation {
+    /// No cyclic boundary shift was applied.
+    None,
+    /// Leading closing delimiters (`}`, `end`, `</tag>`) rotated to the end of the chunk.
+    LeadingClosers(Vec<String>),
+    /// Trailing `[section]` headers rotated to the start of the chunk.
+    TrailingSections(Vec<String>),
+    /// Leading deeper-indented continuation lines rotated to the end of the chunk.
+    LeadingDeeperIndent(usize),
+}
+
+/// Structural block fingerprint capturing declaration keys, cyclic rotation symmetry, and indentation.
+#[derive(Debug, Clone)]
+struct StructuralBlockSignature {
+    /// Canonical declaration/block keys present in the hunk.
+    keys: std::collections::BTreeSet<String>,
+    /// Cyclic boundary rotation applied when normalizing the hunk.
+    rotation: CyclicRotation,
+    /// Minimum non-empty indentation width (in bytes) of the normalized hunk.
+    min_indent: usize,
+}
+
 /// Computes the list of line replacement hunks transforming `base_text` into `target_text`
 /// using `imara-diff`'s Histogram algorithm.
 fn compute_line_edits(base_text: &str, target_text: &str) -> Vec<LineEdit> {
@@ -54,7 +78,7 @@ fn compute_line_edits(base_text: &str, target_text: &str) -> Vec<LineEdit> {
 }
 
 /// Performs a 3-way line-level merge (diff3) between `base`, `left`, and `right` using
-/// Histogram diff alignment.
+/// Histogram diff alignment with safe sub-line and structural reconciliation.
 ///
 /// Non-overlapping line hunks and identical edits on both sides merge cleanly. Overlapping
 /// incompatible line hunks emit intent-annotated conflict markers.
@@ -64,6 +88,30 @@ pub fn merge_text_3way(
     right: &str,
     left_label: &str,
     right_label: &str,
+) -> TextMergeOutcome {
+    merge_text_3way_inner(base, left, right, left_label, right_label, true)
+}
+
+/// Performs a strict 3-way line-level diff3 merge without sub-line token or delimited-span
+/// heuristics, used by manifest/lockfile drivers for format-preserving fast paths and conflict output.
+pub(crate) fn merge_text_3way_strict(
+    base: &str,
+    left: &str,
+    right: &str,
+    left_label: &str,
+    right_label: &str,
+) -> TextMergeOutcome {
+    merge_text_3way_inner(base, left, right, left_label, right_label, false)
+}
+
+/// Core 3-way line-level diff3 engine parameterized by `allow_heuristics`.
+fn merge_text_3way_inner(
+    base: &str,
+    left: &str,
+    right: &str,
+    left_label: &str,
+    right_label: &str,
+    allow_heuristics: bool,
 ) -> TextMergeOutcome {
     if left == right || right == base {
         return TextMergeOutcome {
@@ -119,8 +167,8 @@ pub fn merge_text_3way(
             (Some(le), Some(re)) => {
                 let l_pure_insert = le.base_start == le.base_end;
                 let r_pure_insert = re.base_start == re.base_end;
-                let boundary_collision = (le.base_end == re.base_start
-                    || re.base_end == le.base_start)
+                let boundary_collision = allow_heuristics
+                    && (le.base_end == re.base_start || re.base_end == le.base_start)
                     && (l_pure_insert != r_pure_insert)
                     && chunks_share_structural_key(&le.replacement, &re.replacement);
 
@@ -165,52 +213,110 @@ pub fn merge_text_3way(
                     r_idx += 1;
                 } else {
                     let region_start = le.base_start.min(re.base_start);
-                    let region_end = le.base_end.max(re.base_end);
+                    let mut region_end = le.base_end.max(re.base_end);
+                    let mut l_end_idx = l_idx + 1;
+                    let mut r_end_idx = r_idx + 1;
+
+                    // Transitively absorb all subsequent left/right hunks overlapping the window
+                    // so `base_pos` never rewinds and no lines are duplicated or lost.
+                    loop {
+                        let mut expanded = false;
+
+                        while let Some(next_le) = left_edits.get(l_end_idx) {
+                            let last_re = &right_edits[r_end_idx - 1];
+
+                            if edit_overlaps_window(
+                                next_le,
+                                region_start,
+                                region_end,
+                                last_re,
+                                allow_heuristics,
+                            ) {
+                                region_end = region_end.max(next_le.base_end);
+                                l_end_idx += 1;
+                                expanded = true;
+                            } else {
+                                break;
+                            }
+                        }
+
+                        while let Some(next_re) = right_edits.get(r_end_idx) {
+                            let last_le = &left_edits[l_end_idx - 1];
+
+                            if edit_overlaps_window(
+                                next_re,
+                                region_start,
+                                region_end,
+                                last_le,
+                                allow_heuristics,
+                            ) {
+                                region_end = region_end.max(next_re.base_end);
+                                r_end_idx += 1;
+                                expanded = true;
+                            } else {
+                                break;
+                            }
+                        }
+
+                        if !expanded {
+                            break;
+                        }
+                    }
 
                     while base_pos < region_start && base_pos < base_lines.len() {
                         out_lines.push(base_lines[base_pos].to_string());
                         base_pos += 1;
                     }
 
-                    let base_chunk: Vec<&str> = base_lines[region_start..region_end].to_vec();
+                    let clamped_end = region_end.min(base_lines.len());
+                    let clamped_start = region_start.min(clamped_end);
+                    let base_chunk: Vec<&str> = base_lines[clamped_start..clamped_end].to_vec();
+                    let left_chunk = materialize_chunk(
+                        &base_lines,
+                        clamped_start,
+                        clamped_end,
+                        &left_edits[l_idx..l_end_idx],
+                    );
+                    let right_chunk = materialize_chunk(
+                        &base_lines,
+                        clamped_start,
+                        clamped_end,
+                        &right_edits[r_idx..r_end_idx],
+                    );
 
-                    let mut left_chunk: Vec<String> = Vec::new();
-                    for line in &base_lines[region_start..le.base_start] {
-                        left_chunk.push((*line).to_string());
-                    }
-                    left_chunk.extend(le.replacement.iter().cloned());
-                    for line in &base_lines[le.base_end..region_end] {
-                        left_chunk.push((*line).to_string());
-                    }
-
-                    let mut right_chunk: Vec<String> = Vec::new();
-                    for line in &base_lines[region_start..re.base_start] {
-                        right_chunk.push((*line).to_string());
-                    }
-                    right_chunk.extend(re.replacement.iter().cloned());
-                    for line in &base_lines[re.base_end..region_end] {
-                        right_chunk.push((*line).to_string());
-                    }
-
-                    if let Some(reconciled) =
-                        try_reconcile_overlapping_hunk(&base_chunk, &left_chunk, &right_chunk)
-                    {
-                        out_lines.extend(reconciled);
+                    if left_chunk == right_chunk {
+                        out_lines.extend(left_chunk);
+                    } else if allow_heuristics {
+                        if let Some(reconciled) =
+                            try_reconcile_overlapping_hunk(&base_chunk, &left_chunk, &right_chunk)
+                        {
+                            out_lines.extend(reconciled);
+                        } else {
+                            let (l_conf, r_conf, clean_tail) = split_disjoint_trailing_blocks(
+                                &base_chunk,
+                                &left_chunk,
+                                &right_chunk,
+                            );
+                            conflict_count += 1;
+                            out_lines.push(format!("<<<<<<< {left_label}"));
+                            out_lines.extend(l_conf);
+                            out_lines.push("=======".to_string());
+                            out_lines.extend(r_conf);
+                            out_lines.push(format!(">>>>>>> {right_label}"));
+                            out_lines.extend(clean_tail);
+                        }
                     } else {
-                        let (l_conf, r_conf, clean_tail) =
-                            split_disjoint_trailing_blocks(&left_chunk, &right_chunk);
                         conflict_count += 1;
                         out_lines.push(format!("<<<<<<< {left_label}"));
-                        out_lines.extend(l_conf);
+                        out_lines.extend(left_chunk);
                         out_lines.push("=======".to_string());
-                        out_lines.extend(r_conf);
+                        out_lines.extend(right_chunk);
                         out_lines.push(format!(">>>>>>> {right_label}"));
-                        out_lines.extend(clean_tail);
                     }
 
                     base_pos = region_end;
-                    l_idx += 1;
-                    r_idx += 1;
+                    l_idx = l_end_idx;
+                    r_idx = r_end_idx;
                 }
             }
             (None, None) => break,
@@ -223,6 +329,7 @@ pub fn merge_text_3way(
     }
 
     let mut content = out_lines.join("\n");
+
     if (left.ends_with('\n') || right.ends_with('\n')) && !content.is_empty() {
         content.push('\n');
     }
@@ -232,6 +339,195 @@ pub fn merge_text_3way(
         has_conflicts: conflict_count > 0,
         conflict_count,
     }
+}
+
+/// Returns `true` if `next_edit` overlaps the active conflict window `[region_start, region_end]`
+/// or collides at `region_end` with `last_opposite`.
+fn edit_overlaps_window(
+    next_edit: &LineEdit,
+    region_start: usize,
+    region_end: usize,
+    last_opposite: &LineEdit,
+    allow_heuristics: bool,
+) -> bool {
+    if next_edit.base_start < region_end {
+        return true;
+    }
+
+    if next_edit.base_start == region_end {
+        if region_start == region_end {
+            return true;
+        }
+
+        if last_opposite.base_end == region_end {
+            let next_pure = next_edit.base_start == next_edit.base_end;
+            let opp_pure = last_opposite.base_start == last_opposite.base_end;
+
+            if next_pure && opp_pure {
+                return true;
+            }
+
+            if allow_heuristics
+                && (next_pure != opp_pure)
+                && chunks_share_structural_key(&next_edit.replacement, &last_opposite.replacement)
+            {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/// Applies all `edits` contained within `[region_start, region_end]` onto `base_lines`,
+/// preserving untouched base lines between edits inside the window.
+fn materialize_chunk(
+    base_lines: &[&str],
+    region_start: usize,
+    region_end: usize,
+    edits: &[LineEdit],
+) -> Vec<String> {
+    let mut chunk = Vec::new();
+    let mut pos = region_start;
+
+    for edit in edits {
+        while pos < edit.base_start && pos < base_lines.len() {
+            chunk.push(base_lines[pos].to_string());
+            pos += 1;
+        }
+
+        chunk.extend(edit.replacement.iter().cloned());
+        pos = edit.base_end;
+    }
+
+    while pos < region_end && pos < base_lines.len() {
+        chunk.push(base_lines[pos].to_string());
+        pos += 1;
+    }
+
+    chunk
+}
+
+/// Returns `true` if the `'` character at byte offset `quote_idx` in `line` opens a real
+/// single-quoted string/char literal rather than a Rust lifetime (`'a`, `'static`) or an
+/// English apostrophe (`don't`, `agent's`).
+fn is_single_quote_literal_start(line: &str, quote_idx: usize) -> bool {
+    let bytes = line.as_bytes();
+
+    if quote_idx > 0 {
+        let prev = bytes[quote_idx - 1];
+
+        if prev.is_ascii_alphanumeric() || matches!(prev, b'_' | b'&' | b'<') {
+            return false;
+        }
+    }
+
+    let mut escaped = false;
+    let rest = &line[quote_idx + 1..];
+
+    for (rel_idx, ch) in rest.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+
+        if ch == '\'' {
+            let after_idx = quote_idx + 1 + rel_idx + 1;
+            let next_byte = bytes.get(after_idx).copied();
+
+            if !next_byte.is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_') {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/// Returns `true` if the `<` at `open_idx` opens a generic or tag angle-bracket pair rather than
+/// a comparison or shift operator (`a < b`, `<=`, `<<`, `<-`).
+fn is_generic_angle_open(s: &str, open_idx: usize) -> bool {
+    let bytes = s.as_bytes();
+    let next = bytes.get(open_idx + 1).copied();
+
+    if matches!(next, Some(b'=' | b'<' | b'-') | None) {
+        return false;
+    }
+
+    let prev_ws = open_idx > 0 && bytes[open_idx - 1].is_ascii_whitespace();
+    let next_ws = next.is_some_and(|b| b.is_ascii_whitespace());
+
+    if prev_ws && next_ws {
+        return false;
+    }
+
+    // Verify a matching closing `>` exists before any top-level `;` or unmatched closer.
+    let mut nested_angles = 1usize;
+    let mut paren_depth = 0i32;
+    let mut in_quote: Option<char> = None;
+    let mut escaped = false;
+
+    for (rel_idx, ch) in s[open_idx + 1..].char_indices() {
+        let abs_idx = open_idx + 1 + rel_idx;
+
+        if let Some(q) = in_quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == q {
+                in_quote = None;
+            }
+
+            continue;
+        }
+
+        if ch == '"' || ch == '`' {
+            in_quote = Some(ch);
+            continue;
+        }
+
+        if ch == '\'' && is_single_quote_literal_start(s, abs_idx) {
+            in_quote = Some('\'');
+            continue;
+        }
+
+        match ch {
+            '(' | '[' | '{' => paren_depth += 1,
+            ')' | ']' | '}' => {
+                paren_depth -= 1;
+
+                if paren_depth < 0 {
+                    return false;
+                }
+            }
+            ';' if paren_depth == 0 => return false,
+            '<' if paren_depth == 0 => {
+                if !matches!(bytes.get(abs_idx + 1), Some(b'=' | b'<' | b'-')) {
+                    nested_angles += 1;
+                }
+            }
+            '>' if paren_depth == 0 => {
+                let prev = bytes.get(abs_idx.saturating_sub(1)).copied();
+
+                if !matches!(prev, Some(b'=' | b'-')) {
+                    nested_angles -= 1;
+
+                    if nested_angles == 0 {
+                        return true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    false
 }
 
 /// Attempts to reconcile an overlapping line hunk by stripping shared unchanged prefixes/suffixes
@@ -274,7 +570,11 @@ fn try_reconcile_overlapping_hunk(
             let mut out = Vec::with_capacity(prefix_len + mid.len() + suffix_len);
             out.extend(left_chunk[..prefix_len].iter().cloned());
             out.extend(mid);
-            out.extend(left_chunk[(left_chunk.len() - suffix_len)..].iter().cloned());
+            out.extend(
+                left_chunk[(left_chunk.len() - suffix_len)..]
+                    .iter()
+                    .cloned(),
+            );
             return Some(out);
         }
     }
@@ -336,8 +636,8 @@ fn try_reconcile_overlapping_hunk(
 }
 
 /// Checks if `left_chunk` and `right_chunk` start with an identical YAML mapping container
-/// header (e.g. `dependencies:`) or singleton `[section]` header whose body lines can be
-/// recursively reconciled under a single shared header.
+/// header (e.g. `dependencies:`) or singleton INI/TOML `[section]` header whose body lines
+/// are `key = value` entries rather than code declarations (such as C# `[Authorize]` methods).
 fn find_shared_container_header_prefix(
     left_chunk: &[String],
     right_chunk: &[String],
@@ -387,12 +687,7 @@ fn find_shared_container_header_prefix(
     }
 
     if is_section {
-        let valid_body = l_rest.iter().chain(r_rest.iter()).all(|l| {
-            let t = l.trim();
-            t.is_empty() || !is_section_header_line(t)
-        });
-
-        if valid_body {
+        if is_ini_toml_section_body(l_rest) && is_ini_toml_section_body(r_rest) {
             return Some(hdr_len);
         }
 
@@ -411,6 +706,106 @@ fn find_shared_container_header_prefix(
     None
 }
 
+/// Returns `true` if `lines` looks like an INI/TOML section body of `key = value` entries
+/// rather than C#/Rust/Java/code declarations following an attribute like `[Authorize]` or `[Test]`.
+fn is_ini_toml_section_body(lines: &[String]) -> bool {
+    let mut saw_kv = false;
+
+    for line in lines {
+        let t = line.trim();
+
+        if t.is_empty() || t.starts_with('#') || t.starts_with(';') {
+            continue;
+        }
+
+        if is_section_header_line(t) {
+            return false;
+        }
+
+        if t.ends_with('{') || t.ends_with('}') {
+            return false;
+        }
+
+        if !saw_kv {
+            if !is_ini_toml_kv_line(t) {
+                return false;
+            }
+
+            saw_kv = true;
+        } else if looks_like_code_declaration(t) {
+            return false;
+        }
+    }
+
+    saw_kv
+}
+
+/// Returns `true` if `trimmed` is a plain INI/TOML `key = value` line.
+fn is_ini_toml_kv_line(trimmed: &str) -> bool {
+    if looks_like_code_declaration(trimmed) {
+        return false;
+    }
+
+    let Some(eq_idx) = trimmed.find('=') else {
+        return false;
+    };
+
+    if trimmed.as_bytes().get(eq_idx + 1) == Some(&b'=')
+        || trimmed.as_bytes().get(eq_idx + 1) == Some(&b'>')
+    {
+        return false;
+    }
+
+    let key = trimmed[..eq_idx].trim();
+
+    if key.is_empty() || key.contains('(') || key.contains(')') || key.contains('{') {
+        return false;
+    }
+
+    key.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'"' | b'\'' | b' '))
+}
+
+/// Returns `true` if `trimmed` starts with a common method, class, or function declaration keyword.
+fn looks_like_code_declaration(trimmed: &str) -> bool {
+    for kw in [
+        "public ",
+        "private ",
+        "protected ",
+        "internal ",
+        "static ",
+        "async ",
+        "virtual ",
+        "override ",
+        "abstract ",
+        "sealed ",
+        "readonly ",
+        "extern ",
+        "void ",
+        "class ",
+        "struct ",
+        "interface ",
+        "enum ",
+        "record ",
+        "namespace ",
+        "fn ",
+        "pub ",
+        "func ",
+        "function ",
+        "def ",
+        "let ",
+        "var ",
+        "const ",
+        "return ",
+    ] {
+        if trimmed.starts_with(kw) {
+            return true;
+        }
+    }
+
+    false
+}
+
 /// Returns `true` if `trimmed` is a YAML mapping container header (`key:`) rather than a
 /// code declaration or control-flow statement (`def`, `class`, `if`, `for`, etc.).
 fn is_yaml_mapping_container_header(trimmed: &str) -> bool {
@@ -421,23 +816,8 @@ fn is_yaml_mapping_container_header(trimmed: &str) -> bool {
     }
 
     for kw in [
-        "def ",
-        "async ",
-        "class ",
-        "if ",
-        "elif ",
-        "else:",
-        "for ",
-        "while ",
-        "with ",
-        "try:",
-        "except",
-        "finally:",
-        "match ",
-        "case ",
-        "fn ",
-        "func ",
-        "proc ",
+        "def ", "async ", "class ", "if ", "elif ", "else:", "for ", "while ", "with ", "try:",
+        "except", "finally:", "match ", "case ", "fn ", "func ", "proc ",
     ] {
         if clean.starts_with(kw) {
             return false;
@@ -460,7 +840,11 @@ fn is_section_header_line(trimmed: &str) -> bool {
 
     let inner = trimmed.trim_start_matches('[').trim_end_matches(']').trim();
 
-    if inner.is_empty() || !inner.chars().any(|c| c.is_ascii_alphanumeric()) {
+    if inner.is_empty()
+        || !inner.chars().any(|c| c.is_ascii_alphanumeric())
+        || inner.contains('(')
+        || inner.contains(')')
+    {
         return false;
     }
 
@@ -482,10 +866,11 @@ fn strip_inline_hash_comment(line: &str) -> &str {
             } else if ch == q {
                 in_quote = None;
             }
+
             continue;
         }
 
-        if matches!(ch, '"' | '\'' | '`') {
+        if matches!(ch, '"' | '`') || (ch == '\'' && is_single_quote_literal_start(line, idx)) {
             in_quote = Some(ch);
             continue;
         }
@@ -571,7 +956,7 @@ fn are_inline_delimiters_balanced(lines: &[&String]) -> bool {
         let mut in_quote: Option<char> = None;
         let mut escaped = false;
 
-        for ch in trimmed.chars() {
+        for (idx, ch) in trimmed.char_indices() {
             if let Some(q) = in_quote {
                 if escaped {
                     escaped = false;
@@ -580,10 +965,13 @@ fn are_inline_delimiters_balanced(lines: &[&String]) -> bool {
                 } else if ch == q {
                     in_quote = None;
                 }
+
                 continue;
             }
 
-            if matches!(ch, '"' | '\'' | '`') {
+            if matches!(ch, '"' | '`')
+                || (ch == '\'' && is_single_quote_literal_start(trimmed, idx))
+            {
                 in_quote = Some(ch);
                 continue;
             }
@@ -592,6 +980,7 @@ fn are_inline_delimiters_balanced(lines: &[&String]) -> bool {
                 '(' => paren += 1,
                 ')' => {
                     paren -= 1;
+
                     if paren < 0 {
                         return false;
                     }
@@ -599,6 +988,7 @@ fn are_inline_delimiters_balanced(lines: &[&String]) -> bool {
                 '[' => bracket += 1,
                 ']' => {
                     bracket -= 1;
+
                     if bracket < 0 {
                         return false;
                     }
@@ -606,6 +996,7 @@ fn are_inline_delimiters_balanced(lines: &[&String]) -> bool {
                 '{' => brace += 1,
                 '}' => {
                     brace -= 1;
+
                     if brace < 0 {
                         return false;
                     }
@@ -682,6 +1073,7 @@ fn try_reconcile_multiline_insertion(
 
                 if let Some(last) = l_vec.last_mut() {
                     let trimmed = last.trim_end();
+
                     if !trimmed.is_empty() && !trimmed.ends_with(',') {
                         *last = format!("{trimmed},");
                     }
@@ -734,14 +1126,14 @@ fn try_reconcile_multiline_insertion(
 
 /// Returns `true` if `left` and `right` contain at least one overlapping structural declaration key.
 fn chunks_share_structural_key(left: &[String], right: &[String]) -> bool {
-    let (Some(l_keys), Some(r_keys)) = (
-        extract_structural_block_keys(left),
-        extract_structural_block_keys(right),
+    let (Some(l_sig), Some(r_sig)) = (
+        extract_structural_block_signature(left),
+        extract_structural_block_signature(right),
     ) else {
         return false;
     };
 
-    !l_keys.is_disjoint(&r_keys)
+    !l_sig.keys.is_disjoint(&r_sig.keys)
 }
 
 /// Checks whether a slice of lines has balanced braces `{ ... }`, matching HTML/XML closing tags,
@@ -760,6 +1152,7 @@ fn is_structurally_balanced(lines: &[String]) -> bool {
                 '{' => brace_depth += 1,
                 '}' => {
                     brace_depth -= 1;
+
                     if brace_depth < 0 {
                         return false;
                     }
@@ -808,6 +1201,7 @@ fn is_structurally_balanced(lines: &[String]) -> bool {
                     )
                 {
                     let close_tag = format!("</{tag_name}>");
+
                     if !joined.contains(&close_tag) {
                         return false;
                     }
@@ -855,6 +1249,7 @@ fn is_structurally_balanced(lines: &[String]) -> bool {
 
             if is_keyword_block_closer(t) {
                 depth -= 1;
+
                 if depth < 0 {
                     return false;
                 }
@@ -866,6 +1261,7 @@ fn is_structurally_balanced(lines: &[String]) -> bool {
                 if depth != 0 {
                     return false;
                 }
+
                 depth = 1;
             }
         }
@@ -887,8 +1283,13 @@ fn is_structurally_balanced(lines: &[String]) -> bool {
         .iter()
         .any(|l| (l.len() - l.trim_start().len()) > min_indent);
 
-    if has_deeper_indent && !non_comment.iter().any(|l| l.contains('{') || l.contains('}')) {
+    if has_deeper_indent
+        && !non_comment
+            .iter()
+            .any(|l| l.contains('{') || l.contains('}'))
+    {
         let first_indent = non_comment[0].len() - non_comment[0].trim_start().len();
+
         if first_indent != min_indent || is_mid_block_clause(non_comment[0].trim()) {
             return false;
         }
@@ -898,9 +1299,11 @@ fn is_structurally_balanced(lines: &[String]) -> bool {
 }
 
 /// Finds a line index in `chunk` where all `shared_keys` reside in `&chunk[..split_at]` and
-/// `&chunk[split_at..]` consists solely of balanced declarations disjoint from `other_keys`.
+/// `&chunk[split_at..]` consists solely of newly added balanced declarations disjoint from
+/// `other_keys` and `base_keys`.
 fn find_disjoint_tail_split(
     chunk: &[String],
+    base_keys: &std::collections::BTreeSet<String>,
     other_keys: &std::collections::BTreeSet<String>,
     shared_keys: &std::collections::BTreeSet<String>,
 ) -> Option<usize> {
@@ -916,6 +1319,7 @@ fn find_disjoint_tail_split(
 
     for split_at in 1..chunk.len() {
         let line = &chunk[split_at];
+
         if line.trim().is_empty() || (line.len() - line.trim_start().len()) > min_indent {
             continue;
         }
@@ -927,18 +1331,23 @@ fn find_disjoint_tail_split(
             continue;
         }
 
-        let (Some(head_keys), Some(tail_keys)) = (
-            extract_structural_block_keys(head),
-            extract_structural_block_keys(tail),
+        let (Some(head_sig), Some(tail_sig)) = (
+            extract_structural_block_signature(head),
+            extract_structural_block_signature(tail),
         ) else {
             continue;
         };
 
-        if !head_keys.is_empty()
-            && !tail_keys.is_empty()
-            && shared_keys.is_subset(&head_keys)
-            && tail_keys.is_disjoint(other_keys)
-            && tail_keys.is_disjoint(&head_keys)
+        if head_sig.rotation != CyclicRotation::None || tail_sig.rotation != CyclicRotation::None {
+            continue;
+        }
+
+        if !head_sig.keys.is_empty()
+            && !tail_sig.keys.is_empty()
+            && shared_keys.is_subset(&head_sig.keys)
+            && tail_sig.keys.is_disjoint(other_keys)
+            && tail_sig.keys.is_disjoint(base_keys)
+            && tail_sig.keys.is_disjoint(&head_sig.keys)
         {
             return Some(split_at);
         }
@@ -947,21 +1356,38 @@ fn find_disjoint_tail_split(
     None
 }
 
-/// Peels off non-conflicting trailing structural declarations from `left_chunk` and `right_chunk`
-/// when only the leading declaration collides.
+/// Peels off genuinely newly added, non-conflicting trailing structural declarations from
+/// `left_chunk` and `right_chunk` when only the leading declaration collides, never peeling
+/// blocks that existed in `base_chunk` (so deletions on the other side are never resurrected).
 fn split_disjoint_trailing_blocks(
+    base_chunk: &[&str],
     left_chunk: &[String],
     right_chunk: &[String],
 ) -> (Vec<String>, Vec<String>, Vec<String>) {
-    let (Some(l_keys), Some(r_keys)) = (
-        extract_structural_block_keys(left_chunk),
-        extract_structural_block_keys(right_chunk),
+    let base_non_empty: Vec<String> = base_chunk
+        .iter()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| (*l).to_string())
+        .collect();
+
+    let base_keys = if base_non_empty.is_empty() {
+        std::collections::BTreeSet::new()
+    } else {
+        let Some(b_sig) = extract_structural_block_signature(&base_non_empty) else {
+            return (left_chunk.to_vec(), right_chunk.to_vec(), Vec::new());
+        };
+        b_sig.keys
+    };
+
+    let (Some(l_sig), Some(r_sig)) = (
+        extract_structural_block_signature(left_chunk),
+        extract_structural_block_signature(right_chunk),
     ) else {
         return (left_chunk.to_vec(), right_chunk.to_vec(), Vec::new());
     };
 
     let shared: std::collections::BTreeSet<String> =
-        l_keys.intersection(&r_keys).cloned().collect();
+        l_sig.keys.intersection(&r_sig.keys).cloned().collect();
 
     if shared.is_empty() {
         return (left_chunk.to_vec(), right_chunk.to_vec(), Vec::new());
@@ -971,15 +1397,19 @@ fn split_disjoint_trailing_blocks(
     let mut r_conf = right_chunk.to_vec();
     let mut clean_tail = Vec::new();
 
-    if l_keys.len() > shared.len() {
-        if let Some(split_idx) = find_disjoint_tail_split(left_chunk, &r_keys, &shared) {
+    if l_sig.keys.len() > shared.len() {
+        if let Some(split_idx) =
+            find_disjoint_tail_split(left_chunk, &base_keys, &r_sig.keys, &shared)
+        {
             l_conf = left_chunk[..split_idx].to_vec();
             clean_tail.extend_from_slice(&left_chunk[split_idx..]);
         }
     }
 
-    if r_keys.len() > shared.len() {
-        if let Some(split_idx) = find_disjoint_tail_split(right_chunk, &l_keys, &shared) {
+    if r_sig.keys.len() > shared.len() {
+        if let Some(split_idx) =
+            find_disjoint_tail_split(right_chunk, &base_keys, &l_sig.keys, &shared)
+        {
             r_conf = right_chunk[..split_idx].to_vec();
             clean_tail.extend_from_slice(&right_chunk[split_idx..]);
         }
@@ -988,38 +1418,28 @@ fn split_disjoint_trailing_blocks(
     (l_conf, r_conf, clean_tail)
 }
 
-/// Returns `true` if `left` and `right` represent distinct structural declarations (e.g. HTML elements,
-/// CSS rules, or braced procedures) that can be concatenated without conflict.
+/// Returns `true` if `left` and `right` represent distinct structural declarations sharing the
+/// exact same cyclic boundary shift and minimum indentation level.
 fn are_compatible_structural_blocks(left: &[String], right: &[String]) -> bool {
-    let Some(mut left_keys) = extract_structural_block_keys(left) else {
+    let Some(left_sig) = extract_structural_block_signature(left) else {
         return false;
     };
-    let Some(mut right_keys) = extract_structural_block_keys(right) else {
+    let Some(right_sig) = extract_structural_block_signature(right) else {
         return false;
     };
 
-    if left_keys.len() > 1
-        && right_keys.len() > 1
-        && left_keys
-            .iter()
-            .chain(right_keys.iter())
-            .all(|k| k.starts_with("block:.") || k.starts_with("block:@"))
-    {
-        let shared: Vec<String> = left_keys.intersection(&right_keys).cloned().collect();
-        if shared.len() < left_keys.len() && shared.len() < right_keys.len() {
-            for k in shared {
-                left_keys.remove(&k);
-                right_keys.remove(&k);
-            }
-        }
+    if left_sig.rotation != right_sig.rotation || left_sig.min_indent != right_sig.min_indent {
+        return false;
     }
 
-    !left_keys.is_empty() && !right_keys.is_empty() && left_keys.is_disjoint(&right_keys)
+    !left_sig.keys.is_empty()
+        && !right_sig.keys.is_empty()
+        && left_sig.keys.is_disjoint(&right_sig.keys)
 }
 
-/// Extracts a set of canonical structural block identifiers (`html:<tag>`, `block:<header>`,
-/// `endblock:<header>`, `section:<header>`, or `indent:<header>`) from a multi-line diff hunk.
-fn extract_structural_block_keys(chunk: &[String]) -> Option<std::collections::BTreeSet<String>> {
+/// Extracts canonical structural block identifiers, cyclic rotation metadata, and indentation
+/// from a multi-line diff hunk.
+fn extract_structural_block_signature(chunk: &[String]) -> Option<StructuralBlockSignature> {
     let raw_non_empty: Vec<&String> = chunk.iter().filter(|l| !l.trim().is_empty()).collect();
 
     if raw_non_empty.is_empty() {
@@ -1029,8 +1449,8 @@ fn extract_structural_block_keys(chunk: &[String]) -> Option<std::collections::B
     // When inserting a block that ends with the same closing delimiter(s) (`}`, `end`, or `</tag>`)
     // as the preceding block in `base`, `imara-diff` often anchors the trailing delimiter(s) to `base`
     // so the diff hunk is cyclically shifted (`[closing_delims..., block_header, ...]`).
-    // Rotating all leading closing delimiters to the end restores the canonical block structure
-    // while preserving exact concatenation semantics.
+    // Recording the exact rotation ensures we only concatenate two chunks when BOTH share the
+    // exact same boundary shift and indentation level.
     let is_closing_delim = |s: &str| -> bool {
         let t = s.trim();
         matches!(t, "}" | "};" | "}," | ")" | ");" | "]" | "];")
@@ -1039,17 +1459,23 @@ fn extract_structural_block_keys(chunk: &[String]) -> Option<std::collections::B
     };
 
     let mut split_idx = 0usize;
+
     while split_idx < raw_non_empty.len() && is_closing_delim(raw_non_empty[split_idx]) {
         split_idx += 1;
     }
 
-    let non_empty: Vec<&String> = if split_idx > 0 && split_idx < raw_non_empty.len() {
-        let mut rotated = raw_non_empty[split_idx..].to_vec();
-        rotated.extend_from_slice(&raw_non_empty[..split_idx]);
-        rotated
-    } else {
-        raw_non_empty
-    };
+    let (non_empty, base_rotation): (Vec<&String>, CyclicRotation) =
+        if split_idx > 0 && split_idx < raw_non_empty.len() {
+            let closers: Vec<String> = raw_non_empty[..split_idx]
+                .iter()
+                .map(|s| (*s).clone())
+                .collect();
+            let mut rotated = raw_non_empty[split_idx..].to_vec();
+            rotated.extend_from_slice(&raw_non_empty[..split_idx]);
+            (rotated, CyclicRotation::LeadingClosers(closers))
+        } else {
+            (raw_non_empty, CyclicRotation::None)
+        };
 
     let first_trimmed = non_empty[0].trim();
 
@@ -1084,29 +1510,42 @@ fn extract_structural_block_keys(chunk: &[String]) -> Option<std::collections::B
         }
 
         if !keys.is_empty() {
-            return Some(keys);
+            return Some(StructuralBlockSignature {
+                keys,
+                rotation: base_rotation,
+                min_indent,
+            });
         }
     }
 
     let mut brace_depth = 0i32;
     let mut keys = std::collections::BTreeSet::new();
     let mut saw_braced_block = false;
+    let mut braced_min_indent: Option<usize> = None;
 
     for (idx, line) in non_empty.iter().enumerate() {
         let t = line.trim();
+        let indent = line.len() - line.trim_start().len();
 
         if brace_depth == 0 && !t.starts_with("//") && !t.starts_with("/*") && !t.starts_with('#') {
             if t == "{" {
                 if idx > 0 {
                     let prev = non_empty[idx - 1].trim();
+
                     if !prev.is_empty() && !prev.starts_with("//") {
+                        let prev_indent =
+                            non_empty[idx - 1].len() - non_empty[idx - 1].trim_start().len();
+                        braced_min_indent =
+                            Some(braced_min_indent.map_or(prev_indent, |m| m.min(prev_indent)));
                         keys.insert(format!("block:{prev}"));
                         saw_braced_block = true;
                     }
                 }
             } else if t.ends_with('{') {
                 let header = t.trim_end_matches('{').trim();
+
                 if !header.is_empty() {
+                    braced_min_indent = Some(braced_min_indent.map_or(indent, |m| m.min(indent)));
                     keys.insert(format!("block:{header}"));
                     saw_braced_block = true;
                 }
@@ -1123,7 +1562,11 @@ fn extract_structural_block_keys(chunk: &[String]) -> Option<std::collections::B
     }
 
     if saw_braced_block && brace_depth == 0 && !keys.is_empty() {
-        return Some(keys);
+        return Some(StructuralBlockSignature {
+            keys,
+            rotation: base_rotation,
+            min_indent: braced_min_indent.unwrap_or(0),
+        });
     }
 
     let non_comment: Vec<&String> = non_empty
@@ -1170,6 +1613,7 @@ fn extract_structural_block_keys(chunk: &[String]) -> Option<std::collections::B
                     valid_kw = false;
                     break;
                 }
+
                 open_depth = 0;
                 saw_closed = true;
             } else if is_mid_block_clause(t) {
@@ -1182,46 +1626,60 @@ fn extract_structural_block_keys(chunk: &[String]) -> Option<std::collections::B
                     valid_kw = false;
                     break;
                 }
+
                 kw_keys.insert(format!("endblock:{t}"));
                 open_depth = 1;
             }
         }
 
         if valid_kw && saw_closed && open_depth == 0 && !kw_keys.is_empty() {
-            return Some(kw_keys);
+            return Some(StructuralBlockSignature {
+                keys: kw_keys,
+                rotation: base_rotation,
+                min_indent,
+            });
         }
     }
 
-    // Section / stanza blocks (`[section]` in INI/config files or `[[package]]` in lockfiles).
-    let section_ordered: Vec<&String> = if !is_section_header_line(non_comment[0].trim())
+    // Section / stanza blocks (`[section]` in INI/TOML files or `[[package]]` in lockfiles).
+    let (section_ordered, section_rotation): (Vec<&String>, CyclicRotation) = if base_rotation
+        == CyclicRotation::None
+        && !is_section_header_line(non_comment[0].trim())
         && is_section_header_line(non_comment[non_comment.len() - 1].trim())
     {
         let mut trail_start = non_comment.len();
+
         while trail_start > 0 && is_section_header_line(non_comment[trail_start - 1].trim()) {
             trail_start -= 1;
         }
+
+        let headers: Vec<String> = non_comment[trail_start..]
+            .iter()
+            .map(|s| (*s).clone())
+            .collect();
         let mut rot = non_comment[trail_start..].to_vec();
         rot.extend_from_slice(&non_comment[..trail_start]);
-        rot
+        (rot, CyclicRotation::TrailingSections(headers))
     } else {
-        non_comment.clone()
+        (non_comment.clone(), base_rotation.clone())
     };
 
     if is_section_header_line(section_ordered[0].trim()) {
         let mut sec_keys = std::collections::BTreeSet::new();
         let mut valid_sec = true;
-        let mut body_lines_since_header = 0usize;
+        let mut cur_body: Vec<String> = Vec::new();
 
         for (idx, line) in section_ordered.iter().enumerate() {
             let indent = line.len() - line.trim_start().len();
             let t = strip_inline_hash_comment(line.trim());
 
             if indent == min_indent && is_section_header_line(t) {
-                if idx > 0 && body_lines_since_header == 0 {
+                if idx > 0 && !is_ini_toml_section_body(&cur_body) {
                     valid_sec = false;
                     break;
                 }
-                body_lines_since_header = 0;
+
+                cur_body.clear();
 
                 if t.starts_with("[[") && t.ends_with("]]") {
                     let next_hint = section_ordered
@@ -1233,12 +1691,16 @@ fn extract_structural_block_keys(chunk: &[String]) -> Option<std::collections::B
                     sec_keys.insert(format!("section:{t}"));
                 }
             } else {
-                body_lines_since_header += 1;
+                cur_body.push((*line).clone());
             }
         }
 
-        if valid_sec && body_lines_since_header > 0 && !sec_keys.is_empty() {
-            return Some(sec_keys);
+        if valid_sec && is_ini_toml_section_body(&cur_body) && !sec_keys.is_empty() {
+            return Some(StructuralBlockSignature {
+                keys: sec_keys,
+                rotation: section_rotation,
+                min_indent,
+            });
         }
     }
 
@@ -1256,12 +1718,16 @@ fn extract_structural_block_keys(chunk: &[String]) -> Option<std::collections::B
         let last_indent = non_comment[non_comment.len() - 1].len()
             - non_comment[non_comment.len() - 1].trim_start().len();
 
-        let indent_ordered: Vec<&String> = if first_min_idx > 0 && last_indent > min_indent {
+        let (indent_ordered, indent_rotation): (Vec<&String>, CyclicRotation) = if base_rotation
+            == CyclicRotation::None
+            && first_min_idx > 0
+            && last_indent > min_indent
+        {
             let mut rot = non_comment[first_min_idx..].to_vec();
             rot.extend_from_slice(&non_comment[..first_min_idx]);
-            rot
+            (rot, CyclicRotation::LeadingDeeperIndent(min_indent))
         } else {
-            non_comment
+            (non_comment, base_rotation)
         };
 
         let mut indent_keys = std::collections::BTreeSet::new();
@@ -1298,6 +1764,7 @@ fn extract_structural_block_keys(chunk: &[String]) -> Option<std::collections::B
                     valid_indent = false;
                     break;
                 }
+
                 continue;
             }
 
@@ -1305,7 +1772,11 @@ fn extract_structural_block_keys(chunk: &[String]) -> Option<std::collections::B
         }
 
         if valid_indent && !indent_keys.is_empty() {
-            return Some(indent_keys);
+            return Some(StructuralBlockSignature {
+                keys: indent_keys,
+                rotation: indent_rotation,
+                min_indent,
+            });
         }
     }
 
@@ -1316,6 +1787,7 @@ fn extract_structural_block_keys(chunk: &[String]) -> Option<std::collections::B
 fn are_compatible_comma_collection_tails(left: &[String], right: &[String]) -> bool {
     let extract_key = |line: &str| -> String {
         let without_comma = line.trim().trim_end_matches(',').trim();
+
         if let Some((k, _)) = split_top_level_kv(without_comma) {
             format!("kv:{}", normalize_key(k))
         } else {
@@ -1345,6 +1817,7 @@ fn try_merge_additive_chunks(left: &[String], right: &[String]) -> Option<Vec<St
     for line in left.iter().chain(right.iter()) {
         if !line.trim().is_empty() {
             let ind = line.len() - line.trim_start().len();
+
             if let Some(expected) = base_indent {
                 if ind != expected {
                     return None;
@@ -1388,9 +1861,13 @@ fn try_merge_additive_chunks(left: &[String], right: &[String]) -> Option<Vec<St
 
     for (r_key_opt, r_line) in right_keyed {
         let Some(r_key) = r_key_opt else {
-            if out.last().is_none_or(|(_, last_l)| !last_l.trim().is_empty()) {
+            if out
+                .last()
+                .is_none_or(|(_, last_l)| !last_l.trim().is_empty())
+            {
                 out.push((None, r_line));
             }
+
             continue;
         };
 
@@ -1407,7 +1884,6 @@ fn try_merge_additive_chunks(left: &[String], right: &[String]) -> Option<Vec<St
                 continue;
             }
 
-            // Conflicting binding for the same key (e.g. `MAX_ITEMS :: 10` vs `MAX_ITEMS :: 20`)
             return None;
         }
 
@@ -1456,17 +1932,20 @@ fn extract_additive_line_key(line: &str) -> Option<String> {
 
     if t.ends_with(',') {
         let without_comma = t.trim_end_matches(',').trim();
+
         if let Some((k, v)) = split_top_level_kv(without_comma) {
             if !v.is_empty() {
                 return Some(format!("kv:{}", normalize_key(k)));
             }
         }
+
         return Some(format!("elem:{without_comma}"));
     }
 
     if !t.ends_with('{') && !t.ends_with('(') && !t.ends_with(':') {
         if let Some((k, v)) = split_top_level_kv(t) {
             let norm = normalize_key(k);
+
             if !norm.is_empty() && !v.is_empty() {
                 return Some(format!("kv:{norm}"));
             }
@@ -1477,7 +1956,7 @@ fn extract_additive_line_key(line: &str) -> Option<String> {
 }
 
 /// Attempts to reconcile 3 versions of a single line (`base`, `left`, `right`) via pipe-union
-/// merging, delimited-skeleton merging, span normalization, or sub-line token diff3.
+/// merging, delimited-skeleton merging, span normalization, or safe sub-line token diff3.
 fn try_reconcile_single_line(base: &str, left: &str, right: &str) -> Option<String> {
     if let Some(merged) = try_merge_pipe_union_line(base, left, right) {
         return Some(merged);
@@ -1500,7 +1979,8 @@ fn try_reconcile_single_line(base: &str, left: &str, right: &str) -> Option<Stri
     try_token_merge_line(&b_norm, &l_norm, &r_norm)
 }
 
-/// Reconciles 3-way edits to a pipe-delimited type union line (`type X = "a" | "b";`).
+/// Reconciles 3-way edits to an explicit TypeScript pipe-delimited type union line
+/// (`type X = "a" | "b";` or `export type X = "a" | "b";`).
 fn try_merge_pipe_union_line(base: &str, left: &str, right: &str) -> Option<String> {
     let (b_lhs, b_rhs) = split_type_union_line(base)?;
     let (l_lhs, l_rhs) = split_type_union_line(left)?;
@@ -1514,23 +1994,80 @@ fn try_merge_pipe_union_line(base: &str, left: &str, right: &str) -> Option<Stri
     let (l_items, l_semi) = parse_pipe_items(l_rhs)?;
     let (r_items, r_semi) = parse_pipe_items(r_rhs)?;
 
-    let merged = merge_keyed_items(&b_items, &l_items, &r_items)?;
-    let semi = if l_semi || r_semi || b_semi { ";" } else { "" };
-    Some(format!("{} = {}{}", l_lhs.trim_end(), merged.join(" | "), semi))
-}
-
-/// Splits a type-union assignment line (`type T = A | B`) into `(lhs, rhs)` around `'='`.
-fn split_type_union_line(line: &str) -> Option<(&str, &str)> {
-    let trimmed = line.trim_start();
-
-    if !(trimmed.starts_with("type ")
-        || trimmed.starts_with("export type ")
-        || trimmed.contains('|'))
-    {
+    if has_unkeyed_replacement_conflict(&b_items, &l_items, &r_items) {
         return None;
     }
 
-    let eq_idx = line.find('=')?;
+    let merged = merge_keyed_items(&b_items, &l_items, &r_items)?;
+    let semi = if l_semi || r_semi || b_semi { ";" } else { "" };
+    Some(format!(
+        "{} = {}{}",
+        l_lhs.trim_end(),
+        merged.join(" | "),
+        semi
+    ))
+}
+
+/// Returns `true` if `s` contains `//` or `/*` comment markers outside quoted string literals.
+fn contains_line_or_block_comment(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let mut in_quote: Option<char> = None;
+    let mut escaped = false;
+
+    for (idx, ch) in s.char_indices() {
+        if let Some(q) = in_quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == q {
+                in_quote = None;
+            }
+
+            continue;
+        }
+
+        if matches!(ch, '"' | '`') || (ch == '\'' && is_single_quote_literal_start(s, idx)) {
+            in_quote = Some(ch);
+            continue;
+        }
+
+        if ch == '/' && matches!(bytes.get(idx + 1), Some(b'/' | b'*')) {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Splits an explicit TypeScript type-union assignment line (`type T = A | B` or
+/// `export type T = A | B`) into `(lhs, rhs)` around the assignment `'='`.
+fn split_type_union_line(line: &str) -> Option<(&str, &str)> {
+    let trimmed = line.trim_start();
+
+    if !(trimmed.starts_with("type ") || trimmed.starts_with("export type ")) {
+        return None;
+    }
+
+    if contains_line_or_block_comment(line) {
+        return None;
+    }
+
+    let bytes = line.as_bytes();
+    let mut eq_pos = None;
+
+    for (idx, &b) in bytes.iter().enumerate() {
+        if b == b'='
+            && bytes.get(idx + 1) != Some(&b'=')
+            && bytes.get(idx + 1) != Some(&b'>')
+            && (idx == 0 || !matches!(bytes[idx - 1], b'=' | b'!' | b'<' | b'>'))
+        {
+            eq_pos = Some(idx);
+            break;
+        }
+    }
+
+    let eq_idx = eq_pos?;
     let rhs = &line[eq_idx + 1..];
 
     if !rhs.contains('|') || rhs.contains("||") {
@@ -1562,8 +2099,240 @@ fn parse_pipe_items(rhs: &str) -> Option<(Vec<(String, String)>, bool)> {
     Some((items, has_semi))
 }
 
+/// Returns `true` if both `left` and `right` removed the same base item while each adding
+/// distinct replacement items (indicating a value replacement conflict rather than additions).
+fn has_unkeyed_replacement_conflict(
+    base: &[(String, String)],
+    left: &[(String, String)],
+    right: &[(String, String)],
+) -> bool {
+    let base_keys: std::collections::BTreeSet<&str> =
+        base.iter().map(|(k, _)| k.as_str()).collect();
+    let left_keys: std::collections::BTreeSet<&str> =
+        left.iter().map(|(k, _)| k.as_str()).collect();
+    let right_keys: std::collections::BTreeSet<&str> =
+        right.iter().map(|(k, _)| k.as_str()).collect();
+
+    let both_removed_same = base_keys
+        .iter()
+        .any(|k| !left_keys.contains(k) && !right_keys.contains(k));
+    let left_added = left_keys.iter().any(|k| !base_keys.contains(k));
+    let right_added = right_keys.iter().any(|k| !base_keys.contains(k));
+
+    both_removed_same && left_added && right_added
+}
+
 /// Tuple `(opening_delimiter_char, start_byte_offset, end_byte_offset_exclusive)` for a top-level delimited span.
 type DelimSpan = (char, usize, usize);
+
+/// Returns the final ASCII identifier word of `prefix.trim_end()`.
+fn trailing_identifier_word(prefix: &str) -> &str {
+    let trimmed = prefix.trim_end();
+    let start = trimmed
+        .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
+    &trimmed[start..]
+}
+
+/// Returns `true` if a `(...)` span preceded by `before` is a control-flow condition or
+/// expression operator (`if (...)`, `while (...)`, `for (...)`, etc.) that must never be
+/// comma-merged.
+fn is_control_flow_paren(before: &str) -> bool {
+    let word = trailing_identifier_word(before);
+    matches!(
+        word,
+        "if" | "elif"
+            | "while"
+            | "for"
+            | "switch"
+            | "match"
+            | "catch"
+            | "until"
+            | "unless"
+            | "return"
+            | "yield"
+            | "await"
+            | "throw"
+            | "typeof"
+            | "sizeof"
+            | "assert"
+            | "synchronized"
+            | "lock"
+            | "using"
+            | "with"
+            | "when"
+    )
+}
+
+/// Returns `true` if a `[...]` span preceded by `before` is an array/map subscript expression
+/// (`arr[1]`, `get()[i]`, `m["k"]`) rather than an array literal or attribute.
+fn is_array_subscript(before: &str) -> bool {
+    let trimmed = before.trim_end();
+
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let Some(last_ch) = trimmed.chars().last() else {
+        return false;
+    };
+
+    if matches!(
+        last_ch,
+        '=' | ':'
+            | ','
+            | '('
+            | '['
+            | '{'
+            | '>'
+            | '#'
+            | '@'
+            | '?'
+            | '|'
+            | '&'
+            | '+'
+            | '-'
+            | '*'
+            | '/'
+            | ';'
+            | '!'
+            | '~'
+            | '^'
+            | '%'
+    ) {
+        return false;
+    }
+
+    let word = trailing_identifier_word(trimmed);
+
+    if matches!(
+        word,
+        "return"
+            | "yield"
+            | "await"
+            | "in"
+            | "of"
+            | "case"
+            | "else"
+            | "and"
+            | "or"
+            | "not"
+            | "is"
+            | "let"
+            | "const"
+            | "var"
+            | "type"
+            | "export"
+            | "import"
+    ) {
+        return false;
+    }
+
+    last_ch.is_ascii_alphanumeric() || matches!(last_ch, '_' | ')' | ']' | '}' | '"' | '\'')
+}
+
+/// Returns `true` if a `{...}` span preceded by `before` is a code block body
+/// (`fn tax() { a * 15 }`, `if cond { ... }`, `() => { ... }`) rather than an import,
+/// destructuring, object/map, or set literal.
+fn is_code_block_brace(before: &str, inners: &[&str]) -> bool {
+    for inner in inners {
+        if split_top_level(inner, ';').len() > 1 {
+            return true;
+        }
+    }
+
+    let trimmed = before.trim();
+
+    if trimmed == "import"
+        || trimmed.starts_with("import ")
+        || trimmed == "export"
+        || trimmed == "export type"
+        || trimmed.starts_with("export {")
+        || trimmed.starts_with("export type {")
+        || trimmed == "use"
+        || trimmed.starts_with("use ")
+        || trimmed.starts_with("pub use ")
+        || trimmed.starts_with("pub(crate) use ")
+    {
+        return false;
+    }
+
+    if trimmed.ends_with(')') || trimmed.ends_with("=>") {
+        return true;
+    }
+
+    let last_word = trailing_identifier_word(trimmed);
+
+    if matches!(
+        last_word,
+        "else" | "try" | "finally" | "loop" | "do" | "unsafe" | "async" | "move"
+    ) {
+        return true;
+    }
+
+    for kw in [
+        "fn ",
+        "pub fn ",
+        "pub(crate) fn ",
+        "async fn ",
+        "pub async fn ",
+        "func ",
+        "function ",
+        "def ",
+        "if ",
+        "while ",
+        "for ",
+        "match ",
+        "switch ",
+        "class ",
+        "struct ",
+        "enum ",
+        "impl ",
+        "trait ",
+        "mod ",
+    ] {
+        if trimmed.starts_with(kw) {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Returns `true` if the surrounding syntax indicates an explicit import, export, destructuring,
+/// or attribute/derive list where even a 1-item base list can safely accept additive insertions.
+fn is_explicit_list_syntax(open_ch: char, before: &str, after: &str) -> bool {
+    let b = before.trim();
+    let a = after.trim();
+
+    if b == "import"
+        || b.starts_with("import ")
+        || b == "export"
+        || b.starts_with("export ")
+        || b == "use"
+        || b.starts_with("use ")
+        || b.starts_with("pub use ")
+        || b.starts_with("pub(crate) use ")
+        || b == "from"
+        || b.starts_with("from ")
+    {
+        return true;
+    }
+
+    if b.starts_with("#[") || b.starts_with("#![") || b.starts_with('@') {
+        return true;
+    }
+
+    if matches!(open_ch, '{' | '[')
+        && (b == "const" || b == "let" || b == "var" || b.starts_with("export const"))
+        && a.starts_with('=')
+    {
+        return true;
+    }
+
+    false
+}
 
 /// Computes a language-agnostic canonical skeleton key for any line that contains a delimited
 /// comma-list (`{...}`, `(...)`, `[...]`) or a prefix comma-list (`from <mod> import a, b`).
@@ -1580,9 +2349,19 @@ pub fn delimited_skeleton_key(line: &str) -> Option<String> {
     let spans = find_top_level_delim_spans(trimmed);
 
     if let Some(&(open_ch, start, end)) = spans.last() {
+        let before = &trimmed[..start];
+        let after = &trimmed[end..];
         let inner = &trimmed[start + 1..end - 1];
 
-        if open_ch == '{' && split_top_level(inner, ';').len() > 1 {
+        if open_ch == '{' && is_code_block_brace(before, &[inner]) {
+            return None;
+        }
+
+        if open_ch == '[' && is_array_subscript(before) {
+            return None;
+        }
+
+        if open_ch == '(' && is_control_flow_paren(before) {
             return None;
         }
 
@@ -1594,8 +2373,8 @@ pub fn delimited_skeleton_key(line: &str) -> Option<String> {
             '{' => '}',
             _ => return None,
         };
-        let outer_before = normalize_skeleton_fragment(&trimmed[..start]);
-        let outer_after = normalize_skeleton_fragment(&trimmed[end..]);
+        let outer_before = normalize_skeleton_fragment(before);
+        let outer_after = normalize_skeleton_fragment(after);
 
         if open_ch == '(' {
             let is_attr_or_decl = trimmed.starts_with('#')
@@ -1643,19 +2422,12 @@ pub fn delimited_skeleton_key(line: &str) -> Option<String> {
 /// Normalizes quotes and whitespace in a skeleton prefix/suffix fragment.
 fn normalize_skeleton_fragment(s: &str) -> String {
     let quote_norm: String = s.chars().map(|c| if c == '\'' { '"' } else { c }).collect();
-    quote_norm
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    quote_norm.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Merges two lines (`left` and `right`, with optional `base`) that share the same outer
 /// [`delimited_skeleton_key`] by performing a 3-way keyed union over their comma-separated items.
-pub fn try_merge_same_skeleton_line(
-    base: Option<&str>,
-    left: &str,
-    right: &str,
-) -> Option<String> {
+pub fn try_merge_same_skeleton_line(base: Option<&str>, left: &str, right: &str) -> Option<String> {
     let l_skel = delimited_skeleton_key(left)?;
     let r_skel = delimited_skeleton_key(right)?;
 
@@ -1683,17 +2455,18 @@ pub fn try_merge_same_skeleton_line(
             }
         }
 
-        let b_inner = base
-            .and_then(|b| {
-                let b_spans = find_top_level_delim_spans(b);
-                let &(b_open, bs, be) = b_spans.last()?;
-                (b_open == open_ch).then_some(&b[bs + 1..be - 1])
-            })
-            .unwrap_or("");
+        let b_inner_opt = base.and_then(|b| {
+            let b_spans = find_top_level_delim_spans(b);
+            let &(b_open, bs, be) = b_spans.last()?;
+            (b_open == open_ch).then_some(&b[bs + 1..be - 1])
+        });
+        let l_before = &left[..l_start];
+        let l_after = &left[l_end..];
         let l_inner = &left[l_start + 1..l_end - 1];
         let r_inner = &right[r_start + 1..r_end - 1];
 
-        let merged_inner = merge_delimited_items(open_ch, b_inner, l_inner, r_inner)?;
+        let merged_inner =
+            merge_delimited_items(open_ch, l_before, l_after, b_inner_opt, l_inner, r_inner)?;
         let mut out = left.to_string();
         out.replace_range(l_start + 1..l_end - 1, &merged_inner);
         return Some(out);
@@ -1701,13 +2474,12 @@ pub fn try_merge_same_skeleton_line(
 
     let l_imp = left.find(" import ")?;
     let r_imp = right.find(" import ")?;
-    let b_inner = base
-        .and_then(|b| b.find(" import ").map(|bi| &b[bi + 8..]))
-        .unwrap_or("");
+    let b_inner_opt = base.and_then(|b| b.find(" import ").map(|bi| &b[bi + 8..]));
+    let l_before = &left[..l_imp + 8];
     let l_inner = &left[l_imp + 8..];
     let r_inner = &right[r_imp + 8..];
-    let merged_inner = merge_delimited_items('(', b_inner, l_inner, r_inner)?;
-    Some(format!("{}{merged_inner}", &left[..l_imp + 8]))
+    let merged_inner = merge_delimited_items('(', l_before, "", b_inner_opt, l_inner, r_inner)?;
+    Some(format!("{l_before}{merged_inner}"))
 }
 
 /// Reconciles matching top-level delimited comma-list spans (`(...)`, `[...]`, `{...}`) across
@@ -1721,10 +2493,7 @@ fn normalize_delimited_spans(
     let l_spans = find_top_level_delim_spans(left);
     let r_spans = find_top_level_delim_spans(right);
 
-    if b_spans.is_empty()
-        || b_spans.len() != l_spans.len()
-        || b_spans.len() != r_spans.len()
-    {
+    if b_spans.is_empty() || b_spans.len() != l_spans.len() || b_spans.len() != r_spans.len() {
         return Some((base.to_string(), left.to_string(), right.to_string()));
     }
 
@@ -1764,7 +2533,10 @@ fn normalize_delimited_spans(
             continue;
         }
 
-        let merged_inner = merge_delimited_items(open_ch, b_inner, l_inner, r_inner)?;
+        let b_before = &base[..b_start];
+        let b_after = &base[b_end..];
+        let merged_inner =
+            merge_delimited_items(open_ch, b_before, b_after, Some(b_inner), l_inner, r_inner)?;
         b_out.replace_range(b_start + 1..b_end - 1, &merged_inner);
         l_out.replace_range(l_start + 1..l_end - 1, &merged_inner);
         r_out.replace_range(r_start + 1..r_end - 1, &merged_inner);
@@ -1774,7 +2546,7 @@ fn normalize_delimited_spans(
 }
 
 /// Scans `line` for balanced top-level delimiter spans `(...)`, `[...]`, and `{...}`,
-/// ignoring delimiters inside quoted string literals.
+/// ignoring delimiters inside quoted string literals while handling Rust lifetimes safely.
 fn find_top_level_delim_spans(line: &str) -> Vec<DelimSpan> {
     let mut spans = Vec::new();
     let mut stack: Vec<(char, usize)> = Vec::new();
@@ -1790,10 +2562,11 @@ fn find_top_level_delim_spans(line: &str) -> Vec<DelimSpan> {
             } else if ch == q {
                 in_quote = None;
             }
+
             continue;
         }
 
-        if matches!(ch, '"' | '\'' | '`') {
+        if matches!(ch, '"' | '`') || (ch == '\'' && is_single_quote_literal_start(line, idx)) {
             in_quote = Some(ch);
             continue;
         }
@@ -1819,25 +2592,151 @@ fn find_top_level_delim_spans(line: &str) -> Vec<DelimSpan> {
     spans
 }
 
-/// Merges comma-separated items inside a delimited span (`open_ch` in `{'(', '[', '{'}`).
+/// Parsed comma-separated item inside a delimited span.
+struct ParsedDelimItem {
+    /// Lookup key (KV property name when `is_kv == true`, otherwise the item itself).
+    key: String,
+    /// Original trimmed item text.
+    raw: String,
+    /// `true` when this item is a structured `key: value` / `key = value` / `key => value` binding.
+    is_kv: bool,
+}
+
+/// Safely merges comma-separated items inside a delimited span (`open_ch` in `{'(', '[', '{'}`),
+/// rejecting control-flow conditions, array subscripts, code blocks, single-item replacements,
+/// positional slot replacements, and duplicate nested Rust `use` subtrees.
 fn merge_delimited_items(
     open_ch: char,
-    base_inner: &str,
+    before_span: &str,
+    after_span: &str,
+    base_inner_opt: Option<&str>,
     left_inner: &str,
     right_inner: &str,
 ) -> Option<String> {
-    // Reject statement blocks `{ return x; }` that contain top-level semicolons.
-    if open_ch == '{'
-        && (split_top_level(base_inner, ';').len() > 1
-            || split_top_level(left_inner, ';').len() > 1
-            || split_top_level(right_inner, ';').len() > 1)
-    {
+    if open_ch == '(' && is_control_flow_paren(before_span) {
         return None;
     }
 
-    let b_items = parse_comma_items(open_ch, base_inner)?;
-    let l_items = parse_comma_items(open_ch, left_inner)?;
-    let r_items = parse_comma_items(open_ch, right_inner)?;
+    if open_ch == '[' && is_array_subscript(before_span) {
+        return None;
+    }
+
+    let base_inner = base_inner_opt.unwrap_or("");
+
+    if open_ch == '{' && is_code_block_brace(before_span, &[base_inner, left_inner, right_inner]) {
+        return None;
+    }
+
+    let b_parsed = parse_comma_items(open_ch, base_inner)?;
+    let l_parsed = parse_comma_items(open_ch, left_inner)?;
+    let r_parsed = parse_comma_items(open_ch, right_inner)?;
+
+    let all_kv = !l_parsed.is_empty()
+        && !r_parsed.is_empty()
+        && b_parsed.iter().all(|it| it.is_kv)
+        && l_parsed.iter().all(|it| it.is_kv)
+        && r_parsed.iter().all(|it| it.is_kv);
+    let explicit_list = is_explicit_list_syntax(open_ch, before_span, after_span);
+
+    if base_inner_opt.is_some() {
+        // When base has fewer than 2 items, only allow merging for explicit imports,
+        // destructuring, attributes, or key-value maps (and never for single-item replacements).
+        if b_parsed.len() < 2 && !explicit_list && !all_kv {
+            return None;
+        }
+    } else {
+        // Add/add without base: require explicit list, KV map, or shared anchor item with >= 2 items.
+        let l_keys: std::collections::BTreeSet<&str> =
+            l_parsed.iter().map(|it| it.key.as_str()).collect();
+        let shares_item = r_parsed.iter().any(|it| l_keys.contains(it.key.as_str()));
+
+        if !explicit_list && !all_kv && !shares_item {
+            return None;
+        }
+    }
+
+    // Guard against nested Rust `use` subtree collisions (`collections::{A}` vs `collections::{B}`).
+    if open_ch == '{'
+        && (before_span.trim_start().starts_with("use ")
+            || before_span.trim_start().starts_with("pub use ")
+            || before_span.trim_start().starts_with("pub(crate) use "))
+    {
+        for l_it in &l_parsed {
+            if let Some((l_prefix, _)) = l_it.raw.split_once("::{") {
+                for r_it in &r_parsed {
+                    if let Some((r_prefix, _)) = r_it.raw.split_once("::{") {
+                        if l_prefix == r_prefix && l_it.raw != r_it.raw {
+                            return None;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let b_items: Vec<(String, String)> = b_parsed
+        .iter()
+        .map(|it| (it.key.clone(), it.raw.clone()))
+        .collect();
+    let l_items: Vec<(String, String)> = l_parsed
+        .iter()
+        .map(|it| (it.key.clone(), it.raw.clone()))
+        .collect();
+    let r_items: Vec<(String, String)> = r_parsed
+        .iter()
+        .map(|it| (it.key.clone(), it.raw.clone()))
+        .collect();
+
+    if base_inner_opt.is_some() && !all_kv {
+        // Reject when both sides replaced the same unkeyed base item with different values.
+        let b_unkeyed: Vec<(String, String)> = b_parsed
+            .iter()
+            .filter(|it| !it.is_kv)
+            .map(|it| (it.key.clone(), it.raw.clone()))
+            .collect();
+        let l_unkeyed: Vec<(String, String)> = l_parsed
+            .iter()
+            .filter(|it| !it.is_kv)
+            .map(|it| (it.key.clone(), it.raw.clone()))
+            .collect();
+        let r_unkeyed: Vec<(String, String)> = r_parsed
+            .iter()
+            .filter(|it| !it.is_kv)
+            .map(|it| (it.key.clone(), it.raw.clone()))
+            .collect();
+
+        if has_unkeyed_replacement_conflict(&b_unkeyed, &l_unkeyed, &r_unkeyed) {
+            return None;
+        }
+
+        // Reject positional slot collisions where both sides changed the same index differently.
+        let min_pos = b_parsed.len().min(l_parsed.len()).min(r_parsed.len());
+
+        for idx in 0..min_pos {
+            if !b_parsed[idx].is_kv
+                && l_parsed[idx].raw != b_parsed[idx].raw
+                && r_parsed[idx].raw != b_parsed[idx].raw
+                && l_parsed[idx].raw != r_parsed[idx].raw
+            {
+                return None;
+            }
+        }
+
+        // For positional `(...)` calls/params, refuse if both sides mutated/removed unkeyed base
+        // items (prevents swapping argument order like `charge(200, v)`).
+        if open_ch == '(' && !explicit_list {
+            let l_removed_unkeyed = b_unkeyed
+                .iter()
+                .any(|(k, _)| !l_unkeyed.iter().any(|(lk, _)| lk == k));
+            let r_removed_unkeyed = b_unkeyed
+                .iter()
+                .any(|(k, _)| !r_unkeyed.iter().any(|(rk, _)| rk == k));
+
+            if l_removed_unkeyed && r_removed_unkeyed {
+                return None;
+            }
+        }
+    }
 
     let merged = merge_keyed_items(&b_items, &l_items, &r_items)?;
     let pad_spaces = open_ch == '{'
@@ -1851,8 +2750,8 @@ fn merge_delimited_items(
     }
 }
 
-/// Splits `inner` on top-level commas and returns `(canonical_key, raw_item)` pairs if all keys are unique.
-fn parse_comma_items(open_ch: char, inner: &str) -> Option<Vec<(String, String)>> {
+/// Splits `inner` on top-level commas and returns [`ParsedDelimItem`]s if all keys are unique.
+fn parse_comma_items(open_ch: char, inner: &str) -> Option<Vec<ParsedDelimItem>> {
     let trimmed = inner.trim();
 
     if trimmed.is_empty() {
@@ -1865,42 +2764,61 @@ fn parse_comma_items(open_ch: char, inner: &str) -> Option<Vec<(String, String)>
 
     for part in parts {
         let item_str = part.trim();
+
         if item_str.is_empty() {
             continue;
         }
 
-        let key = classify_delimited_item_key(open_ch, item_str);
+        let (key, is_kv) = classify_delimited_item_key(open_ch, item_str);
+
         if !seen_keys.insert(key.clone()) {
-            // Duplicate keys in the same list cannot be keyed unambiguously.
             return None;
         }
 
-        items.push((key, item_str.to_string()));
+        items.push(ParsedDelimItem {
+            key,
+            raw: item_str.to_string(),
+            is_kv,
+        });
     }
 
     Some(items)
 }
 
-/// Extracts the lookup key for a comma-separated item inside `open_ch` (extracting the property
-/// name for key-value entries inside `{...}` or `(...)`).
-fn classify_delimited_item_key(open_ch: char, item: &str) -> String {
+/// Extracts `(lookup_key, is_kv)` for a comma-separated item inside `open_ch`.
+fn classify_delimited_item_key(open_ch: char, item: &str) -> (String, bool) {
     if matches!(open_ch, '{' | '(') {
         if let Some((k, _)) = split_top_level_kv(item) {
             let norm = normalize_key(k);
+
             if !norm.is_empty() {
-                return norm;
+                return (norm, true);
             }
         }
     }
 
-    item.to_string()
+    if open_ch == '[' && item.contains("=>") {
+        if let Some((k, _)) = split_top_level_kv(item) {
+            let norm = normalize_key(k);
+
+            if !norm.is_empty() {
+                return (norm, true);
+            }
+        }
+    }
+
+    (item.to_string(), false)
 }
 
-/// Splits `item` around a top-level key-value separator (`:`, whitespace-padded `::`, `=`, or `=>`).
+/// Splits `item` around a top-level key-value separator (`:`, whitespace-padded `::`, `=`, or `=>`),
+/// rejecting compound assignment operators (`+=`, `-=`, etc.), ternary `? ... : ...` colons,
+/// and properly handling Rust lifetimes (`'a`, `'static`) and `<`/`>` comparisons.
 fn split_top_level_kv(item: &str) -> Option<(&str, &str)> {
     let mut depth = 0usize;
+    let mut angle_depth = 0usize;
     let mut in_quote: Option<char> = None;
     let mut escaped = false;
+    let mut ternary_q_idx: Option<usize> = None;
     let bytes = item.as_bytes();
 
     for (idx, ch) in item.char_indices() {
@@ -1912,26 +2830,50 @@ fn split_top_level_kv(item: &str) -> Option<(&str, &str)> {
             } else if ch == q {
                 in_quote = None;
             }
+
             continue;
         }
 
-        if matches!(ch, '"' | '\'' | '`') {
+        if matches!(ch, '"' | '`') || (ch == '\'' && is_single_quote_literal_start(item, idx)) {
             in_quote = Some(ch);
             continue;
         }
 
-        if matches!(ch, '(' | '[' | '{' | '<') {
+        if matches!(ch, '(' | '[' | '{') {
             depth += 1;
             continue;
         }
 
-        if matches!(ch, ')' | ']' | '}' | '>') {
+        if matches!(ch, ')' | ']' | '}') {
             depth = depth.saturating_sub(1);
             continue;
         }
 
-        if depth == 0 {
+        if ch == '<' && is_generic_angle_open(item, idx) {
+            angle_depth += 1;
+            continue;
+        }
+
+        if ch == '>' && angle_depth > 0 {
+            let prev = idx.checked_sub(1).and_then(|p| bytes.get(p)).copied();
+
+            if !matches!(prev, Some(b'=' | b'-')) {
+                angle_depth -= 1;
+                continue;
+            }
+        }
+
+        if depth == 0 && angle_depth == 0 {
+            if ch == '?' {
+                ternary_q_idx = Some(idx);
+                continue;
+            }
+
             if ch == ':' {
+                if bytes.get(idx + 1) == Some(&b'=') {
+                    continue;
+                }
+
                 if bytes.get(idx + 1) == Some(&b':') {
                     // Whitespace-delimited `::` (e.g. Odin/Jai `CONST :: 10`) is a declaration binding;
                     // contiguous `::` (e.g. `std::io::Error`) is a namespace path separator.
@@ -1949,12 +2891,36 @@ fn split_top_level_kv(item: &str) -> Option<(&str, &str)> {
                     continue;
                 }
 
+                // Skip ternary `cond ? a : b` colons while keeping TypeScript optional properties `foo?: T`.
+                if let Some(q_idx) = ternary_q_idx {
+                    if !item[q_idx + 1..idx].trim().is_empty() {
+                        ternary_q_idx = None;
+                        continue;
+                    }
+                }
+
                 return Some((item[..idx].trim(), item[idx + 1..].trim()));
             }
 
             if ch == '=' {
                 if bytes.get(idx + 1) == Some(&b'=')
-                    || (idx > 0 && matches!(bytes[idx - 1], b'=' | b'!' | b'<' | b'>'))
+                    || (idx > 0
+                        && matches!(
+                            bytes[idx - 1],
+                            b'=' | b'!'
+                                | b'<'
+                                | b'>'
+                                | b'+'
+                                | b'-'
+                                | b'*'
+                                | b'/'
+                                | b'%'
+                                | b'|'
+                                | b'&'
+                                | b'^'
+                                | b'~'
+                                | b':'
+                        ))
                 {
                     continue;
                 }
@@ -1980,13 +2946,16 @@ fn normalize_key(raw: &str) -> String {
         .to_string()
 }
 
-/// Splits `input` by `sep` only at nesting depth `0` outside string literals.
+/// Splits `input` by `sep` only at nesting depth `0` outside string literals, properly handling
+/// Rust lifetimes and `<`/`>` comparisons.
 fn split_top_level(input: &str, sep: char) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut depth = 0usize;
+    let mut angle_depth = 0usize;
     let mut in_quote: Option<char> = None;
     let mut escaped = false;
     let mut last_idx = 0usize;
+    let bytes = input.as_bytes();
 
     for (idx, ch) in input.char_indices() {
         if let Some(q) = in_quote {
@@ -1997,25 +2966,40 @@ fn split_top_level(input: &str, sep: char) -> Vec<&str> {
             } else if ch == q {
                 in_quote = None;
             }
+
             continue;
         }
 
-        if matches!(ch, '"' | '\'' | '`') {
+        if matches!(ch, '"' | '`') || (ch == '\'' && is_single_quote_literal_start(input, idx)) {
             in_quote = Some(ch);
             continue;
         }
 
-        if matches!(ch, '(' | '[' | '{' | '<') {
+        if matches!(ch, '(' | '[' | '{') {
             depth += 1;
             continue;
         }
 
-        if matches!(ch, ')' | ']' | '}' | '>') {
+        if matches!(ch, ')' | ']' | '}') {
             depth = depth.saturating_sub(1);
             continue;
         }
 
-        if depth == 0 && ch == sep {
+        if ch == '<' && is_generic_angle_open(input, idx) {
+            angle_depth += 1;
+            continue;
+        }
+
+        if ch == '>' && angle_depth > 0 {
+            let prev = idx.checked_sub(1).and_then(|p| bytes.get(p)).copied();
+
+            if !matches!(prev, Some(b'=' | b'-')) {
+                angle_depth -= 1;
+                continue;
+            }
+        }
+
+        if depth == 0 && angle_depth == 0 && ch == sep {
             parts.push(&input[last_idx..idx]);
             last_idx = idx + ch.len_utf8();
         }
@@ -2032,20 +3016,17 @@ fn merge_keyed_items(
     left: &[(String, String)],
     right: &[(String, String)],
 ) -> Option<Vec<String>> {
-    let base_map: std::collections::BTreeMap<&str, &str> = base
-        .iter()
-        .map(|(k, v)| (k.as_str(), v.as_str()))
-        .collect();
-    let left_map: std::collections::BTreeMap<&str, &str> = left
-        .iter()
-        .map(|(k, v)| (k.as_str(), v.as_str()))
-        .collect();
+    let base_map: std::collections::BTreeMap<&str, &str> =
+        base.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let left_map: std::collections::BTreeMap<&str, &str> =
+        left.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
     let right_map: std::collections::BTreeMap<&str, &str> = right
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
 
     let mut ordered_keys: Vec<&str> = Vec::new();
+
     for (k, _) in left.iter().chain(right.iter()) {
         if !ordered_keys.contains(&k.as_str()) {
             ordered_keys.push(k.as_str());
@@ -2095,12 +3076,86 @@ fn merge_keyed_items(
     Some(merged)
 }
 
-/// Performs sub-line word/punctuation token diff3 on a single line, requiring at least one
-/// unchanged non-whitespace anchor token between concurrent left and right token edits.
+/// Returns `true` if `tok` is a real alphabetic/identifier anchor word (not punctuation,
+/// whitespace, quoted string literal, URL, or numeric/version literal).
+fn is_word_anchor(tok: &str) -> bool {
+    if tok.is_empty()
+        || tok.starts_with('"')
+        || tok.starts_with('\'')
+        || tok.starts_with('`')
+        || tok.contains("://")
+    {
+        return false;
+    }
+
+    let mut has_alpha = false;
+
+    for ch in tok.chars() {
+        if ch.is_alphabetic() {
+            has_alpha = true;
+        } else if !ch.is_alphanumeric() && ch != '_' {
+            return false;
+        }
+    }
+
+    has_alpha
+}
+
+/// Returns `true` if `edit` in `b_toks` is directly adjacent to an arithmetic operator token
+/// (`+`, `-`, `*`, `/`, `%`).
+fn is_edit_adjacent_to_arithmetic(b_toks: &[&str], edit: &LineEdit) -> bool {
+    let is_arith_op = |t: &str| matches!(t, "+" | "-" | "*" | "/" | "%");
+
+    let mut idx = edit.base_start;
+
+    while idx > 0 {
+        idx -= 1;
+        let tok = b_toks[idx];
+
+        if tok.trim().is_empty() {
+            continue;
+        }
+
+        if is_arith_op(tok) {
+            return true;
+        }
+
+        break;
+    }
+
+    let mut fwd = edit.base_end;
+
+    while fwd < b_toks.len() {
+        let tok = b_toks[fwd];
+
+        if tok.trim().is_empty() {
+            fwd += 1;
+            continue;
+        }
+
+        if is_arith_op(tok) {
+            return true;
+        }
+
+        break;
+    }
+
+    for tok in &b_toks[edit.base_start..edit.base_end.min(b_toks.len())] {
+        if is_arith_op(tok) {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Performs safe sub-line token diff3 on a single line, keeping string literals, URLs, and
+/// numeric/version literals atomic and requiring at least one unchanged alphabetic identifier
+/// anchor separating concurrent edits.
 fn try_token_merge_line(base: &str, left: &str, right: &str) -> Option<String> {
-    let b_toks = tokenize_line(base);
-    let l_toks = tokenize_line(left);
-    let r_toks = tokenize_line(right);
+    let b_toks = tokenize_line_atomic(base);
+    let l_toks = tokenize_line_atomic(left);
+    let r_toks = tokenize_line_atomic(right);
 
     let b_joined = b_toks.join("\n");
     let l_joined = l_toks.join("\n");
@@ -2117,8 +3172,9 @@ fn try_token_merge_line(base: &str, left: &str, right: &str) -> Option<String> {
         return Some(left.to_string());
     }
 
-    // Require every left token edit and right token edit to be separated by at least one
-    // unchanged non-whitespace token in `base` so adjacent/same-value edits still flag a conflict.
+    // Require every non-identical pair of left and right token edits to be separated by at least
+    // one real unchanged alphabetic/identifier anchor token (never punctuation-only separators),
+    // and refuse to token-merge concurrent arithmetic edits.
     for le in &l_edits {
         for re in &r_edits {
             if le.base_start == re.base_start
@@ -2126,6 +3182,12 @@ fn try_token_merge_line(base: &str, left: &str, right: &str) -> Option<String> {
                 && le.replacement == re.replacement
             {
                 continue;
+            }
+
+            if is_edit_adjacent_to_arithmetic(&b_toks, le)
+                && is_edit_adjacent_to_arithmetic(&b_toks, re)
+            {
+                return None;
             }
 
             let (first_end, second_start) = if le.base_end <= re.base_start {
@@ -2136,11 +3198,11 @@ fn try_token_merge_line(base: &str, left: &str, right: &str) -> Option<String> {
                 return None;
             };
 
-            let has_non_ws_anchor = b_toks[first_end..second_start]
+            let has_word_anchor = b_toks[first_end..second_start]
                 .iter()
-                .any(|t| !t.trim().is_empty());
+                .any(|t| is_word_anchor(t));
 
-            if !has_non_ws_anchor {
+            if !has_word_anchor {
                 return None;
             }
         }
@@ -2219,47 +3281,140 @@ fn try_token_merge_line(base: &str, left: &str, right: &str) -> Option<String> {
     Some(out_toks.concat())
 }
 
-/// Splits `line` into contiguous identifier/number words, whitespace runs, and single-char punctuation tokens.
-fn tokenize_line(line: &str) -> Vec<&str> {
+/// Splits `line` into tokens while keeping quoted string literals, URLs, and numeric/semver
+/// literals as single indivisible tokens so partial edits inside them always conflict cleanly.
+fn tokenize_line_atomic(line: &str) -> Vec<&str> {
     let mut tokens = Vec::new();
-    let mut start = 0usize;
-    let mut current_kind: Option<u8> = None;
+    let bytes = line.as_bytes();
+    let len = bytes.len();
+    let mut i = 0usize;
 
-    for (idx, ch) in line.char_indices() {
-        let kind = if ch.is_alphanumeric() || ch == '_' {
-            Some(0)
-        } else if ch.is_whitespace() {
-            Some(1)
-        } else {
-            None
-        };
+    while i < len {
+        let ch = line[i..].chars().next().unwrap_or('\0');
 
-        match (current_kind, kind) {
-            (Some(k1), Some(k2)) if k1 == k2 => {}
-            (Some(_), Some(k2)) => {
-                tokens.push(&line[start..idx]);
-                start = idx;
-                current_kind = Some(k2);
+        // Quoted string literal as a single atomic token.
+        if ch == '"' || ch == '`' || (ch == '\'' && is_single_quote_literal_start(line, i)) {
+            let start = i;
+            i += ch.len_utf8();
+            let mut escaped = false;
+
+            while i < len {
+                let c = line[i..].chars().next().unwrap_or('\0');
+                i += c.len_utf8();
+
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == ch {
+                    break;
+                }
             }
-            (Some(_), None) => {
-                tokens.push(&line[start..idx]);
-                tokens.push(&line[idx..idx + ch.len_utf8()]);
-                start = idx + ch.len_utf8();
-                current_kind = None;
+
+            tokens.push(&line[start..i]);
+            continue;
+        }
+
+        // Whitespace run.
+        if ch.is_whitespace() {
+            let start = i;
+
+            while i < len {
+                let c = line[i..].chars().next().unwrap_or('\0');
+
+                if !c.is_whitespace() {
+                    break;
+                }
+
+                i += c.len_utf8();
             }
-            (None, Some(k2)) => {
-                start = idx;
-                current_kind = Some(k2);
+
+            tokens.push(&line[start..i]);
+            continue;
+        }
+
+        // URL (`scheme://...`) as a single atomic token.
+        if ch.is_ascii_alphabetic() {
+            let mut scan = i;
+
+            while scan < len
+                && (bytes[scan].is_ascii_alphanumeric()
+                    || matches!(bytes[scan], b'+' | b'-' | b'.'))
+            {
+                scan += 1;
             }
-            (None, None) => {
-                tokens.push(&line[idx..idx + ch.len_utf8()]);
-                start = idx + ch.len_utf8();
+
+            if scan + 2 < len && &bytes[scan..scan + 3] == b"://" {
+                let start = i;
+                i = scan + 3;
+
+                while i < len
+                    && !bytes[i].is_ascii_whitespace()
+                    && !matches!(
+                        bytes[i],
+                        b'"' | b'\'' | b'`' | b'<' | b'>' | b')' | b']' | b'}' | b',' | b';'
+                    )
+                {
+                    i += 1;
+                }
+
+                tokens.push(&line[start..i]);
+                continue;
             }
         }
-    }
 
-    if current_kind.is_some() && start < line.len() {
-        tokens.push(&line[start..]);
+        // Numeric, decimal, IP, or semver literal (`1.15`, `0.0.0.0`, `1.0.200`, `v1.2.3-rc.1`).
+        let is_version_v =
+            (ch == 'v' || ch == 'V') && bytes.get(i + 1).is_some_and(u8::is_ascii_digit);
+
+        if ch.is_ascii_digit() || is_version_v {
+            let start = i;
+            i += 1;
+
+            while i < len {
+                let b = bytes[i];
+                let continues = b.is_ascii_alphanumeric()
+                    || b == b'_'
+                    || (b == b'.' && bytes.get(i + 1).is_some_and(u8::is_ascii_alphanumeric))
+                    || ((b == b'-' || b == b'+')
+                        && bytes.get(i + 1).is_some_and(u8::is_ascii_alphanumeric)
+                        && (line[start..i].contains('.')
+                            || bytes[i - 1] == b'e'
+                            || bytes[i - 1] == b'E'));
+
+                if continues {
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+
+            tokens.push(&line[start..i]);
+            continue;
+        }
+
+        // Regular identifier/word token.
+        if ch.is_alphanumeric() || ch == '_' {
+            let start = i;
+
+            while i < len {
+                let c = line[i..].chars().next().unwrap_or('\0');
+
+                if !(c.is_alphanumeric() || c == '_') {
+                    break;
+                }
+
+                i += c.len_utf8();
+            }
+
+            tokens.push(&line[start..i]);
+            continue;
+        }
+
+        // Single punctuation token.
+        let end = i + ch.len_utf8();
+        tokens.push(&line[i..end]);
+        i = end;
     }
 
     tokens
@@ -2291,6 +3446,7 @@ pub fn attribute_agent_hunks(
     working_text: &str,
 ) -> Vec<(usize, usize, bool)> {
     let agent_edits = compute_line_edits(base_text, agent_text);
+
     if agent_edits.is_empty() {
         return Vec::new();
     }
@@ -2365,6 +3521,8 @@ pub fn attribute_agent_hunks(
         raw_ranges.push((start_1, end_1, false));
     }
 
+    raw_ranges.sort_unstable();
+
     let mut merged: Vec<(usize, usize, bool)> = Vec::new();
 
     for (s, e, in_wt) in raw_ranges {
@@ -2418,6 +3576,22 @@ mod tests {
     }
 
     #[test]
+    fn multi_hunk_overlap_window_never_rewinds_or_duplicates_lines() {
+        let base = "l0\nl1\nl2\nl3\nl4\nl5\nl6\nl7\n";
+        let left = "l0_L\nl1_L\nl2_L\nl3_L\nl4_L\nl5_L\nl6\nl7\n";
+        let right = "l0\nl1_R\nl2\nl3\nl4_R\nl5\nl6\nl7\n";
+
+        let res = merge_text_3way(base, left, right, "left", "right");
+        assert!(res.has_conflicts);
+        assert_eq!(res.conflict_count, 1);
+        assert_eq!(res.content.matches("l6").count(), 1);
+        assert_eq!(res.content.matches("l7").count(), 1);
+        assert!(res.content.contains("l1_R"));
+        assert!(res.content.contains("l4_R"));
+        assert!(res.content.ends_with("l6\nl7\n"));
+    }
+
+    #[test]
     fn colliding_line_edits_emit_diff3_markers() {
         let base = "const LIMIT = 10;\n";
         let left = "const LIMIT = 25;\n";
@@ -2428,6 +3602,204 @@ mod tests {
         assert_eq!(res.conflict_count, 1);
         assert!(res.content.contains("<<<<<<< agent-a"));
         assert!(res.content.contains(">>>>>>> agent-b"));
+    }
+
+    #[test]
+    fn conflicting_expressions_closures_versions_and_subscripts_always_conflict() {
+        // Conflicting call argument scalar replacement must NOT comma-concatenate into `charge(u, 150, 200)`.
+        let r_call = merge_text_3way(
+            "charge(u, 100);\n",
+            "charge(u, 150);\n",
+            "charge(u, 200);\n",
+            "a",
+            "b",
+        );
+        assert!(
+            r_call.has_conflicts,
+            "expected conflict, got:\n{}",
+            r_call.content
+        );
+
+        // Conflicting `if (...)` condition must NOT become `if (retries > 5, retries > 10)`.
+        let r_if = merge_text_3way(
+            "if (retries > 3) {\n",
+            "if (retries > 5) {\n",
+            "if (retries > 10) {\n",
+            "a",
+            "b",
+        );
+        assert!(
+            r_if.has_conflicts,
+            "expected conflict, got:\n{}",
+            r_if.content
+        );
+
+        // Conflicting array subscript must NOT become `arr[1, 2]`.
+        let r_sub = merge_text_3way(
+            "let x = arr[0];\n",
+            "let x = arr[1];\n",
+            "let x = arr[2];\n",
+            "a",
+            "b",
+        );
+        assert!(
+            r_sub.has_conflicts,
+            "expected conflict, got:\n{}",
+            r_sub.content
+        );
+
+        // Conflicting inline function body must NOT become `fn tax() { a * 15, a * 20 }`.
+        let r_fn = merge_text_3way(
+            "fn tax() { a * 10 }\n",
+            "fn tax() { a * 15 }\n",
+            "fn tax() { a * 20 }\n",
+            "a",
+            "b",
+        );
+        assert!(
+            r_fn.has_conflicts,
+            "expected conflict, got:\n{}",
+            r_fn.content
+        );
+
+        // Rust closure with `|` must NOT be treated as a TypeScript pipe union!
+        let r_closure = merge_text_3way(
+            "let f = |x| x * 2;\n",
+            "let f = |x| x * 3;\n",
+            "let f = |x| x * 4;\n",
+            "a",
+            "b",
+        );
+        assert!(
+            r_closure.has_conflicts,
+            "expected closure conflict, got:\n{}",
+            r_closure.content
+        );
+
+        // Semver strings & decimals & URLs must NOT token-merge on `.` or `/`.
+        let r_ver = merge_text_3way(
+            "serde = \"1.0.100\"\n",
+            "serde = \"1.0.200\"\n",
+            "serde = \"1.1.100\"\n",
+            "a",
+            "b",
+        );
+        assert!(
+            r_ver.has_conflicts,
+            "expected semver conflict, got:\n{}",
+            r_ver.content
+        );
+
+        let r_num = merge_text_3way(
+            "let rate = 1.05;\n",
+            "let rate = 1.15;\n",
+            "let rate = 0.25;\n",
+            "a",
+            "b",
+        );
+        assert!(
+            r_num.has_conflicts,
+            "expected decimal conflict, got:\n{}",
+            r_num.content
+        );
+
+        let r_url = merge_text_3way(
+            "const URL = \"https://api.v1.example.com/users\";\n",
+            "const URL = \"https://api.v2.example.com/users\";\n",
+            "const URL = \"https://api.v1.example.com/accounts\";\n",
+            "a",
+            "b",
+        );
+        assert!(
+            r_url.has_conflicts,
+            "expected URL conflict, got:\n{}",
+            r_url.content
+        );
+    }
+
+    #[test]
+    fn csharp_authorize_attribute_is_never_stripped_as_shared_section_header() {
+        let base = "public class ApiController {\n}\n";
+        let left = "public class ApiController {\n    [Authorize]\n    public void GetUsers() {\n    }\n}\n";
+        let right = "public class ApiController {\n    [Authorize]\n    public void GetInvoices() {\n    }\n}\n";
+
+        let res = merge_text_3way(base, left, right, "a", "b");
+        if !res.has_conflicts {
+            assert_eq!(
+                res.content.matches("[Authorize]").count(),
+                2,
+                "both C# endpoints must keep [Authorize], got:\n{}",
+                res.content
+            );
+        }
+    }
+
+    #[test]
+    fn colliding_css_rules_always_conflict() {
+        let base = ".header {\n  color: black;\n}\n";
+        let left = ".header {\n  color: black;\n}\n\n.btn {\n  color: blue;\n}\n\n.card {\n  padding: 4px;\n}\n";
+        let right = ".header {\n  color: black;\n}\n\n.btn {\n  color: red;\n}\n\n.badge {\n  margin: 2px;\n}\n";
+
+        let res = merge_text_3way(base, left, right, "a", "b");
+        assert!(
+            res.has_conflicts,
+            "colliding .btn CSS rules must conflict, got:\n{}",
+            res.content
+        );
+    }
+
+    #[test]
+    fn asymmetric_cyclic_rotation_never_teleports_code_between_blocks() {
+        let base = "fn alpha() {\n    start();\n}\n";
+        let left = "fn alpha() {\n    start();\n}\n\nfn beta() {\n    run_beta();\n}\n";
+        let right = "fn alpha() {\n    start();\n    if ready {\n        finish();\n    }\n}\n";
+
+        let res = merge_text_3way(base, left, right, "a", "b");
+        if !res.has_conflicts {
+            let beta_idx = res.content.find("fn beta()").expect("beta");
+            let ready_idx = res.content.find("if ready").expect("ready");
+            assert!(
+                ready_idx < beta_idx,
+                "if ready must stay inside alpha, not teleport into beta:\n{}",
+                res.content
+            );
+        }
+    }
+
+    #[test]
+    fn split_kv_rejects_compound_assignments_and_ternaries_and_handles_lifetimes() {
+        assert!(split_top_level_kv("count += 1").is_none());
+        assert!(split_top_level_kv("flags |= MASK").is_none());
+        assert!(split_top_level_kv("cond ? a : b").is_none());
+        assert_eq!(
+            split_top_level_kv("name?: string"),
+            Some(("name?", "string"))
+        );
+        assert_eq!(split_top_level_kv("key: &'a str"), Some(("key", "&'a str")));
+        assert_eq!(
+            split_top_level("a < b, c > d", ','),
+            vec!["a < b", " c > d"]
+        );
+        assert_eq!(
+            split_top_level("m: HashMap<String, i32>, n: usize", ','),
+            vec!["m: HashMap<String, i32>", " n: usize"]
+        );
+    }
+
+    #[test]
+    fn split_disjoint_trailing_blocks_never_resurrects_deleted_base_block() {
+        let base = "fn a() {\n    old_a();\n}\nfn b() {\n    old_b();\n}\n";
+        let left = "fn a() {\n    left_a();\n}\nfn b() {\n    old_b();\n}\n";
+        let right = "fn a() {\n    right_a();\n}\n";
+
+        let res = merge_text_3way(base, left, right, "a", "b");
+        assert!(res.has_conflicts);
+        let marker_end = res.content.find(">>>>>>> b").expect("end marker");
+        assert!(
+            !res.content[marker_end..].contains("fn b()"),
+            "deleted fn b() must not be emitted outside conflict markers:\n{}",
+            res.content
+        );
     }
 
     #[test]
@@ -2642,8 +4014,12 @@ packages:
             res_pnpm.content
         );
         assert!(
-            res_pnpm.content.contains("axios:\n        specifier: ^1.6.0")
-                && res_pnpm.content.contains("zod:\n        specifier: ^3.22.0")
+            res_pnpm
+                .content
+                .contains("axios:\n        specifier: ^1.6.0")
+                && res_pnpm
+                    .content
+                    .contains("zod:\n        specifier: ^3.22.0")
                 && res_pnpm.content.contains("/axios@1.6.8:")
                 && res_pnpm.content.contains("/zod@3.22.4:"),
             "all pnpm importer and package blocks must be preserved:\n{}",
@@ -2685,7 +4061,8 @@ packages:
     #[test]
     fn shared_yaml_container_headers_and_yarn_lock_blocks_merge_cleanly() {
         let base_yaml = "name: service\nversion: 1.0.0\n";
-        let left_yaml = "name: service\nversion: 1.0.0\ndependencies:\n  axios:\n    version: 1.6.8\n";
+        let left_yaml =
+            "name: service\nversion: 1.0.0\ndependencies:\n  axios:\n    version: 1.6.8\n";
         let right_yaml =
             "name: service\nversion: 1.0.0\ndependencies:\n  zod:\n    version: 3.22.4\n";
         let res_yaml = merge_text_3way(base_yaml, left_yaml, right_yaml, "a", "b");

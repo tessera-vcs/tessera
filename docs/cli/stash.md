@@ -10,12 +10,14 @@ tes stash [subcommand] [options]
 
 ## Subcommands
 
-- `tes stash [push] [-m <msg>] [-a <ID>] [paths...]` - Save the current session's (or working tree's) uncommitted changes onto the stash stack and restore the stashed files to the branch base. Optionally pass `<paths...>` to stash only specific files.
+- `tes stash [push] [-m <msg>] [-b <branch>] [-a <ID>] [paths...]` - Save the current session's (or working tree's) uncommitted changes onto the stash stack and restore the stashed files to the branch base. Optionally pass `<paths...>` to stash only specific files.
 - `tes stash pop [index] [-a <ID>]` - 3-way AST-merge `stash@{index}` (default `0`) onto the current branch/session and remove it from the stash stack.
 - `tes stash apply [index] [-a <ID>]` - 3-way AST-merge `stash@{index}` (default `0`) onto the current branch/session while keeping it in the stash stack.
 - `tes stash list` - List all stash entries (`stash@{0}`, `stash@{1}`, ...).
-- `tes stash drop [index]` - Delete a single stash entry (default `0`).
-- `tes stash clear` - Remove all entries from the stash stack.
+- `tes stash drop [index] [-a <ID>]` - Delete a single stash entry (default `0`).
+- `tes stash clear [-a <ID>]` - Remove all entries from the stash stack.
+
+> **Note:** `-a` / `--agent <ID>` is accepted both **before** and **after** subcommands (for example, `tes stash -a antigravity-1 pop` and `tes stash pop -a antigravity-1` are equivalent).
 
 ## Examples
 

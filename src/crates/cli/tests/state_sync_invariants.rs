@@ -1039,9 +1039,17 @@ fn stale_peer_never_reverts_subsequent_hooked_edits_on_new_or_existing_file() {
 
                 repo.tes(
                     "ghost",
-                    &["claim", "--branch", "main", "--intent", "ghost work", "f.rs"],
+                    &[
+                        "claim",
+                        "--branch",
+                        "main",
+                        "--intent",
+                        "ghost work",
+                        "f.rs",
+                    ],
                 );
-                let mut text = initial.replace("pub fn a() -> u8 {\n    1", "pub fn a() -> u8 {\n    10");
+                let mut text =
+                    initial.replace("pub fn a() -> u8 {\n    1", "pub fn a() -> u8 {\n    10");
                 if ghost_same_fn {
                     text = text.replace("let pad2 = 0;", "let pad2 = 7;");
                 }
@@ -1056,7 +1064,9 @@ fn stale_peer_never_reverts_subsequent_hooked_edits_on_new_or_existing_file() {
                     repo.hook("live", "f.rs");
                 }
 
-                let after_first = repo.read("f.rs").replace("let first = 1;", "let first = 20;");
+                let after_first = repo
+                    .read("f.rs")
+                    .replace("let first = 1;", "let first = 20;");
                 repo.write("f.rs", &after_first);
                 repo.hook("live", "f.rs");
 
@@ -1141,7 +1151,13 @@ fn off_head_branch_session_deletions_moves_chmod_and_exec_merge_cleanly() {
 
     repo.tes(
         "offhead",
-        &["commit", "-b", "feat/off-head", "-m", "feat: off-head refactor"],
+        &[
+            "commit",
+            "-b",
+            "feat/off-head",
+            "-m",
+            "feat: off-head refactor",
+        ],
     );
     repo.assert_git_clean("after committing feat/off-head");
 
@@ -1180,7 +1196,14 @@ fn switch_cherry_pick_pull_resolve_and_stash_apply_preserve_git_status_parity() 
 
     repo.tes(
         "picker",
-        &["claim", "--branch", "feat/pick", "--intent", "Add picked.txt", "picked.txt"],
+        &[
+            "claim",
+            "--branch",
+            "feat/pick",
+            "--intent",
+            "Add picked.txt",
+            "picked.txt",
+        ],
     );
     repo.tes(
         "picker",
@@ -1223,7 +1246,12 @@ fn switch_cherry_pick_pull_resolve_and_stash_apply_preserve_git_status_parity() 
         "-q",
         bare_path.to_str().expect("bare path"),
     ]);
-    repo.git(&["remote", "add", "origin", bare_path.to_str().expect("bare path")]);
+    repo.git(&[
+        "remote",
+        "add",
+        "origin",
+        bare_path.to_str().expect("bare path"),
+    ]);
     repo.git(&["push", "-q", "-u", "origin", "main"]);
     repo.git(&[
         "clone",
@@ -1247,7 +1275,11 @@ fn switch_cherry_pick_pull_resolve_and_stash_apply_preserve_git_status_parity() 
             .env("GIT_COMMITTER_EMAIL", "t@example.com")
             .output()
             .expect("clone git");
-        assert!(out.status.success(), "{:?}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "{:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     };
     run_clone_git(&["add", "upstream.txt"]);
     run_clone_git(&["commit", "-q", "-m", "feat: upstream file"]);
@@ -1279,11 +1311,25 @@ fn switch_cherry_pick_pull_resolve_and_stash_apply_preserve_git_status_parity() 
 
     repo.tes(
         "left",
-        &["claim", "--branch", "main", "--intent", "Left run.sh", "run.sh"],
+        &[
+            "claim",
+            "--branch",
+            "main",
+            "--intent",
+            "Left run.sh",
+            "run.sh",
+        ],
     );
     repo.tes(
         "right",
-        &["claim", "--branch", "main", "--intent", "Right run.sh", "run.sh"],
+        &[
+            "claim",
+            "--branch",
+            "main",
+            "--intent",
+            "Right run.sh",
+            "run.sh",
+        ],
     );
     repo.write("run.sh", "#!/bin/sh\necho left\n");
     repo.hook("left", "run.sh");
@@ -1332,9 +1378,11 @@ fn slot_reuse_and_polyglot_port_isolation_across_shells_and_dev_servers() {
     let repo = Repo::new(&[("README.md", "# Polyglot Port Test\n", false)]);
 
     let env1_default_json: serde_json::Value =
-        serde_json::from_str(&repo.tes("term-1001", &["--json", "env"])).expect("env1 default json");
+        serde_json::from_str(&repo.tes("term-1001", &["--json", "env"]))
+            .expect("env1 default json");
     let env2_default_json: serde_json::Value =
-        serde_json::from_str(&repo.tes("term-1002", &["--json", "env"])).expect("env2 default json");
+        serde_json::from_str(&repo.tes("term-1002", &["--json", "env"]))
+            .expect("env2 default json");
 
     assert_eq!(env1_default_json["slot"], 1, "{env1_default_json}");
     assert_eq!(env1_default_json["port"], 3100, "{env1_default_json}");
@@ -1467,7 +1515,11 @@ fn slot_reuse_and_polyglot_port_isolation_across_shells_and_dev_servers() {
         };
 
         assert_eq!(
-            run_shimmed("3100", "node", &["node_modules/.bin/vitepress", "dev", "docs"]),
+            run_shimmed(
+                "3100",
+                "node",
+                &["node_modules/.bin/vitepress", "dev", "docs"]
+            ),
             "node_modules/.bin/vitepress dev docs --port 3100"
         );
         assert_eq!(
@@ -1483,7 +1535,11 @@ fn slot_reuse_and_polyglot_port_isolation_across_shells_and_dev_servers() {
             "node_modules/nuxi/bin/nuxi.mjs dev --port 3100"
         );
         assert_eq!(
-            run_shimmed("3100", "node", &["node_modules/@remix-run/dev/dist/cli.js", "vite:dev"]),
+            run_shimmed(
+                "3100",
+                "node",
+                &["node_modules/@remix-run/dev/dist/cli.js", "vite:dev"]
+            ),
             "node_modules/@remix-run/dev/dist/cli.js vite:dev --port 3100"
         );
         assert_eq!(
@@ -1491,17 +1547,18 @@ fn slot_reuse_and_polyglot_port_isolation_across_shells_and_dev_servers() {
             "node_modules/storybook/index.js dev -p 3106"
         );
         assert_eq!(
-            run_shimmed("3100", "node", &["node_modules/prisma/build/index.js", "studio"]),
+            run_shimmed(
+                "3100",
+                "node",
+                &["node_modules/prisma/build/index.js", "studio"]
+            ),
             "node_modules/prisma/build/index.js studio --port 3108"
         );
         assert_eq!(
             run_shimmed("3100", "bun", &["x", "astro", "dev"]),
             "x astro dev --port 3100"
         );
-        assert_eq!(
-            run_shimmed("3100", "npx", &["vite"]),
-            "vite --port 3100"
-        );
+        assert_eq!(run_shimmed("3100", "npx", &["vite"]), "vite --port 3100");
         assert_eq!(
             run_shimmed("3100", "deno", &["serve", "main.ts"]),
             "serve main.ts --port 3100"
@@ -1550,17 +1607,15 @@ fn slot_reuse_and_polyglot_port_isolation_across_shells_and_dev_servers() {
             run_shimmed("3100", "bundle", &["exec", "rails", "s"]),
             "exec rails s -p 3100"
         );
-        assert_eq!(
-            run_shimmed("3100", "hugo", &["server"]),
-            "server -p 3100"
-        );
+        assert_eq!(run_shimmed("3100", "hugo", &["server"]), "server -p 3100");
         assert_eq!(
             run_shimmed("3100", "caddy", &["file-server"]),
             "file-server --listen :3100"
         );
         assert_eq!(
             run_shimmed("3100", "dotnet", &["run"]),
-            "run --urls http://localhost:3100"
+            "run",
+            "dotnet run relies on ASPNETCORE_URLS instead of injecting --urls so console apps never break"
         );
         assert_eq!(
             run_shimmed("3100", "mvn", &["spring-boot:run"]),
@@ -1570,10 +1625,7 @@ fn slot_reuse_and_polyglot_port_isolation_across_shells_and_dev_servers() {
             run_shimmed("3100", "gradle", &["bootRun"]),
             "bootRun -Dserver.port=3100 -Dquarkus.http.port=3100"
         );
-        assert_eq!(
-            run_shimmed("3100", "sbt", &["run"]),
-            "-Dhttp.port=3100 run"
-        );
+        assert_eq!(run_shimmed("3100", "sbt", &["run"]), "-Dhttp.port=3100 run");
         assert_eq!(
             run_shimmed("3100", "flutter", &["run", "-d", "web-server"]),
             "run -d web-server --web-port=3109"
@@ -1581,14 +1633,20 @@ fn slot_reuse_and_polyglot_port_isolation_across_shells_and_dev_servers() {
 
         let lease_dir = shim_dir.join(".leases").join("3100");
         fs::create_dir_all(&lease_dir).expect("create lease 3100");
-        fs::write(lease_dir.join("pid"), format!("{}\n", std::process::id()))
-            .expect("write live pid");
-        assert_eq!(
-            run_shimmed("3100", "node", &["node_modules/.bin/vite"]),
-            "node_modules/.bin/vite --port 3101",
-            "second concurrent server in the same session must step to 3101 when 3100 is leased"
-        );
+        let mut peer_sleeper = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn peer lease sleeper");
+        fs::write(lease_dir.join("pid"), format!("{}\n", peer_sleeper.id()))
+            .expect("write distinct live peer pid");
+        let stepped = run_shimmed("3100", "node", &["node_modules/.bin/vite"]);
+        let _ = peer_sleeper.kill();
+        let _ = peer_sleeper.wait();
         let _ = fs::remove_file(lease_dir.join("pid"));
+        assert_eq!(
+            stepped, "node_modules/.bin/vite --port 3101",
+            "second concurrent server in the same session must step to 3101 when 3100 is leased by a distinct live peer PID"
+        );
     }
 }
 
@@ -1670,11 +1728,7 @@ fn cross_branch_watcher_restored_baseline_preserves_both_sessions_and_multiline_
     #[cfg(unix)]
     if Path::new("/bin/zsh").is_file() {
         let bin = Path::new(env!("CARGO_BIN_EXE_tes"));
-        let bin_dir = bin
-            .parent()
-            .expect("tes bin parent")
-            .display()
-            .to_string();
+        let bin_dir = bin.parent().expect("tes bin parent").display().to_string();
         let zsh_script = r#"
             eval "$("$TES_BIN" env --zsh)"
             _tes_preexec $'tes switch feat/habit-tracker\nnode -v'
@@ -1693,10 +1747,7 @@ fn cross_branch_watcher_restored_baseline_preserves_both_sessions_and_multiline_
             .env("TES_BIN", bin)
             .env(
                 "PATH",
-                format!(
-                    "{bin_dir}:{}",
-                    std::env::var("PATH").unwrap_or_default()
-                ),
+                format!("{bin_dir}:{}", std::env::var("PATH").unwrap_or_default()),
             )
             .output()
             .expect("run zsh multiline test");
@@ -1718,4 +1769,815 @@ fn cross_branch_watcher_restored_baseline_preserves_both_sessions_and_multiline_
             "multiline `tes switch feat/pomodoro-timer\\nagy` must keep PWD at repo_root: {stdout}"
         );
     }
+}
+
+/// Verifies `tes init --local` (plus `-C` relative path resolution), `tes doctor --json`,
+/// `tes merge --dry-run`, `--verify` error handling, and non-zero exit codes on verification failures.
+#[test]
+fn doctor_init_local_and_merge_dry_run_e2e() {
+    let parent_tmp = tempfile::tempdir().expect("parent tempdir");
+    let rel_repo = parent_tmp.path().join("nested-local-repo");
+    fs::create_dir_all(&rel_repo).expect("mkdir nested-local-repo");
+    fs::write(rel_repo.join("lib.rs"), "pub fn base() -> i32 { 1 }\n").expect("write lib.rs");
+
+    let tes_bin = Path::new(env!("CARGO_BIN_EXE_tes"));
+    let init_local = Command::new(tes_bin)
+        .args([
+            "-C",
+            parent_tmp.path().to_str().expect("parent path"),
+            "init",
+            "nested-local-repo",
+            "--local",
+            "--harness",
+            "antigravity",
+            "--json",
+        ])
+        .env("GIT_AUTHOR_NAME", "Test Author")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test Author")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .output()
+        .expect("tes -C parent init nested-local-repo --local");
+    assert!(
+        init_local.status.success(),
+        "tes init --local failed: {}",
+        String::from_utf8_lossy(&init_local.stderr)
+    );
+
+    let exclude_content =
+        fs::read_to_string(rel_repo.join(".git/info/exclude")).expect("read .git/info/exclude");
+    assert!(
+        exclude_content.contains(".agents/rules/tessera.md"),
+        "expected harness file in .git/info/exclude, got:\n{exclude_content}"
+    );
+
+    let git_status_local = Command::new("git")
+        .current_dir(&rel_repo)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .args(["status", "--porcelain"])
+        .output()
+        .expect("git status local");
+    assert!(
+        git_status_local.status.success() && git_status_local.stdout.is_empty(),
+        "expected clean git status after tes init --local, got: {}",
+        String::from_utf8_lossy(&git_status_local.stdout)
+    );
+
+    let repo = Repo::new(&[("lib.rs", "pub fn base() -> i32 { 1 }\n", false)]);
+
+    fs::write(
+        repo.path("tessera.toml"),
+        "verify_command = \"echo untrusted\"\n",
+    )
+    .expect("write untrusted tessera.toml");
+
+    let doc_out = repo.tes("term-doc", &["doctor", "--json"]);
+    let doc_json: serde_json::Value = serde_json::from_str(&doc_out).expect("doctor json");
+    assert_eq!(doc_json["ok"], true, "doctor report: {doc_json}");
+    let checks = doc_json["checks"].as_array().expect("checks array");
+    assert_eq!(checks.len(), 7, "expected 7 doctor checks: {doc_json}");
+
+    let cfg_check = checks
+        .iter()
+        .find(|c| c["id"] == "repo_config")
+        .expect("repo_config check");
+    assert_eq!(
+        cfg_check["status"], "warn",
+        "untrusted tessera.toml with verify_command should warn: {cfg_check}"
+    );
+
+    repo.tes(
+        "dry-worker",
+        &[
+            "claim",
+            "--branch",
+            "feat/dry",
+            "--intent",
+            "Add dry fn",
+            "lib.rs",
+        ],
+    );
+    repo.tes(
+        "dry-worker",
+        &[
+            "exec",
+            "-b",
+            "feat/dry",
+            "--",
+            "sh",
+            "-c",
+            "printf 'pub fn base() -> i32 { 1 }\\npub fn dry() -> i32 { 2 }\\n' > lib.rs",
+        ],
+    );
+    repo.tes(
+        "dry-worker",
+        &["commit", "-b", "feat/dry", "-m", "feat: dry"],
+    );
+
+    let head_before = repo.git(&["rev-parse", "main"]);
+    let oplog_before: serde_json::Value =
+        serde_json::from_str(&repo.tes("term-doc", &["oplog", "--json"])).expect("oplog before");
+
+    let dry_out = repo.tes(
+        "term-doc",
+        &["merge", "feat/dry", "--into", "main", "--dry-run", "--json"],
+    );
+    let dry_json: serde_json::Value = serde_json::from_str(&dry_out).expect("dry-run json");
+    assert_eq!(dry_json["created_commit"], false, "{dry_json}");
+    assert_eq!(dry_json["verification_passed"], true, "{dry_json}");
+    assert!(
+        dry_json["conflicts"].as_array().is_some_and(Vec::is_empty),
+        "{dry_json}"
+    );
+    assert_eq!(
+        repo.git(&["rev-parse", "main"]),
+        head_before,
+        "dry-run must not advance main"
+    );
+    assert_eq!(
+        repo.read("lib.rs"),
+        "pub fn base() -> i32 { 1 }\n",
+        "dry-run must not modify working tree"
+    );
+    let oplog_after: serde_json::Value =
+        serde_json::from_str(&repo.tes("term-doc", &["oplog", "--json"])).expect("oplog after");
+    assert_eq!(
+        oplog_before.as_array().map(Vec::len),
+        oplog_after.as_array().map(Vec::len),
+        "dry-run must not write OpLog entries"
+    );
+
+    let missing_verify = repo.run_tes(Some("term-doc"), &["merge", "--verify", "feat/dry"]);
+    assert!(
+        !missing_verify.status.success(),
+        "bare --verify with no verify_command configured must fail explicitly"
+    );
+    let missing_stderr = String::from_utf8_lossy(&missing_verify.stderr);
+    assert!(
+        missing_stderr.contains("no verify_command is configured"),
+        "expected missing verify_command error (not running 'feat/dry' as command!), got: {missing_stderr}"
+    );
+
+    let failed_verify = repo.run_tes(
+        Some("term-doc"),
+        &["merge", "feat/dry", "--into", "main", "--verify=exit 1"],
+    );
+    assert!(
+        !failed_verify.status.success(),
+        "failing --verify must exit non-zero"
+    );
+    let failed_stdout = String::from_utf8_lossy(&failed_verify.stdout);
+    assert!(
+        failed_stdout.contains("Verification failed; branch 'main' was not advanced"),
+        "expected clear verification failure message, got: {failed_stdout}"
+    );
+    assert_eq!(
+        repo.git(&["rev-parse", "main"]),
+        head_before,
+        "failed verification must not advance main"
+    );
+}
+
+/// Verifies `tes push` (single-arg branch, auto-commit with deletions, `--json`, conflict blocking)
+/// and divergent `tes pull` (conflict registration, non-zero exit code, caller new-file preservation).
+#[test]
+fn push_and_divergent_pull_conflicts_and_preservation_e2e() {
+    let repo = Repo::new(&[
+        ("shared.txt", "line 1\nline 2\n", false),
+        ("obsolete.txt", "delete me\n", false),
+    ]);
+
+    let remote_tmp = tempfile::tempdir().expect("remote tempdir");
+    let bare_path = remote_tmp.path().join("origin.git");
+    let clone_path = remote_tmp.path().join("clone");
+    let bare_str = bare_path.to_str().expect("bare path");
+    let clone_str = clone_path.to_str().expect("clone path");
+
+    repo.git(&["init", "--bare", "-b", "main", "-q", bare_str]);
+    repo.git(&["remote", "add", "origin", bare_str]);
+    repo.git(&["push", "-q", "-u", "origin", "main"]);
+
+    // Delete a tracked file and verify `tes push main --json` auto-commits the deletion and emits real JSON.
+    repo.tes(
+        "pusher",
+        &["claim", "--intent", "Drop obsolete file", "obsolete.txt"],
+    );
+    repo.rm("obsolete.txt");
+    repo.hook("pusher", "obsolete.txt");
+
+    let push_json_raw = repo.tes("pusher", &["push", "main", "--json"]);
+    let push_json: serde_json::Value = serde_json::from_str(&push_json_raw).expect("push json");
+    assert_eq!(push_json["ok"], true, "{push_json}");
+    assert_eq!(push_json["remote"], "origin", "{push_json}");
+    assert_eq!(push_json["branch"], "main", "{push_json}");
+    assert!(
+        !repo.head_tree().contains_key("obsolete.txt"),
+        "push auto-commit must include deletion tombstones"
+    );
+
+    // Clone origin and create a divergent upstream commit editing `shared.txt`.
+    repo.git(&["clone", "-q", "-b", "main", bare_str, clone_str]);
+    fs::write(clone_path.join("shared.txt"), "remote change\nline 2\n")
+        .expect("write remote shared");
+
+    let run_clone_git = |args: &[&str]| {
+        let mut cmd = Command::new("git");
+        cmd.current_dir(&clone_path).args(args);
+
+        for key in ISOLATED_ENV {
+            cmd.env_remove(key);
+        }
+
+        let out = cmd
+            .env("GIT_AUTHOR_NAME", "Upstream")
+            .env("GIT_AUTHOR_EMAIL", "up@example.com")
+            .env("GIT_COMMITTER_NAME", "Upstream")
+            .env("GIT_COMMITTER_EMAIL", "up@example.com")
+            .output()
+            .expect("clone git");
+        assert!(
+            out.status.success(),
+            "clone git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    run_clone_git(&["add", "shared.txt"]);
+    run_clone_git(&["commit", "-q", "-m", "feat: upstream edit shared.txt"]);
+    run_clone_git(&["push", "-q", "origin", "main"]);
+
+    // Make a conflicting local commit on `shared.txt`, plus keep an unrelated new file on disk.
+    repo.write("shared.txt", "local change\nline 2\n");
+    repo.hook("pusher", "shared.txt");
+    repo.tes("pusher", &["commit", "-m", "feat: local edit shared.txt"]);
+    repo.write("local_notes.txt", "keep this new file safe\n");
+
+    let pull_out = repo.run_tes(Some("pusher"), &["pull", "main", "--json"]);
+    assert!(
+        !pull_out.status.success(),
+        "divergent pull with conflict must exit non-zero"
+    );
+    let pull_json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&pull_out.stdout)).expect("pull json");
+    let conflicts = pull_json["conflicts"].as_array().expect("conflicts array");
+    assert!(
+        conflicts.iter().any(|c| c["path"] == "shared.txt"),
+        "expected shared.txt conflict in PullReport: {pull_json}"
+    );
+    assert_eq!(
+        repo.read("local_notes.txt"),
+        "keep this new file safe\n",
+        "divergent pull must preserve caller's unrelated new file"
+    );
+
+    // Resolve the pull conflict, then create a fresh auto-commit conflict and prove `tes push` aborts.
+    repo.tes(
+        "pusher",
+        &[
+            "resolve",
+            "shared.txt",
+            "--strategy",
+            "content",
+            "--content",
+            "resolved line\nline 2\n",
+        ],
+    );
+    repo.rm("local_notes.txt");
+    repo.tes("pusher", &["commit", "-m", "fix: resolve pull conflict"]);
+
+    repo.tes(
+        "c1",
+        &[
+            "claim",
+            "--branch",
+            "main",
+            "--intent",
+            "Edit c1",
+            "shared.txt",
+        ],
+    );
+    repo.tes(
+        "c2",
+        &[
+            "claim",
+            "--branch",
+            "main",
+            "--intent",
+            "Edit c2",
+            "shared.txt",
+        ],
+    );
+    repo.write("shared.txt", "c1 line\nline 2\n");
+    repo.hook("c1", "shared.txt");
+    repo.write("shared.txt", "c2 line\nline 2\n");
+    repo.hook("c2", "shared.txt");
+
+    let blocked_push = repo.run_tes(Some("c2"), &["push", "origin", "main", "--json"]);
+    assert!(
+        !blocked_push.status.success(),
+        "tes push must abort with non-zero exit when auto-commit encounters conflicts"
+    );
+}
+
+/// Verifies `tes diff` (`--staged` empty, `--json`, `HEAD~1`, `A...B`, subdirectory pathspecs),
+/// piped `tes status --porcelain` (zero ANSI + `??`), `tes config` trust/untrust isolation,
+/// `tes resolve` strict strategy + `--content-file`, and `tes stash` global `-a` & deleted paths.
+#[test]
+fn diff_status_porcelain_resolve_stash_and_config_trust_e2e() {
+    let repo = Repo::new(&[
+        ("sub/mod.rs", "pub fn v() -> i32 { 1 }\n", false),
+        ("other.txt", "hello\n", false),
+        ("dropme.txt", "bye\n", false),
+    ]);
+
+    // Unstaged edit only -> `tes diff --staged` must emit NOTHING instead of falling through.
+    repo.write("other.txt", "unstaged edit\n");
+    let empty_staged = repo.tes("term-diff", &["diff", "--staged"]);
+    assert!(
+        empty_staged.trim().is_empty(),
+        "tes diff --staged must be empty when session has no staged changes, got:\n{empty_staged}"
+    );
+
+    // Untracked file + piped `tes status --porcelain` -> zero ANSI escapes and `??` marker.
+    repo.write("untracked.txt", "brand new\n");
+    let porcelain_out = repo.run_tes(Some("term-diff"), &["status", "--porcelain"]);
+    assert!(porcelain_out.status.success());
+    let porcelain_str = String::from_utf8_lossy(&porcelain_out.stdout);
+    assert!(
+        !porcelain_str.contains('\x1b'),
+        "piped tes status --porcelain must never emit ANSI codes: {porcelain_str:?}"
+    );
+    assert!(
+        porcelain_str.contains("?? untracked.txt"),
+        "expected untracked file as `??` in porcelain output, got:\n{porcelain_str}"
+    );
+    repo.rm("untracked.txt");
+    repo.tes("term-diff", &["restore", "other.txt"]);
+
+    // Commit v2 on `main`, then create branch `feat/three-dot` at v2 and advance `main` to v3.
+    repo.write("sub/mod.rs", "pub fn v() -> i32 { 2 }\n");
+    repo.hook("term-diff", "sub/mod.rs");
+    repo.tes("term-diff", &["commit", "-m", "feat: v2"]);
+
+    repo.tes(
+        "brancher",
+        &[
+            "claim",
+            "--branch",
+            "feat/three-dot",
+            "--intent",
+            "Branch edit",
+            "sub/mod.rs",
+        ],
+    );
+    repo.tes(
+        "brancher",
+        &[
+            "exec",
+            "-b",
+            "feat/three-dot",
+            "--",
+            "sh",
+            "-c",
+            "printf 'pub fn v() -> i32 { 2 }\\npub fn feat() -> i32 { 9 }\\n' > sub/mod.rs",
+        ],
+    );
+    repo.tes(
+        "brancher",
+        &["commit", "-b", "feat/three-dot", "-m", "feat: branch fn"],
+    );
+
+    repo.write("other.txt", "trunk v3\n");
+    repo.hook("term-diff", "other.txt");
+    repo.tes("term-diff", &["commit", "-m", "feat: trunk v3"]);
+
+    // `tes diff main...feat/three-dot` must diff merge-base(main, feat/three-dot)..feat/three-dot
+    // so it shows `feat()` without showing an inverted diff of `other.txt`!
+    let three_dot = repo.tes("term-diff", &["diff", "main...feat/three-dot", "--json"]);
+    let three_dot_json: serde_json::Value =
+        serde_json::from_str(&three_dot).expect("three-dot diff json");
+    let three_dot_diff = three_dot_json["diff"].as_str().unwrap_or_default();
+    assert!(
+        three_dot_diff.contains("pub fn feat()"),
+        "expected feat() in three-dot diff: {three_dot_json}"
+    );
+    assert!(
+        !three_dot_diff.contains("other.txt"),
+        "three-dot merge-base diff must not include inverted trunk commit other.txt: {three_dot_json}"
+    );
+
+    // Single-revision diff (`tes diff HEAD~1`) + subdirectory `-C sub diff HEAD~1 mod.rs`.
+    let single_rev = repo.tes("term-diff", &["diff", "HEAD~1", "--json"]);
+    let single_json: serde_json::Value =
+        serde_json::from_str(&single_rev).expect("single rev json");
+    assert!(
+        single_json["diff"]
+            .as_str()
+            .is_some_and(|d| d.contains("trunk v3")),
+        "expected trunk v3 in HEAD~1 diff: {single_json}"
+    );
+
+    let sub_diff = Command::new(env!("CARGO_BIN_EXE_tes"))
+        .current_dir(repo.path("sub"))
+        .args(["diff", "HEAD~2..HEAD", "mod.rs"])
+        .env("TES_SESSION_ID", "term-diff")
+        .env("TES_NO_PAGER", "1")
+        .output()
+        .expect("subdir tes diff");
+    assert!(sub_diff.status.success());
+    assert!(
+        String::from_utf8_lossy(&sub_diff.stdout).contains("pub fn v() -> i32 { 2 }"),
+        "subdir diff should resolve mod.rs to sub/mod.rs: {}",
+        String::from_utf8_lossy(&sub_diff.stdout)
+    );
+
+    // `tes config set` while `tessera.toml` is trusted, followed by `tes config untrust`
+    // must NOT bake `tessera.toml`'s `verify_command` into `.git/tessera/config.toml`!
+    repo.write("tessera.toml", "verify_command = \"echo from-repo-toml\"\n");
+    repo.tes("term-diff", &["config", "trust"]);
+    let trusted_show: serde_json::Value =
+        serde_json::from_str(&repo.tes("term-diff", &["config", "show", "--json"]))
+            .expect("trusted config");
+    assert_eq!(trusted_show["verify_command"], "echo from-repo-toml");
+
+    repo.tes("term-diff", &["config", "set", "base_port", "4100"]);
+    repo.tes("term-diff", &["config", "untrust"]);
+    let untrusted_show: serde_json::Value =
+        serde_json::from_str(&repo.tes("term-diff", &["config", "show", "--json"]))
+            .expect("untrusted config");
+    assert_eq!(untrusted_show["base_port"], 4100);
+    assert!(
+        untrusted_show["verify_command"].is_null(),
+        "untrust must revoke tessera.toml verify_command even after tes config set: {untrusted_show}"
+    );
+
+    // `tes resolve`: invalid strategy rejected, missing content rejected without truncation, `--content-file` works.
+    repo.tes(
+        "r1",
+        &["claim", "--branch", "main", "--intent", "Left", "other.txt"],
+    );
+    repo.tes(
+        "r2",
+        &[
+            "claim",
+            "--branch",
+            "main",
+            "--intent",
+            "Right",
+            "other.txt",
+        ],
+    );
+    repo.write("other.txt", "left version\n");
+    repo.hook("r1", "other.txt");
+    repo.write("other.txt", "right version\n");
+    repo.hook("r2", "other.txt");
+
+    let bad_strat = repo.run_tes(Some("r2"), &["resolve", "other.txt", "--strategy", "bogus"]);
+    assert!(
+        !bad_strat.status.success(),
+        "unknown resolve strategy must fail"
+    );
+
+    let missing_content = repo.run_tes(
+        Some("r2"),
+        &["resolve", "other.txt", "--strategy", "content"],
+    );
+    assert!(
+        !missing_content.status.success(),
+        "--strategy content without --content or --content-file must fail"
+    );
+    assert!(
+        !repo.read("other.txt").is_empty(),
+        "failed resolve must never truncate file to 0 bytes"
+    );
+
+    let cf_path = repo.path("resolved_input.txt");
+    fs::write(&cf_path, "resolved from file\n").expect("write content-file");
+    repo.tes(
+        "r2",
+        &[
+            "resolve",
+            "other.txt",
+            "--strategy",
+            "content",
+            "--content-file",
+            cf_path.to_str().expect("cf path"),
+        ],
+    );
+    assert_eq!(repo.read("other.txt"), "resolved from file\n");
+    repo.rm("resolved_input.txt");
+    repo.tes("r2", &["commit", "-m", "fix: resolve via content-file"]);
+    repo.tes("r1", &["agent", "close", "antigravity-r1"]);
+
+    // `tes stash push <deleted-file>` + `tes stash pop 0 -a <agent>`.
+    repo.tes(
+        "stasher",
+        &[
+            "claim",
+            "--branch",
+            "main",
+            "--intent",
+            "Delete dropme",
+            "dropme.txt",
+        ],
+    );
+    repo.rm("dropme.txt");
+    repo.hook("stasher", "dropme.txt");
+    let stash_out = repo.tes("stasher", &["stash", "push", "dropme.txt"]);
+    assert!(
+        stash_out.contains("1 file(s)"),
+        "stash push of deleted file must treat dropme.txt as path and count deleted_paths: {stash_out}"
+    );
+    assert!(
+        repo.path("dropme.txt").is_file(),
+        "stash push must restore dropme.txt"
+    );
+
+    repo.tes(
+        "term-other",
+        &["stash", "pop", "0", "-a", "antigravity-stasher"],
+    );
+    assert!(
+        !repo.path("dropme.txt").exists(),
+        "tes stash pop 0 -a <agent> must reapply deleted path"
+    );
+}
+
+/// Verifies `tes env` protects user `PORT` when `port_isolation=false` and outside repos,
+/// strips `TES_SHIM_BIN` from `PATH` when leaving or disabling isolation, never mutates `OpLog`
+/// on passive prompts, and emits fixed PowerShell, Nushell, and quote-aware Zsh scripts.
+#[test]
+fn env_port_preservation_passive_oplog_and_shell_parsing_e2e() {
+    let repo = Repo::new(&[("lib.rs", "pub fn ok() {}\n", false)]);
+
+    let oplog_before: serde_json::Value =
+        serde_json::from_str(&repo.tes("term-check", &["oplog", "--json"])).expect("oplog before");
+    let _ = repo.tes("term-passive-1", &["env"]);
+    let _ = repo.tes("term-passive-2", &["env"]);
+    let oplog_after: serde_json::Value =
+        serde_json::from_str(&repo.tes("term-check", &["oplog", "--json"])).expect("oplog after");
+    assert_eq!(
+        oplog_before.as_array().map(Vec::len),
+        oplog_after.as_array().map(Vec::len),
+        "passive `tes env` prompts must not write OpLog operations"
+    );
+
+    let pwsh_script = repo.tes("term-check", &["env", "--pwsh"]);
+    assert!(
+        pwsh_script.contains("complete --shell plain") && !pwsh_script.contains("completions"),
+        "pwsh hook must call `tes complete`, not `tes completions`: {pwsh_script}"
+    );
+    assert!(
+        pwsh_script.contains("$exitCode = $LASTEXITCODE")
+            && pwsh_script.contains("$global:LASTEXITCODE = $exitCode"),
+        "pwsh hook must preserve $LASTEXITCODE across _TesSyncEnv: {pwsh_script}"
+    );
+
+    let nu_script = repo.tes("term-check", &["env", "--nu"]);
+    assert!(
+        nu_script.contains("is-not-empty") && nu_script.contains("hide-env -i TES_BRANCH"),
+        "nu hook must guard empty stdout and hide TES_* outside repos: {nu_script}"
+    );
+
+    #[cfg(unix)]
+    {
+        let tes_bin = Path::new(env!("CARGO_BIN_EXE_tes"));
+        let bin_dir = tes_bin.parent().expect("bin dir").display().to_string();
+        let path_with_tes = format!("{bin_dir}:{}", std::env::var("PATH").unwrap_or_default());
+        let non_repo = tempfile::tempdir().expect("non-repo dir");
+
+        // Verify user's PORT=8080 survives `eval "$(tes env)"` inside a repo with port_isolation=false
+        // AND outside a repo, while Tessera-managed ports + TES_SHIM_BIN ARE cleaned up when transitioning.
+        let sh_check = format!(
+            concat!(
+                "export PORT=8080\n",
+                "eval \"$(tes env)\"\n",
+                "printf 'IN_DEFAULT_PORT=%s\\n' \"$PORT\"\n",
+                "cd '{}' && eval \"$(tes env)\"\n",
+                "printf 'OUT_DEFAULT_PORT=%s\\n' \"$PORT\"\n",
+                "cd '{}' && tes config set port_isolation true >/dev/null\n",
+                "eval \"$(tes env)\"\n",
+                "case \":$PATH:\" in *\":$TES_SHIM_BIN:\"*) HAS_SHIM=yes ;; *) HAS_SHIM=no ;; esac\n",
+                "printf 'ISOLATED_PORT=%s|MANAGED=%s|HAS_SHIM=%s\\n' \"$PORT\" \"$TES_MANAGED_PORTS\" \"$HAS_SHIM\"\n",
+                "OLD_SHIM=\"$TES_SHIM_BIN\"\n",
+                "tes config set port_isolation false >/dev/null\n",
+                "eval \"$(tes env)\"\n",
+                "case \":$PATH:\" in *\":$OLD_SHIM:\"*) SHIM_REMOVED=no ;; *) SHIM_REMOVED=yes ;; esac\n",
+                "printf 'AFTER_DISABLE_PORT=%s|SHIM_REMOVED=%s\\n' \"${{PORT:-unset}}\" \"$SHIM_REMOVED\"\n"
+            ),
+            non_repo.path().display(),
+            repo.root.display()
+        );
+        let sh_out = Command::new("/bin/sh")
+            .current_dir(&repo.root)
+            .env("PATH", &path_with_tes)
+            .env("TES_SESSION_ID", "term-port-check")
+            .args(["-c", &sh_check])
+            .output()
+            .expect("run sh port preservation check");
+        let sh_stdout = String::from_utf8_lossy(&sh_out.stdout);
+        assert!(
+            sh_out.status.success(),
+            "sh check failed: stdout={sh_stdout}, stderr={}",
+            String::from_utf8_lossy(&sh_out.stderr)
+        );
+        assert!(
+            sh_stdout.contains("IN_DEFAULT_PORT=8080"),
+            "user PORT=8080 must not be unset when port_isolation=false:\n{sh_stdout}"
+        );
+        assert!(
+            sh_stdout.contains("OUT_DEFAULT_PORT=8080"),
+            "user PORT=8080 must not be unset outside a Tessera repo:\n{sh_stdout}"
+        );
+        assert!(
+            sh_stdout.contains("MANAGED=1|HAS_SHIM=yes"),
+            "port_isolation=true must set TES_MANAGED_PORTS=1 and prepend TES_SHIM_BIN:\n{sh_stdout}"
+        );
+        assert!(
+            sh_stdout.contains("AFTER_DISABLE_PORT=unset|SHIM_REMOVED=yes"),
+            "disabling port_isolation must unset Tessera-managed PORT and strip TES_SHIM_BIN from PATH:\n{sh_stdout}"
+        );
+
+        // Verify Zsh quote-aware `_tes_preexec` does NOT hop for `git commit -m "a; b"` or `FOO=1 git status`.
+        if Path::new("/bin/zsh").is_file() {
+            repo.tes("term-zsh-q", &["switch", "feat/zsh-quote"]);
+            let zsh_script = r#"
+                export TES_SESSION_ID="term-zsh-q"
+                eval "$(tes env --zsh)"
+                _tes_preexec 'git commit -m "a; b"'
+                echo "QUOTED_PWD=$PWD"
+                _tes_preexec 'FOO=1 command git status'
+                echo "ENV_PREFIX_PWD=$PWD"
+            "#;
+            let z_out = Command::new("/bin/zsh")
+                .current_dir(&repo.root)
+                .env("PATH", &path_with_tes)
+                .args(["-c", zsh_script])
+                .output()
+                .expect("run zsh quote check");
+            let z_stdout = String::from_utf8_lossy(&z_out.stdout);
+            assert!(
+                z_out.status.success(),
+                "zsh quote check failed: stdout={z_stdout}, stderr={}",
+                String::from_utf8_lossy(&z_out.stderr)
+            );
+            assert!(
+                !z_stdout.contains("branches/feat-zsh-quote"),
+                "quoted semicolon or env-var prefixed git must NOT hop into sandbox:\n{z_stdout}"
+            );
+        }
+    }
+}
+
+/// Verifies binary file conflict detection, Unix symlink preservation, linked Git worktree
+/// discovery & diagnostics, and `tes gc` + `tes undo` milestone chain integrity.
+#[test]
+fn binary_conflict_symlink_worktree_and_gc_undo_integrity_e2e() {
+    let repo = Repo::new(&[("code.rs", "pub fn v() -> u8 { 1 }\n", false)]);
+
+    // Seed a binary file and verify divergent binary edits record a `Binary` conflict.
+    fs::write(
+        repo.path("logo.bin"),
+        [0x89u8, 0x50, 0x4E, 0x47, 0x00, 0x01, 0x02],
+    )
+    .expect("write bin");
+    repo.hook("bin-seed", "logo.bin");
+    repo.tes("bin-seed", &["commit", "-m", "feat: add binary asset"]);
+
+    repo.tes(
+        "bin-a",
+        &[
+            "claim",
+            "--branch",
+            "main",
+            "--intent",
+            "Update logo A",
+            "logo.bin",
+        ],
+    );
+    repo.tes(
+        "bin-b",
+        &[
+            "claim",
+            "--branch",
+            "main",
+            "--intent",
+            "Update logo B",
+            "logo.bin",
+        ],
+    );
+    fs::write(
+        repo.path("logo.bin"),
+        [0x89u8, 0x50, 0x4E, 0x47, 0x00, 0xAA, 0xBB],
+    )
+    .expect("write bin A");
+    repo.hook("bin-a", "logo.bin");
+    fs::write(
+        repo.path("logo.bin"),
+        [0x89u8, 0x50, 0x4E, 0x47, 0x00, 0xCC, 0xDD],
+    )
+    .expect("write bin B");
+    repo.hook("bin-b", "logo.bin");
+
+    let conflicts_json: serde_json::Value =
+        serde_json::from_str(&repo.tes("bin-b", &["conflicts", "--json"])).expect("conflicts json");
+    let conflict_arr = conflicts_json.as_array().expect("conflicts array");
+    assert!(
+        conflict_arr
+            .iter()
+            .any(|c| c["path"] == "logo.bin" && c["kind"] == "Binary"),
+        "expected Binary conflict for logo.bin: {conflicts_json}"
+    );
+    repo.tes("bin-b", &["resolve", "logo.bin", "--strategy", "ours"]);
+    repo.tes("bin-b", &["commit", "-m", "fix: resolve binary conflict"]);
+    repo.tes("bin-a", &["agent", "close", "--all"]);
+
+    // Unix tracked symlink preservation across commits.
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(Path::new("code.rs"), repo.path("link_to_code.rs"))
+            .expect("create relative symlink");
+        repo.tes("term-sym", &["commit", "-m", "feat: add tracked symlink"]);
+        let head = repo.head_tree();
+        assert_eq!(
+            head.get("link_to_code.rs").map(|(m, _)| m.as_str()),
+            Some("120000"),
+            "tracked symlink must keep mode 120000 in Git tree: {head:?}"
+        );
+        assert!(
+            repo.path("link_to_code.rs")
+                .symlink_metadata()
+                .expect("lstat symlink")
+                .file_type()
+                .is_symlink(),
+            "symlink must remain a symlink on disk after commit"
+        );
+    }
+
+    // Linked Git worktree discovery and `tes doctor --json`.
+    let wt_tmp = tempfile::tempdir().expect("worktree tempdir");
+    let wt_dir = wt_tmp.path().join("linked-wt");
+    repo.git(&[
+        "worktree",
+        "add",
+        "-q",
+        "-b",
+        "feat/worktree",
+        wt_dir.to_str().expect("wt dir"),
+    ]);
+
+    let wt_doctor_out = Command::new(env!("CARGO_BIN_EXE_tes"))
+        .current_dir(&wt_dir)
+        .args(["doctor", "--json"])
+        .env("TES_SESSION_ID", "term-wt")
+        .output()
+        .expect("tes doctor in linked worktree");
+    assert!(
+        wt_doctor_out.status.success(),
+        "tes doctor failed in linked worktree: {}",
+        String::from_utf8_lossy(&wt_doctor_out.stderr)
+    );
+    let wt_doc_json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&wt_doctor_out.stdout))
+            .expect("wt doctor json");
+    let wt_git_check = wt_doc_json["checks"]
+        .as_array()
+        .expect("checks")
+        .iter()
+        .find(|c| c["id"] == "git_repository")
+        .expect("git_repository check");
+    assert_eq!(wt_git_check["details"]["is_linked_worktree"], true);
+
+    let wt_status = Command::new(env!("CARGO_BIN_EXE_tes"))
+        .current_dir(&wt_dir)
+        .args(["status", "--json"])
+        .env("TES_SESSION_ID", "term-wt")
+        .output()
+        .expect("tes status in linked worktree");
+    assert!(wt_status.status.success());
+
+    // `tes gc` + `tes undo` chain integrity after multiple ephemeral edits and a milestone commit.
+    repo.tes(
+        "gc-agent",
+        &["claim", "--intent", "Stepwise edits", "code.rs"],
+    );
+
+    for n in 2u8..=5u8 {
+        repo.write("code.rs", &format!("pub fn v() -> u8 {{ {n} }}\n"));
+        repo.hook("gc-agent", "code.rs");
+    }
+
+    repo.tes("gc-agent", &["commit", "-m", "feat: v5"]);
+    assert_eq!(repo.read("code.rs"), "pub fn v() -> u8 { 5 }\n");
+
+    let gc_out = repo.tes("gc-agent", &["gc", "--json"]);
+    let gc_json: serde_json::Value = serde_json::from_str(&gc_out).expect("gc json");
+    assert!(gc_json["compacted_operations"].is_u64(), "{gc_json}");
+
+    repo.tes("gc-agent", &["undo"]);
+    assert_eq!(
+        repo.read("code.rs"),
+        "pub fn v() -> u8 { 1 }\n",
+        "tes undo after tes gc must cleanly restore pre-commit milestone state"
+    );
 }

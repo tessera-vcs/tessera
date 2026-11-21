@@ -58,7 +58,7 @@ tes switch feat/faq
 ```
 
 ### **Instant Sandboxes**
-Run builds, tests, and dev servers on any branch without reinstalling dependencies. Tessera clones `node_modules`, `target`, and `.venv` using filesystem copy-on-write and assigns each session its own port and test database.
+Run builds, tests, and dev servers on any branch without reinstalling dependencies. Tessera clones `node_modules`, `target`, and `.venv` using filesystem copy-on-write, assigns each session a `TES_PORT` slot (enable full dev-server port isolation with `tes config set port_isolation true` or `TES_PORT_ISOLATION=1`; defaults to `false`), and isolates locally configured test database URLs.
 
 ```bash:no-line-numbers
 # Run builds or dev servers in isolated Copy-on-Write branch sandboxes
@@ -114,8 +114,9 @@ tes radar
 <div class="build-code-content" data-content="terminals">
 
 ```bash:no-line-numbers
-# Enable (tes:<branch>) in your shell prompt
+# Enable (tes:<branch>) in your shell prompt and opt into dev-server port isolation
 tes env --install
+tes config set port_isolation true
 
 # Terminal 1: run feat/pricing on port 3100
 tes switch feat/pricing
@@ -166,8 +167,9 @@ tes radar
 <div class="build-code-content" data-content="terminals">
 
 ```bash:no-line-numbers
-# Enable (tes:<branch>) in your shell prompt
+# Enable (tes:<branch>) in your shell prompt and opt into dev-server port isolation
 tes env --install
+tes config set port_isolation true
 
 # Terminal 1: run feat/pricing on port 3100
 tes switch feat/pricing

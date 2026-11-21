@@ -6,6 +6,13 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -30,6 +37,9 @@ jobs:
               - 'src/**'
               - 'scripts/**'
               - '.github/workflows/ci.yml'
+              - '.github/workflows/release.yml'
+              - 'docs/public/install.sh'
+              - 'docs/public/install.ps1'
             vscode:
               - 'extensions/vscode/**'
               - '.github/workflows/ci.yml'
@@ -77,19 +87,46 @@ jobs:
         run: |
           brew install --formula bash fish dash mksh oksh yash elvish nushell
 
+      - name: Verify Unix installer and E2E script syntax
+        if: runner.os != 'Windows'
+        run: |
+          sh -n docs/public/install.sh
+          bash -n scripts/ci_multi_shell_e2e.sh
+
+      - name: Verify PowerShell installer syntax
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path "docs\public\install.ps1").Path,
+              [ref]$tokens,
+              [ref]$errors
+          )
+          if ($errors -and $errors.Count -gt 0) {
+              $msg = ($errors | ForEach-Object { $_.Message }) -join "; "
+              throw "PowerShell syntax errors in docs/public/install.ps1: $msg"
+          }
+
       - name: Configure Git identity for tests
         run: |
           git config --global user.name "Tessera CI"
           git config --global user.email "ci@tessera.getlunaris.dev"
           git config --global init.defaultBranch main
 
+      - name: Check formatting (rustfmt)
+        working-directory: src
+        run: cargo fmt --all -- --check
+
       - name: Run cargo clippy
         working-directory: src
-        run: cargo clippy --workspace --all-targets
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Run workspace unit & integration tests
+      - name: Run workspace unit, integration, and doc tests
         working-directory: src
-        run: cargo test --workspace --bins --lib --tests
+        run: cargo test --workspace
 
       - name: Run multi-shell E2E suite (Linux & macOS)
         if: runner.os != 'Windows'
@@ -102,14 +139,23 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $tesBin = Join-Path $PWD "src\target\debug\tes.exe"
+          $origDir = $PWD.Path
+          $tesBin = Join-Path $origDir "src\target\debug\tes.exe"
           $env:PATH = (Split-Path $tesBin -Parent) + ";" + $env:PATH
+
+          function Assert-Ok([string]$Label) {
+              if ($LASTEXITCODE -ne 0) {
+                  throw "$Label failed with exit code $LASTEXITCODE"
+              }
+          }
 
           $workDir = Join-Path $env:TEMP ("tes-win-e2e-" + [guid]::NewGuid().ToString("N"))
           New-Item -ItemType Directory -Force -Path (Join-Path $workDir "src") | Out-Null
-          Set-Location $workDir
 
-          @"
+          try {
+              Set-Location $workDir
+
+              @"
           pub fn alpha() -> i32 {
               10
           }
@@ -119,18 +165,32 @@ jobs:
           }
           "@ | Set-Content -Path "src\lib.rs" -Encoding UTF8
 
-          & $tesBin init --branch main
-          Invoke-Expression (& $tesBin env --pwsh)
+              & $tesBin init --branch main
+              Assert-Ok "tes init"
 
-          tes switch feat/win-pwsh
-          if ($env:TES_BRANCH -ne "feat/win-pwsh") {
-              throw "Expected TES_BRANCH=feat/win-pwsh, got $($env:TES_BRANCH)"
-          }
-          tes switch main
+              Invoke-Expression (& $tesBin env --pwsh)
 
-          $env:TES_SESSION_ID = "win-agent-a"
-          & $tesBin claim --branch feat/win-a --intent "Update alpha" src/lib.rs
-          @"
+              tes switch feat/win-pwsh
+              if ($env:TES_BRANCH -ne "feat/win-pwsh") {
+                  throw "Expected TES_BRANCH=feat/win-pwsh, got $($env:TES_BRANCH)"
+              }
+
+              tes switch main
+              if ($env:TES_BRANCH -ne "main") {
+                  throw "Expected TES_BRANCH=main, got $($env:TES_BRANCH)"
+              }
+
+              $statusJson = (& $tesBin status --json | Out-String) | ConvertFrom-Json
+              Assert-Ok "tes status --json"
+              if ($statusJson.active_branch -ne "main") {
+                  throw "Expected tes status active_branch=main, got $($statusJson.active_branch)"
+              }
+
+              $env:TES_SESSION_ID = "win-agent-a"
+              & $tesBin claim --branch feat/win-a --intent "Update alpha" src/lib.rs
+              Assert-Ok "tes claim win-a"
+
+              @"
           pub fn alpha() -> i32 {
               100
           }
@@ -139,12 +199,24 @@ jobs:
               20
           }
           "@ | Set-Content -Path "src\lib.rs" -Encoding UTF8
-          & $tesBin hook post-tool --path src/lib.rs
-          & $tesBin commit -m "feat(win-a): update alpha"
 
-          $env:TES_SESSION_ID = "win-agent-b"
-          & $tesBin claim --branch feat/win-b --intent "Update beta" src/lib.rs
-          @"
+              & $tesBin hook post-tool --path src/lib.rs
+              Assert-Ok "tes hook post-tool win-a"
+
+              $diffOut = (& $tesBin diff | Out-String)
+              Assert-Ok "tes diff"
+              if ($diffOut -notmatch "100") {
+                  throw "Expected tes diff to include '100', got: $diffOut"
+              }
+
+              & $tesBin commit -m "feat(win-a): update alpha"
+              Assert-Ok "tes commit win-a"
+
+              $env:TES_SESSION_ID = "win-agent-b"
+              & $tesBin claim --branch feat/win-b --intent "Update beta" src/lib.rs
+              Assert-Ok "tes claim win-b"
+
+              @"
           pub fn alpha() -> i32 {
               10
           }
@@ -153,19 +225,98 @@ jobs:
               200
           }
           "@ | Set-Content -Path "src\lib.rs" -Encoding UTF8
-          & $tesBin hook post-tool --path src/lib.rs
-          & $tesBin commit -m "feat(win-b): update beta"
 
-          $env:TES_SESSION_ID = "editor"
-          & $tesBin merge feat/win-a feat/win-b --into main -m "feat: merge win-a and win-b"
+              & $tesBin hook post-tool --path src/lib.rs
+              Assert-Ok "tes hook post-tool win-b"
 
-          $merged = Get-Content -Path "src\lib.rs" -Raw
-          if (($merged -notmatch "100") -or ($merged -notmatch "200")) {
-              throw "3-way AST merge failed on Windows: $merged"
+              & $tesBin commit -m "feat(win-b): update beta"
+              Assert-Ok "tes commit win-b"
+
+              $env:TES_SESSION_ID = "editor"
+              & $tesBin merge feat/win-a feat/win-b --into main -m "feat: merge win-a and win-b"
+              Assert-Ok "tes merge"
+
+              $merged = Get-Content -Path "src\lib.rs" -Raw
+              if (($merged -notmatch "100") -or ($merged -notmatch "200")) {
+                  throw "3-way AST merge failed on Windows: $merged"
+              }
+
+              & $tesBin radar | Out-Null
+              Assert-Ok "tes radar"
+
+              $doctorJson = (& $tesBin doctor --json | Out-String) | ConvertFrom-Json
+              Assert-Ok "tes doctor --json"
+              if (-not $doctorJson.checks) {
+                  throw "tes doctor --json missing checks array"
+              }
+
+              Add-Content -Path "src\lib.rs" -Value "`n// win stash test"
+              & $tesBin stash push -m "win stash test"
+              Assert-Ok "tes stash push"
+
+              $afterPush = Get-Content -Path "src\lib.rs" -Raw
+              if ($afterPush -match "win stash test") {
+                  throw "tes stash push did not revert working tree"
+              }
+
+              $stashList = (& $tesBin stash list | Out-String)
+              Assert-Ok "tes stash list"
+              if ($stashList -notmatch "win stash test") {
+                  throw "tes stash list missing pushed stash: $stashList"
+              }
+
+              & $tesBin stash pop
+              Assert-Ok "tes stash pop"
+
+              $afterPop = Get-Content -Path "src\lib.rs" -Raw
+              if ($afterPop -notmatch "win stash test") {
+                  throw "tes stash pop did not restore stashed change"
+              }
+
+              & $tesBin restore src/lib.rs
+              Assert-Ok "tes restore"
+
+              $mcpRequests = @(
+                  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}',
+                  '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
+              ) -join "`n"
+              $mcpLines = @($mcpRequests | & $tesBin mcp) | Where-Object { $_.Trim() -ne "" }
+              Assert-Ok "tes mcp"
+              if ($mcpLines.Count -lt 2) {
+                  throw "Expected at least 2 JSON-RPC responses from tes mcp, got $($mcpLines.Count)"
+              }
+
+              $initResp = $mcpLines[0] | ConvertFrom-Json
+              $toolsResp = $mcpLines[1] | ConvertFrom-Json
+              if ($initResp.id -ne 1 -or $initResp.result.serverInfo.name -ne "tessera") {
+                  throw "Unexpected MCP initialize response: $($mcpLines[0])"
+              }
+
+              if ($toolsResp.id -ne 2 -or $toolsResp.result.tools.Count -lt 1) {
+                  throw "Unexpected MCP tools/list response: $($mcpLines[1])"
+              }
+
+              $directCompletions = @(& $tesBin complete --shell plain --cword 2 -- tes switch "")
+              Assert-Ok "tes complete"
+              if ($directCompletions -notcontains "feat/win-pwsh") {
+                  throw "Expected 'feat/win-pwsh' in tes complete output, got: $($directCompletions -join ', ')"
+              }
+
+              $pwshCompletions = @(
+                  (TabExpansion2 -inputScript "tes switch " -cursorColumn 11).CompletionMatches |
+                      ForEach-Object { $_.CompletionText }
+              )
+              if ($pwshCompletions -notcontains "feat/win-pwsh") {
+                  throw "Expected 'feat/win-pwsh' from PowerShell TabExpansion2 completion, got: $($pwshCompletions -join ', ')"
+              }
+
+              git fsck --full
+              Assert-Ok "git fsck"
+              Write-Host "Windows PowerShell E2E passed!"
+          } finally {
+              Set-Location $origDir
+              Remove-Item -Recurse -Force $workDir -ErrorAction SilentlyContinue
           }
-
-          git fsck --full
-          Write-Host "Windows PowerShell E2E passed!"
 
   bsd-matrix:
     name: BSD Cross-Platform Tests (FreeBSD & OpenBSD)
@@ -177,10 +328,8 @@ jobs:
       matrix:
         include:
           - os: freebsd
-            vm_action: vmactions/freebsd-vm@v1
             prepare: pkg install -y git rust bash fish dash mksh yash
           - os: openbsd
-            vm_action: vmactions/openbsd-vm@v1
             prepare: pkg_add git rust bash fish dash tcsh
     steps:
       - name: Checkout repository
@@ -196,7 +345,7 @@ jobs:
             git config --global user.name "Tessera BSD CI"
             git config --global user.email "ci@tessera.getlunaris.dev"
             git config --global init.defaultBranch main
-            cargo test --manifest-path src/Cargo.toml --workspace --bins --lib --tests
+            cargo test --manifest-path src/Cargo.toml --workspace
             TES_BIN=./src/target/debug/tes bash ./scripts/ci_multi_shell_e2e.sh
 
       - name: Run tests on OpenBSD
@@ -209,7 +358,7 @@ jobs:
             git config --global user.name "Tessera BSD CI"
             git config --global user.email "ci@tessera.getlunaris.dev"
             git config --global init.defaultBranch main
-            cargo test --manifest-path src/Cargo.toml --workspace --bins --lib --tests
+            cargo test --manifest-path src/Cargo.toml --workspace
             TES_BIN=./src/target/debug/tes bash ./scripts/ci_multi_shell_e2e.sh
 
   vscode-and-docs:

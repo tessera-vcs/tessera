@@ -23,7 +23,9 @@ trunk_branch = "main"
 base_port = 3000
 port_stride = 100
 port_isolation = true
-verify_command = "npm run build"
+auto_isolate_dirty_claims = true
+watch_interval_ms = 75
+watch_timeout_secs = 90
 
 cow_cache_dirs = [
   "node_modules",
@@ -34,11 +36,22 @@ cow_cache_dirs = [
   "vendor"
 ]
 
+package_globs = [
+  "crates/*",
+  "packages/*",
+  "apps/*",
+  "services/*"
+]
+
+# Execution-sensitive fields below require `tes config trust`
+verify_command = "npm run build"
+pager = "less -FRX"
+
 extra_bin_dirs = [
-  "node_modules/.bin",
   ".venv/bin",
-  "vendor/bin",
-  "bin"
+  "venv/bin",
+  "node_modules/.bin",
+  "vendor/bin"
 ]
 
 [custom_env]
@@ -49,7 +62,9 @@ VITE_PORT = "{port}"
 
 ## Configuration Options
 
-### Core Settings
+### Declarative Settings (Loaded Automatically)
+
+These settings are declarative and load automatically from `.git/tessera/config.toml` and any checked-in `tessera.toml`.
 
 #### `trunk_branch`
 
@@ -71,7 +86,7 @@ tes config set trunk_branch main
 
 - **Type:** `number`
 - **Default:** `3000`
-- **Description:** Starting port used when calculating isolated session ports (`PORT = base_port + slot * port_stride`).
+- **Description:** Starting port used when calculating isolated session ports (`PORT = base_port + slot * port_stride`). Must be `>= 1024` in `tessera.toml`.
 
 ```toml
 base_port = 3000
@@ -87,7 +102,7 @@ tes config set base_port 3000
 
 - **Type:** `number`
 - **Default:** `100`
-- **Description:** Port increment between session slots (e.g., Slot 1 receives `3100`, Slot 2 receives `3200`).
+- **Description:** Port increment between session slots (for example, Slot 1 receives `3100`, Slot 2 receives `3200`). Must be `>= 25` in `tessera.toml`.
 
 ```toml
 port_stride = 100
@@ -103,7 +118,7 @@ tes config set port_stride 100
 
 - **Type:** `boolean`
 - **Default:** `false`
-- **Description:** When enabled (`true`) or when `TES_PORT_ISOLATION=1` is set in the environment, `tes env` and `tes exec` automatically export `PORT` and framework port environment variables (`VITE_PORT`, `PORT`, `FLASK_RUN_PORT`, etc.) and prepend CLI port-wrapper shims (`TES_SHIM_BIN`) for each session slot.
+- **Description:** When enabled (`true`) or when `TES_PORT_ISOLATION=1` is set in the environment, `tes env` and `tes exec` automatically export `PORT` and framework port environment variables (`VITE_PORT`, `FLASK_RUN_PORT`, `UVICORN_PORT`, `RAILS_PORT`, and more) and prepend POSIX CLI port-wrapper shims (`TES_SHIM_BIN`) for each session slot.
 
 ```toml
 port_isolation = true
@@ -115,22 +130,52 @@ Update via CLI:
 tes config set port_isolation true
 ```
 
-#### `verify_command`
+#### `auto_isolate_dirty_claims`
 
-- **Type:** `string | null`
-- **Default:** `null`
-- **Description:** Optional verification command executed automatically when running `tes merge --verify` or `tes commit --verify`.
+- **Type:** `boolean`
+- **Default:** `true`
+- **Description:** When `true`, running `tes claim` without `--branch` on a file that already has uncommitted changes from the user or a peer session automatically isolates the new session onto `agent/<session_id>` instead of mixing edits into in-progress work. Pass `--branch <branch>` explicitly when same-branch collaboration is intended, or set this option to `false`.
 
 ```toml
-verify_command = "npm test"
+auto_isolate_dirty_claims = true
 ```
 
 Update via CLI:
 
 ```bash:no-line-numbers
-tes config set verify_command "npm test"
-# or using the shorthand flag:
-tes config --verify-cmd "npm test"
+tes config set auto_isolate_dirty_claims false
+```
+
+#### `watch_interval_ms`
+
+- **Type:** `number`
+- **Default:** `75`
+- **Description:** Polling interval in milliseconds for the background write watcher started on `tes claim` (clamped to a minimum of `15` ms in `tessera.toml`).
+
+```toml
+watch_interval_ms = 75
+```
+
+Update via CLI:
+
+```bash:no-line-numbers
+tes config set watch_interval_ms 75
+```
+
+#### `watch_timeout_secs`
+
+- **Type:** `number`
+- **Default:** `90`
+- **Description:** Idle timeout in seconds before the background write watcher exits automatically (clamped to a minimum of `5` seconds in `tessera.toml`).
+
+```toml
+watch_timeout_secs = 90
+```
+
+Update via CLI:
+
+```bash:no-line-numbers
+tes config set watch_timeout_secs 90
 ```
 
 #### `co_author`
@@ -166,6 +211,52 @@ Update via CLI:
 tes config set co_author_trailer "Tessera <noreply@tessera.getlunaris.dev>"
 ```
 
+#### `cow_cache_dirs`
+
+- **Type:** `string[]`
+- **Default:** `["target", "node_modules", ".pnpm-store", ".turbo", ".next", ".nuxt", ".svelte-kit", "dist", "build", ".venv", "venv", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", "vendor", "_build", "deps", ".gradle", ".build", ".zig-cache", "zig-out", ".dart_tool", "cmake-build-debug", "cmake-build-release"]`
+- **Description:** Untracked dependency and build cache directories cloned via Copy-on-Write into every branch sandbox.
+
+Add directories via CLI:
+
+```bash:no-line-numbers
+tes config add-cache-dir .nx .angular
+```
+
+#### `package_globs`
+
+- **Type:** `string[]`
+- **Default:** `["crates/*", "packages/*", "apps/*", "services/*"]`
+- **Description:** Monorepo workspace or package glob patterns scanned when discovering nested dependency caches.
+
+Add package globs via CLI:
+
+```bash:no-line-numbers
+tes config add-package-glob "modules/*" "plugins/*"
+```
+
+### Trust-Gated Execution Settings
+
+Because these settings influence executed commands, `PATH` resolution, or runtime environment variables, values defined in a checked-in `tessera.toml` are ignored until you explicitly run `tes config trust`. Local overrides set directly via `tes config` in `.git/tessera/config.toml` take effect immediately.
+
+#### `verify_command`
+
+- **Type:** `string | null`
+- **Default:** `null`
+- **Description:** Optional verification command executed when running `tes merge --verify` or `tes commit --verify` (and over MCP when `verify: true` is passed).
+
+```toml
+verify_command = "npm test"
+```
+
+Update via CLI:
+
+```bash:no-line-numbers
+tes config set verify_command "npm test"
+# or using the shorthand flag:
+tes config --verify-cmd "npm test"
+```
+
 #### `pager`
 
 - **Type:** `string | null`
@@ -182,51 +273,23 @@ Update via CLI:
 tes config set pager "delta --paging=always"
 ```
 
-### Sandbox Options
-
-#### `cow_cache_dirs`
-
-- **Type:** `string[]`
-- **Default:** `["node_modules", ".pnpm-store", ".next", ".nuxt", ".svelte-kit", ".turbo", ".parcel-cache", ".vite", "target", ".venv", "venv", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox", "vendor", ".bundle", "_build", "deps", ".gradle", "build", ".build", "cmake-build-debug", "cmake-build-release", ".zig-cache", "zig-out", "bin", "obj", ".dart_tool"]`
-- **Description:** Dependency and build cache directories cloned via Copy-on-Write into every branch sandbox.
-
-Add directories via CLI:
-
-```bash:no-line-numbers
-tes config add-cache-dir .nx .angular
-```
-
 #### `extra_bin_dirs`
 
 - **Type:** `string[]`
-- **Default:** `["node_modules/.bin", ".venv/bin", "venv/bin", "vendor/bin", "bin"]`
-- **Description:** Relative directories inside the branch sandbox prepended to `PATH` during `tes exec`.
+- **Default:** `[".venv/bin", "venv/bin", "node_modules/.bin", "vendor/bin"]`
+- **Description:** Relative directories inside the branch sandbox prepended to `PATH` during `tes exec`. Generic project directories such as `bin` and `.bin` are excluded from the untrusted defaults for security so cloned repositories cannot shadow standard system utilities; add them explicitly via `tes config add-bin-dir` or a trusted `tessera.toml`.
 
 Add binary directories via CLI:
 
 ```bash:no-line-numbers
-tes config add-bin-dir ./scripts ./tools/bin
+tes config add-bin-dir scripts/bin tools/bin
 ```
-
-#### `package_globs`
-
-- **Type:** `string[]`
-- **Default:** `["crates/*", "packages/*", "apps/*", "services/*", "libs/*"]`
-- **Description:** Monorepo workspace or package glob patterns scanned when discovering nested dependency caches.
-
-Add package globs via CLI:
-
-```bash:no-line-numbers
-tes config add-package-glob "modules/*" "plugins/*"
-```
-
-### Environment Variables
 
 #### `[custom_env]`
 
 - **Type:** `table`
 - **Default:** `{}`
-- **Description:** Custom environment variables injected into `tes exec` and switched terminals. Supports `{slot}`, `{port}`, `{branch}`, and `{agent_id}` placeholders.
+- **Description:** Custom environment variable templates injected into `tes exec`. Supports `{slot}`, `{port}`, `{branch}`, and `{agent_id}` placeholders (interpolated in a single pass). Sensitive loader, shell, proxy, and toolchain injection keys (such as `LD_PRELOAD`, `DYLD_INSERT_LIBRARIES`, `COMSPEC`, `NODE_EXTRA_CA_CERTS`, `HTTP_PROXY`, and `SSH_AUTH_SOCK`) are rejected automatically.
 
 ```toml
 [custom_env]
@@ -243,17 +306,19 @@ tes config set-env APP_URL "http://localhost:{port}"
 
 ### Repository Trust (`tessera.toml`)
 
-When cloning an external repository that includes a checked-in `tessera.toml`, non-executable settings (`trunk_branch`, `base_port`, `port_stride`, `co_author`, `co_author_trailer`, `cow_cache_dirs`, and safe `custom_env` templates) are loaded automatically.
+When cloning an external repository that includes a checked-in `tessera.toml`, declarative settings (`trunk_branch`, `base_port`, `port_stride`, `watch_interval_ms`, `watch_timeout_secs`, `auto_isolate_dirty_claims`, `co_author`, `co_author_trailer`, `port_isolation`, `cow_cache_dirs`, and `package_globs`) are loaded automatically.
 
-To prevent untrusted repositories from executing arbitrary commands or overriding system binaries automatically, `verify_command`, `pager`, and `extra_bin_dirs` in `tessera.toml` require explicit repository trust:
+To prevent untrusted repositories from executing arbitrary commands, shadowing binaries, or injecting environment variables automatically, `verify_command`, `pager`, `extra_bin_dirs`, and `custom_env` in `tessera.toml` are ignored until you explicitly trust the current file digest:
 
 ```bash:no-line-numbers
-# trust the repository's tessera.toml
+# trust the repository's current tessera.toml
 tes config trust
 
 # revoke trust for tessera.toml
 tes config untrust
 ```
+
+If `tessera.toml` changes later (for example, after a `tes pull`), its Blake3 digest changes and execution-sensitive fields remain inactive until you review the file and run `tes config trust` again.
 
 ## See Also
 

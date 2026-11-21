@@ -11,9 +11,9 @@ When a merge conflict occurs while using the Tessera IDE extension (in VS Code, 
 1. Tessera writes standard Git conflict markers (`<<<<<<<`, `=======`, `>>>>>>>`) into the file.
 2. The extension opens the conflicted file in your editor and jumps to the `<<<<<<<` line.
 3. Edit the file to keep the code you want, remove the conflict markers, and save (`Cmd+S` / `Ctrl+S`).
-4. As soon as the file is saved without conflict markers, Tessera resolves the conflict and updates the branch commit.
+4. As soon as the file is saved without conflict markers, Tessera resolves the conflict, updates the working tree and sandbox, and records the resolution on the active branch.
 
-You can also click **`N Conflicts`** in the bottom status bar to open the **Conflict Resolver** panel and resolve with a single click (`AST Union`, `Keep Ours`, `Keep Theirs`, or `Keep Working File`).
+You can also click **`N Conflicts`** in the bottom status bar (or run **`Tessera: Open Conflict Resolver`**) to inspect competing agent intents, `Base` / `Ours` / `Theirs` snippets, and verification `diagnostics`, edit the `AST-Union Preview`, click **`Open in Editor`**, or resolve with **`Accept AST-Union`**, **`Accept Ours`**, **`Accept Theirs`**, **`Keep Working File`**, or **`Save Custom`**.
 
 ## Inspecting Conflicts
 
@@ -23,7 +23,7 @@ To list any unresolved conflicts in your repository:
 tes conflicts
 ```
 
-Pass `--json` to inspect the base, ours, and theirs snippets along with the participating session IDs:
+Pass `--json` to inspect the base, ours, and theirs snippets, `ast_union_preview`, `diagnostics`, and participating session IDs:
 
 ```bash:no-line-numbers
 tes conflicts --json
@@ -31,7 +31,7 @@ tes conflicts --json
 
 ## Resolving from the CLI
 
-Resolve a conflicted file using one of four strategies:
+Resolve a conflicted file using one of five strategies:
 
 ```bash:no-line-numbers
 # Combine both sides' AST declarations and statements in order
@@ -45,6 +45,9 @@ tes resolve src/App.vue --strategy theirs
 
 # Use the file as currently edited and saved on disk
 tes resolve src/App.vue --strategy working
+
+# Write explicit resolved content inline or from a file
+tes resolve src/App.vue --strategy content --content-file resolved-app.vue
 ```
 
 ## Checkpoints

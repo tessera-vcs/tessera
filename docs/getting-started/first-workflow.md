@@ -6,7 +6,7 @@ In this guide, you will initialize Tessera in a project, work across two feature
 
 ## 1. Initialize the Repository
 
-Start by running `tes init` in your project root:
+Start by running `tes init` in your project root (pass `tes init --local` on mixed teams to add installed agent rule files to `.git/info/exclude`):
 
 ```bash:no-line-numbers
 tes init
@@ -16,6 +16,12 @@ If you have not already enabled shell prompt integration, run:
 
 ```bash:no-line-numbers
 tes env --install
+```
+
+If you plan to run multiple dev servers side by side on separate branches, enable automatic port isolation (`port_isolation` defaults to `false`):
+
+```bash:no-line-numbers
+tes config set port_isolation true
 ```
 
 ## 2. Work on Two Branches in Parallel

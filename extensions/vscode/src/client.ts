@@ -11,6 +11,32 @@ import * as vscode from "vscode";
 
 const execFileAsync = promisify(execFile);
 
+const DEFAULT_QUERY_TIMEOUT_MS = 30_000;
+const LONG_OPERATION_TIMEOUT_MS = 120_000;
+const RESTORE_TIMEOUT_MS = 60_000;
+
+/**
+ * Error thrown when a file legitimately does not exist on a target branch or commit tree
+ * (for example, a newly added or deleted file during a virtual diff).
+ */
+export class BranchFileNotFoundError extends Error {
+  public readonly branch: string;
+  public readonly relPath: string;
+
+  /**
+   * Constructs a `BranchFileNotFoundError` for the missing `relPath` on `branch`.
+   *
+   * @param branch The target branch or revision name.
+   * @param relPath The repository-relative file path.
+   */
+  public constructor(branch: string, relPath: string) {
+    super(`File '${relPath}' does not exist on '${branch}'`);
+    this.name = "BranchFileNotFoundError";
+    this.branch = branch;
+    this.relPath = relPath;
+  }
+}
+
 /**
  * Metadata for a single Git commit in the visual commit graph.
  */
@@ -109,6 +135,7 @@ export interface ConflictItem {
   readonly left_snippet: string;
   readonly right_snippet: string;
   readonly ast_union_preview: string;
+  readonly diagnostics?: string | null;
   readonly created_at_ms: number;
 }
 
@@ -192,6 +219,37 @@ export interface WorkspaceStateSnapshot {
 }
 
 /**
+ * Returns true if `pathStr` is one of the synthetic build/verification conflict paths.
+ *
+ * @param pathStr The conflict path string to check.
+ * @returns True if `pathStr` is a synthetic verification conflict marker.
+ */
+export function isSyntheticConflictPath(pathStr: string): boolean {
+  return pathStr === "<speculative-verify>" || pathStr === "<build>";
+}
+
+/**
+ * Validates that an agent, session, or operation identifier contains only safe characters
+ * (`[A-Za-z0-9._-]`) and cannot traverse directories or inject CLI flags.
+ *
+ * @param id The identifier to validate.
+ * @returns True if the identifier is safe.
+ */
+export function isValidSafeIdentifier(id: string): boolean {
+  if (
+    !id ||
+    id.length > 128 ||
+    id.startsWith("-") ||
+    id.startsWith(".") ||
+    id.includes("..")
+  ) {
+    return false;
+  }
+
+  return /^[A-Za-z0-9._-]+$/.test(id);
+}
+
+/**
  * Validates that a Git branch or reference name contains only safe characters and no shell metacharacters.
  *
  * @param name The branch or reference name to validate.
@@ -230,6 +288,32 @@ export function isValidRefName(name: string): boolean {
     ) {
       return false;
     }
+  }
+
+  return true;
+}
+
+/**
+ * Validates a Git revision expression (such as `HEAD~1`, a commit SHA, or a branch/checkpoint name)
+ * while preventing leading `-` flag injection and shell metacharacters.
+ *
+ * @param rev The revision or checkpoint string to validate.
+ * @returns True if the revision or checkpoint label is safe.
+ */
+export function isValidRevisionOrCheckpoint(rev: string): boolean {
+  if (
+    !rev ||
+    rev.length > 255 ||
+    rev.startsWith("-") ||
+    rev.includes("..") ||
+    rev.includes("@{") ||
+    rev.includes("\\")
+  ) {
+    return false;
+  }
+
+  if (/[\0-\x20\x7f:?*\[\\;&|$`'"()<>!{}]/.test(rev)) {
+    return false;
   }
 
   return true;
@@ -317,8 +401,109 @@ export function resolveConfinedPath(
 }
 
 /**
+ * Resolves the actual Git directory for `repoRoot`, supporting standard `.git` directories
+ * as well as Git worktrees and submodules where `.git` is a regular file containing `gitdir: <path>`.
+ *
+ * @param repoRoot The repository working tree root directory.
+ * @returns The resolved absolute `.git` directory path, or `null` if not a Git repository.
+ */
+export function resolveGitDir(repoRoot: string): string | null {
+  const dotGit = path.join(repoRoot, ".git");
+
+  try {
+    const stat = fs.statSync(dotGit);
+
+    if (stat.isDirectory()) {
+      return dotGit;
+    }
+
+    if (stat.isFile()) {
+      const content = fs.readFileSync(dotGit, "utf8");
+      const match = /^gitdir:\s*(.+)$/m.exec(content);
+
+      if (!match || !match[1]) {
+        return null;
+      }
+
+      const resolved = path.resolve(repoRoot, match[1].trim());
+
+      if (fs.existsSync(resolved) && fs.statSync(resolved).isDirectory()) {
+        return resolved;
+      }
+    }
+  } catch {
+    return null;
+  }
+
+  return null;
+}
+
+/**
+ * Resolves the shared Git common directory (`commondir`) for a linked worktree, or returns
+ * `gitDir` itself for a standard repository or submodule.
+ *
+ * @param gitDir The resolved Git directory from `resolveGitDir`.
+ * @returns The common Git directory containing shared refs and metadata.
+ */
+export function resolveCommonGitDir(gitDir: string): string {
+  const commonDirFile = path.join(gitDir, "commondir");
+
+  try {
+    if (fs.existsSync(commonDirFile) && fs.statSync(commonDirFile).isFile()) {
+      const relCommon = fs.readFileSync(commonDirFile, "utf8").trim();
+
+      if (relCommon) {
+        const resolved = path.resolve(gitDir, relCommon);
+
+        if (fs.existsSync(resolved) && fs.statSync(resolved).isDirectory()) {
+          return resolved;
+        }
+      }
+    }
+  } catch {
+    // Fall back to gitDir when commondir cannot be read.
+  }
+
+  return gitDir;
+}
+
+/**
+ * Resolves the initialized `.git/tessera` metadata directory for `repoRoot`, supporting
+ * both standard repositories and linked Git worktrees/submodules.
+ *
+ * @param repoRoot The repository working tree root directory.
+ * @returns The absolute path to the `tessera` state directory, or `null` if uninitialized.
+ */
+export function resolveTesseraDir(repoRoot: string): string | null {
+  const gitDir = resolveGitDir(repoRoot);
+
+  if (!gitDir) {
+    return null;
+  }
+
+  const direct = path.join(gitDir, "tessera");
+
+  if (fs.existsSync(direct)) {
+    return direct;
+  }
+
+  const commonGitDir = resolveCommonGitDir(gitDir);
+
+  if (commonGitDir !== gitDir) {
+    const shared = path.join(commonGitDir, "tessera");
+
+    if (fs.existsSync(shared)) {
+      return shared;
+    }
+  }
+
+  return null;
+}
+
+/**
  * Resolves the underlying Git repository root even if the IDE window was opened
- * inside a `.tessera` Copy-on-Write branch sandbox (`.../branches/<branch>`).
+ * inside a `.tessera` Copy-on-Write branch sandbox (`.../branches/<branch>`),
+ * a Git worktree, or a submodule.
  *
  * @param workspaceFolderPath The workspace folder path opened in the editor.
  * @returns The resolved Git repository root path.
@@ -327,9 +512,7 @@ export function resolveRepoRoot(workspaceFolderPath: string): string {
   let curr = workspaceFolderPath;
 
   for (let depth = 0; depth < 10; depth++) {
-    const dotGit = path.join(curr, ".git");
-
-    if (fs.existsSync(dotGit)) {
+    if (resolveGitDir(curr) !== null) {
       return curr;
     }
 
@@ -354,13 +537,13 @@ export function resolveRepoRoot(workspaceFolderPath: string): string {
           isSandboxPath &&
           target &&
           path.isAbsolute(target) &&
-          fs.existsSync(path.join(target, ".git", "tessera"))
+          resolveTesseraDir(target) !== null
         ) {
           return target;
         }
       }
     } catch {
-      // Fall through to parent traversal
+      // Fall through to parent traversal.
     }
 
     const parent = path.dirname(curr);
@@ -376,10 +559,46 @@ export function resolveRepoRoot(workspaceFolderPath: string): string {
 }
 
 /**
+ * Expands a leading `~/` or `~\` home-directory prefix in a configured binary path.
+ *
+ * @param rawPath The raw path string from configuration.
+ * @returns The path with a leading tilde expanded to `os.homedir()`.
+ */
+function expandHomePrefix(rawPath: string): string {
+  if (rawPath === "~") {
+    return os.homedir();
+  }
+
+  if (rawPath.startsWith("~/") || rawPath.startsWith("~\\")) {
+    return path.join(os.homedir(), rawPath.slice(2));
+  }
+
+  return rawPath;
+}
+
+/**
+ * Extracts a descriptive stderr string from a child process error when available.
+ *
+ * @param err The caught error object from `execFileAsync`.
+ * @returns The lowercase stderr or message string for diagnostics matching.
+ */
+function extractExecErrorText(err: unknown): string {
+  if (typeof err !== "object" || err === null) {
+    return String(err);
+  }
+
+  const record = err as { readonly stderr?: unknown; readonly message?: unknown };
+  const stderr = typeof record.stderr === "string" ? record.stderr : "";
+  const message = typeof record.message === "string" ? record.message : "";
+
+  return `${stderr}\n${message}`.toLowerCase();
+}
+
+/**
  * Typed client for invoking the `tes` CLI binary against a workspace root.
  *
  * Preconditions: `repoRoot` must be a valid directory on disk.
- * Error conditions: Rejects with a descriptive `Error` if `tes` exits non-zero or returns malformed JSON.
+ * Error conditions: Rejects with a descriptive `Error` if `tes` exits non-zero, times out, or returns malformed JSON.
  */
 export class CliClient {
   private readonly repoRoot: string;
@@ -403,39 +622,42 @@ export class CliClient {
   }
 
   /**
-   * Returns true when `.git/tessera` exists in the repository root.
+   * Returns true when `.git/tessera` exists in the repository's resolved Git directory.
    *
    * @returns True if the repository is initialized with `tes`.
    */
   public isInitialized(): boolean {
-    return fs.existsSync(path.join(this.repoRoot, ".git", "tessera"));
+    return resolveTesseraDir(this.repoRoot) !== null;
   }
 
   /**
-   * Resolves the configured `tes` binary path, checking `~/.cargo/bin/tes` and `/opt/homebrew/bin/tes`.
+   * Resolves the configured `tes` binary path, expanding `~/` prefixes and probing platform-appropriate
+   * install locations when using the default `"tes"` setting.
    *
    * @returns The resolved executable path or binary name.
    */
   public resolveBinPath(): string {
-    const inspected = vscode.workspace
+    const rawConfigured = vscode.workspace
       .getConfiguration("tes")
-      .inspect<string>("binPath");
-    const configured = (
-      inspected?.globalValue ??
-      inspected?.defaultValue ??
-      "tes"
-    ).trim();
+      .get<string>("binPath", "tes");
+    const configured = expandHomePrefix((rawConfigured ?? "tes").trim());
 
-    if (configured !== "tes" && fs.existsSync(configured)) {
+    if (configured && configured !== "tes") {
       return configured;
     }
 
-    const candidates = [
-      path.join(os.homedir(), ".cargo", "bin", "tes"),
-      path.join(os.homedir(), ".local", "bin", "tes"),
-      "/opt/homebrew/bin/tes",
-      "/usr/local/bin/tes",
-    ];
+    const candidates =
+      process.platform === "win32"
+        ? [
+            path.join(os.homedir(), ".cargo", "bin", "tes.exe"),
+            path.join(os.homedir(), ".local", "bin", "tes.exe"),
+          ]
+        : [
+            path.join(os.homedir(), ".cargo", "bin", "tes"),
+            path.join(os.homedir(), ".local", "bin", "tes"),
+            "/opt/homebrew/bin/tes",
+            "/usr/local/bin/tes",
+          ];
 
     for (const candidate of candidates) {
       if (fs.existsSync(candidate)) {
@@ -443,11 +665,12 @@ export class CliClient {
       }
     }
 
-    return configured || "tes";
+    return "tes";
   }
 
   /**
-   * Builds a PATH string that includes standard macOS/Linux user binary locations.
+   * Builds a process environment with standard user binary locations prepended to `PATH`
+   * while preserving Windows `Path`/`PATH` case-insensitivity and avoiding Unix directories on Windows.
    *
    * @param envOverrides Optional environment variables to merge into the child process environment.
    * @returns The constructed process environment object.
@@ -455,33 +678,53 @@ export class CliClient {
   private buildEnv(
     envOverrides?: Readonly<Record<string, string>>
   ): NodeJS.ProcessEnv {
-    const extraDirs = [
-      path.join(os.homedir(), ".cargo", "bin"),
-      path.join(os.homedir(), ".local", "bin"),
-      "/opt/homebrew/bin",
-      "/usr/local/bin",
-    ];
-    const currentPath = process.env.PATH ?? "/usr/bin:/bin";
+    const env: NodeJS.ProcessEnv = { ...process.env };
 
-    return {
-      ...process.env,
-      PATH: `${extraDirs.join(path.delimiter)}${path.delimiter}${currentPath}`,
-      ...(envOverrides ?? {}),
-    };
+    if (process.platform === "win32") {
+      const extraDirs = [
+        path.join(os.homedir(), ".cargo", "bin"),
+        path.join(os.homedir(), ".local", "bin"),
+      ];
+      const existingPathKey =
+        Object.keys(env).find((k) => k.toLowerCase() === "path") ?? "Path";
+      const currentPath = env[existingPathKey] ?? "";
+
+      env[existingPathKey] = currentPath
+        ? `${extraDirs.join(path.delimiter)}${path.delimiter}${currentPath}`
+        : extraDirs.join(path.delimiter);
+    } else {
+      const extraDirs = [
+        path.join(os.homedir(), ".cargo", "bin"),
+        path.join(os.homedir(), ".local", "bin"),
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+      ];
+      const currentPath = env.PATH ?? "/usr/bin:/bin";
+
+      env.PATH = `${extraDirs.join(path.delimiter)}${path.delimiter}${currentPath}`;
+    }
+
+    if (envOverrides) {
+      Object.assign(env, envOverrides);
+    }
+
+    return env;
   }
 
   /**
    * Executes a `tes` CLI command and returns raw `stdout`.
    *
-   * Error conditions: Throws `Error` if spawning fails or exit code is non-zero.
+   * Error conditions: Throws `Error` if spawning fails, the timeout expires, or exit code is non-zero.
    *
    * @param args CLI arguments to pass to `tes`.
    * @param envOverrides Optional environment variable overrides.
+   * @param timeoutMs Maximum execution duration in milliseconds before killing the child process.
    * @returns The standard output string from the command.
    */
   public async runRaw(
     args: readonly string[],
-    envOverrides?: Readonly<Record<string, string>>
+    envOverrides?: Readonly<Record<string, string>>,
+    timeoutMs = DEFAULT_QUERY_TIMEOUT_MS
   ): Promise<string> {
     const bin = this.resolveBinPath();
     const fullArgs = ["-C", this.repoRoot, ...args];
@@ -489,6 +732,8 @@ export class CliClient {
       cwd: this.repoRoot,
       maxBuffer: 16 * 1024 * 1024,
       env: this.buildEnv(envOverrides),
+      timeout: timeoutMs,
+      windowsHide: true,
     });
 
     return stdout;
@@ -497,51 +742,82 @@ export class CliClient {
   /**
    * Executes a `tes --json` command and parses its output.
    *
-   * Error conditions: Throws `Error` if the command fails or JSON parsing fails.
+   * Error conditions: Throws `Error` if the command fails, times out, or JSON parsing fails.
    *
    * @param args CLI arguments to pass after `--json`.
    * @param envOverrides Optional environment variable overrides.
+   * @param timeoutMs Maximum execution duration in milliseconds.
    * @returns The deserialized JSON response of type `T`.
    */
   public async runJson<T>(
     args: readonly string[],
-    envOverrides?: Readonly<Record<string, string>>
+    envOverrides?: Readonly<Record<string, string>>,
+    timeoutMs = DEFAULT_QUERY_TIMEOUT_MS
   ): Promise<T> {
-    const stdout = await this.runRaw(["--json", ...args], envOverrides);
+    const stdout = await this.runRaw(["--json", ...args], envOverrides, timeoutMs);
     return JSON.parse(stdout) as T;
   }
 
   /**
    * Fetches the complete state snapshot for visual panels and tree views.
+   * Reuses checkpoints already present in `radarReport.active_agents` and only queries
+   * a bounded `oplog` fallback when needed.
    *
    * @returns A combined snapshot of branches, active sessions, conflicts, oplog, stashes, and checkpoints.
    */
   public async fetchSnapshot(): Promise<WorkspaceStateSnapshot> {
-    const [branchReport, radarReport, conflicts, oplog, stashes] =
-      await Promise.all([
-        this.runJson<BranchReport>(["branch", "--agent", "editor"]),
-        this.runJson<RadarReport>(["radar"]),
-        this.runJson<ConflictItem[]>(["conflicts"]),
-        this.runJson<OpLogEntry[]>(["oplog", "--limit", "30"]),
-        this.runJson<StashEntry[]>(["stash", "list"]).catch(
-          (): StashEntry[] => []
-        ),
-      ]);
+    const [branchReport, radarReport, conflicts, stashes] = await Promise.all([
+      this.runJson<BranchReport>(["branch", "--agent", "editor"]),
+      this.runJson<RadarReport>(["radar"]),
+      this.runJson<ConflictItem[]>(["conflicts"]),
+      this.runJson<StashEntry[]>(["stash", "list"]).catch(
+        (): StashEntry[] => []
+      ),
+    ]);
 
     const checkpointMap = new Map<
       string,
       { label: string; opId: string; sessionId: string }
     >();
 
-    for (const op of oplog) {
-      const agentsObj = op.view?.agents;
+    for (const agent of radarReport.active_agents) {
+      if (agent.checkpoints) {
+        for (const [label, opId] of Object.entries(agent.checkpoints)) {
+          if (!checkpointMap.has(label)) {
+            checkpointMap.set(label, {
+              label,
+              opId,
+              sessionId: agent.agent_id,
+            });
+          }
+        }
+      }
+    }
 
-      if (agentsObj) {
-        for (const [sid, agentData] of Object.entries(agentsObj)) {
-          if (agentData.checkpoints) {
-            for (const [label, opId] of Object.entries(agentData.checkpoints)) {
-              if (!checkpointMap.has(label)) {
-                checkpointMap.set(label, { label, opId, sessionId: sid });
+    const radarCarriesCheckpoints = radarReport.active_agents.some(
+      (a) => a.checkpoints !== undefined
+    );
+    let oplog: readonly OpLogEntry[] = [];
+
+    if (checkpointMap.size === 0 && !radarCarriesCheckpoints) {
+      oplog = await this.runJson<OpLogEntry[]>([
+        "oplog",
+        "--limit",
+        "5",
+      ]).catch((): OpLogEntry[] => []);
+
+      for (const op of oplog) {
+        const agentsObj = op.view?.agents;
+
+        if (agentsObj) {
+          for (const [sid, agentData] of Object.entries(agentsObj)) {
+            if (agentData.checkpoints) {
+              for (const [label, opId] of Object.entries(
+                agentData.checkpoints
+              )) {
+                if (!checkpointMap.has(label)) {
+                  checkpointMap.set(label, { label, opId, sessionId: sid });
+                }
               }
             }
           }
@@ -562,20 +838,62 @@ export class CliClient {
   /**
    * Switches the primary editor working tree (`repo_root` and `.git/HEAD`) to `branch`.
    *
+   * Error conditions: Throws `Error` if `branch` is not a valid Git ref name.
+   *
    * @param branch The target branch name to check out in the editor.
    */
   public async switchEditorBranch(branch: string): Promise<void> {
+    const trimmed = branch.trim();
+
+    if (!isValidRefName(trimmed)) {
+      throw new Error(`Invalid branch name '${branch}'`);
+    }
+
     await this.runRaw([
       "switch",
       "--editor",
-      branch.trim(),
       "--agent",
       "editor",
+      "--",
+      trimmed,
     ]);
   }
 
   /**
+   * Creates and switches the editor working tree to a new branch, optionally forked from `from`.
+   *
+   * Error conditions: Throws `Error` if `branch` or `from` is not a valid Git ref name.
+   *
+   * @param branch The new branch name to create.
+   * @param from Optional base branch or ref to fork from.
+   */
+  public async createBranch(branch: string, from?: string): Promise<void> {
+    const trimmed = branch.trim();
+
+    if (!isValidRefName(trimmed)) {
+      throw new Error(`Invalid branch name '${branch}'`);
+    }
+
+    const args = ["switch", "--editor", "--agent", "editor"];
+
+    if (from !== undefined && from.trim().length > 0) {
+      const trimmedFrom = from.trim();
+
+      if (!isValidRefName(trimmedFrom)) {
+        throw new Error(`Invalid base branch '${from}'`);
+      }
+
+      args.push("--from", trimmedFrom);
+    }
+
+    args.push("--", trimmed);
+    await this.runRaw(args);
+  }
+
+  /**
    * Switches a specific session/terminal (`sessionId`) to `branch`.
+   *
+   * Error conditions: Throws `Error` if `sessionId` or `branch` is invalid.
    *
    * @param sessionId The session identifier to rebind.
    * @param branch The target branch name.
@@ -584,60 +902,107 @@ export class CliClient {
     sessionId: string,
     branch: string
   ): Promise<void> {
-    await this.runRaw(["switch", branch, "--agent", sessionId]);
+    const trimmedSession = sessionId.trim();
+    const trimmedBranch = branch.trim();
+
+    if (!isValidSafeIdentifier(trimmedSession)) {
+      throw new Error(`Invalid session identifier '${sessionId}'`);
+    }
+
+    if (!isValidRefName(trimmedBranch)) {
+      throw new Error(`Invalid branch name '${branch}'`);
+    }
+
+    await this.runRaw([
+      "switch",
+      "--agent",
+      trimmedSession,
+      "--",
+      trimmedBranch,
+    ]);
   }
 
   /**
-   * Closes and removes a single session (`agentId`) via `tes done --force`.
+   * Closes and removes a single session (`agentId`) via `tes agent close`.
+   *
+   * Error conditions: Throws `Error` if `agentId` is invalid.
    *
    * @param agentId The session or agent identifier to close.
    */
   public async closeSession(agentId: string): Promise<void> {
-    await this.runRaw(["done", "--force", "--agent", agentId]);
+    const trimmed = agentId.trim();
+
+    if (!isValidSafeIdentifier(trimmed)) {
+      throw new Error(`Invalid session identifier '${agentId}'`);
+    }
+
+    await this.runRaw(["agent", "close", "--", trimmed]);
   }
 
   /**
    * Focuses the terminal tab, multiplexer pane, or IDE window for `sessionId`.
    *
+   * Error conditions: Throws `Error` if `sessionId` is invalid.
+   *
    * @param sessionId The session identifier to focus.
    * @returns A report describing whether focus succeeded and which mechanism was used.
    */
   public async focusSession(sessionId: string): Promise<FocusSessionReport> {
-    return this.runJson<FocusSessionReport>(["session", "focus", sessionId], {
-      TES_FROM_IDE_EXTENSION: "1",
-    });
+    const trimmed = sessionId.trim();
+
+    if (!isValidSafeIdentifier(trimmed)) {
+      throw new Error(`Invalid session identifier '${sessionId}'`);
+    }
+
+    return this.runJson<FocusSessionReport>(
+      ["session", "focus", "--", trimmed],
+      { TES_FROM_IDE_EXTENSION: "1" }
+    );
   }
 
   /**
-   * Clears all clean/idle sessions (or all sessions if `force` is true) via `tes clear`.
+   * Clears all clean/idle sessions (or all sessions if `force` is true) via `tes agent clear`.
    *
    * @param force Whether to force-clear active sessions with uncommitted changes.
    */
   public async clearSessions(force = false): Promise<void> {
-    const args = force ? ["clear", "--force"] : ["clear"];
-    await this.runRaw(args);
+    await this.runRaw(["agent", "clear", ...(force ? ["--force"] : [])]);
   }
 
   /**
-   * Pops a stash entry by index (`stash@{index}`) onto the current session/branch.
+   * Pops a stash entry by index (`stash@{index}`) onto the editor session.
+   *
+   * Error conditions: Throws `Error` if `index` is not a non-negative integer.
    *
    * @param index Zero-based index in the stash stack.
    */
   public async popStash(index: number): Promise<void> {
-    await this.runRaw(["stash", "pop", String(index), "--agent", "editor"]);
+    if (!Number.isInteger(index) || index < 0) {
+      throw new Error(`Invalid stash index '${index}'`);
+    }
+
+    await this.runRaw(["stash", "-a", "editor", "pop", String(index)]);
   }
 
   /**
    * Drops a stash entry by index (`stash@{index}`).
    *
+   * Error conditions: Throws `Error` if `index` is not a non-negative integer.
+   *
    * @param index Zero-based index in the stash stack.
    */
   public async dropStash(index: number): Promise<void> {
-    await this.runRaw(["stash", "drop", String(index)]);
+    if (!Number.isInteger(index) || index < 0) {
+      throw new Error(`Invalid stash index '${index}'`);
+    }
+
+    await this.runRaw(["stash", "-a", "editor", "drop", String(index)]);
   }
 
   /**
    * Merges one or more branches or sessions into `targetBranch`.
+   *
+   * Error conditions: Throws `Error` if `sources` is empty or any ref/session name is invalid.
    *
    * @param sources List of source branch or session names to merge.
    * @param targetBranch The destination branch to merge into.
@@ -648,18 +1013,35 @@ export class CliClient {
     targetBranch: string,
     message: string
   ): Promise<void> {
-    await this.runRaw([
-      "merge",
-      ...sources,
-      "--into",
-      targetBranch,
-      "-m",
-      message,
-    ]);
+    const cleanTarget = targetBranch.trim();
+
+    if (!isValidRefName(cleanTarget)) {
+      throw new Error(`Invalid target branch '${targetBranch}'`);
+    }
+
+    const cleanSources = sources.map((s) => s.trim()).filter(Boolean);
+
+    if (cleanSources.length === 0) {
+      throw new Error("At least one source branch or session is required");
+    }
+
+    for (const src of cleanSources) {
+      if (!isValidRefName(src) && !isValidSafeIdentifier(src)) {
+        throw new Error(`Invalid merge source '${src}'`);
+      }
+    }
+
+    await this.runRaw(
+      ["merge", "--into", cleanTarget, "-m", message, "--", ...cleanSources],
+      undefined,
+      LONG_OPERATION_TIMEOUT_MS
+    );
   }
 
   /**
    * Restores `branch` (or specific `paths`) to `revisionOrCheckpoint`.
+   *
+   * Error conditions: Throws `Error` if `branch`, `revisionOrCheckpoint`, or any path is invalid.
    *
    * @param branch The target branch to restore.
    * @param revisionOrCheckpoint The checkpoint label, commit SHA, or ref to restore from.
@@ -670,31 +1052,81 @@ export class CliClient {
     revisionOrCheckpoint: string,
     paths: readonly string[] = []
   ): Promise<void> {
-    const args = ["restore", "-b", branch, revisionOrCheckpoint, ...paths];
-    await this.runRaw(args);
+    const cleanBranch = branch.trim();
+    const cleanRev = revisionOrCheckpoint.trim();
+
+    if (!isValidRefName(cleanBranch)) {
+      throw new Error(`Invalid branch name '${branch}'`);
+    }
+
+    if (!isValidRevisionOrCheckpoint(cleanRev)) {
+      throw new Error(`Invalid revision or checkpoint '${revisionOrCheckpoint}'`);
+    }
+
+    const cleanPaths: string[] = [];
+
+    for (const rawPath of paths) {
+      const confined = resolveConfinedPath(this.repoRoot, rawPath);
+
+      if (!confined) {
+        throw new Error(`Invalid repository-relative path '${rawPath}'`);
+      }
+
+      cleanPaths.push(confined[0]);
+    }
+
+    await this.runRaw(
+      ["restore", "-b", cleanBranch, "--", cleanRev, ...cleanPaths],
+      undefined,
+      RESTORE_TIMEOUT_MS
+    );
   }
 
   /**
    * Saves a named checkpoint in the Operation Log.
    *
+   * Error conditions: Throws `Error` if `label` is not a safe checkpoint name.
+   *
    * @param label The human-readable checkpoint name.
    */
   public async createCheckpoint(label: string): Promise<void> {
-    await this.runRaw(["checkpoint", label]);
+    const trimmed = label.trim();
+
+    if (!isValidRefName(trimmed)) {
+      throw new Error(`Invalid checkpoint label '${label}'`);
+    }
+
+    await this.runRaw(["checkpoint", "--", trimmed]);
   }
 
   /**
    * Undoes the most recent operation or rolls back to `opId`.
    *
+   * Error conditions: Throws `Error` if `opId` is provided and invalid.
+   *
    * @param opId Optional operation ID to roll back to.
    */
   public async undo(opId?: string): Promise<void> {
-    const args = opId ? ["undo", "--op", opId] : ["undo"];
-    await this.runRaw(args);
+    if (opId !== undefined) {
+      const trimmed = opId.trim();
+
+      if (!isValidSafeIdentifier(trimmed)) {
+        throw new Error(`Invalid operation ID '${opId}'`);
+      }
+
+      await this.runRaw(["undo", "--op", trimmed]);
+      return;
+    }
+
+    await this.runRaw(["undo"]);
   }
 
   /**
    * Resolves a conflict at `filePath` using the specified strategy or explicit content.
+   * When `strategy === "content"`, writes `customContent` to a secure temporary file
+   * and passes `--content-file` to avoid OS command-line length limits (`ARG_MAX`).
+   *
+   * Error conditions: Throws `Error` if `filePath` escapes the repository root.
    *
    * @param filePath The repository-relative path of the conflicted file.
    * @param strategy The resolution strategy (`ast-union`, `ours`, `theirs`, `working`, or `content`).
@@ -705,45 +1137,144 @@ export class CliClient {
     strategy: "ast-union" | "ours" | "theirs" | "working" | "content",
     customContent?: string
   ): Promise<void> {
-    const args = ["resolve", filePath, "--strategy", strategy];
+    let cleanPath: string;
 
-    if (strategy === "content" && customContent !== undefined) {
-      args.push("--content", customContent);
+    if (isSyntheticConflictPath(filePath)) {
+      cleanPath = filePath;
+    } else {
+      const confined = resolveConfinedPath(this.repoRoot, filePath);
+
+      if (!confined) {
+        throw new Error(`Invalid conflict path '${filePath}'`);
+      }
+
+      cleanPath = confined[0];
     }
 
-    await this.runRaw(args);
+    if (strategy === "content") {
+      const tmpDir = await fs.promises.mkdtemp(
+        path.join(os.tmpdir(), "tes-resolve-")
+      );
+      const tmpPath = path.join(tmpDir, "content.txt");
+
+      try {
+        await fs.promises.writeFile(tmpPath, customContent ?? "", {
+          encoding: "utf8",
+          mode: 0o600,
+        });
+        await this.runRaw([
+          "resolve",
+          "--strategy",
+          "content",
+          "--content-file",
+          tmpPath,
+          "--",
+          cleanPath,
+        ]);
+      } finally {
+        await fs.promises
+          .rm(tmpDir, { recursive: true, force: true })
+          .catch(() => undefined);
+      }
+
+      return;
+    }
+
+    await this.runRaw(["resolve", "--strategy", strategy, "--", cleanPath]);
   }
 
   /**
    * Pushes `branch` to `origin`.
    *
+   * Error conditions: Throws `Error` if `branch` is not a valid Git ref name.
+   *
    * @param branch The branch name to push.
    */
   public async pushBranch(branch: string): Promise<void> {
-    await this.runRaw(["push", "origin", branch]);
+    const trimmed = branch.trim();
+
+    if (!isValidRefName(trimmed)) {
+      throw new Error(`Invalid branch name '${branch}'`);
+    }
+
+    await this.runRaw(
+      ["push", "--", "origin", trimmed],
+      undefined,
+      LONG_OPERATION_TIMEOUT_MS
+    );
   }
 
   /**
    * Deletes `branch` safely (`force = false`) or forcefully (`force = true`).
    *
+   * Error conditions: Throws `Error` if `branch` is not a valid Git ref name.
+   *
    * @param branch The branch name to delete.
    * @param force Whether to force-delete an unmerged branch (`-D`).
    */
   public async deleteBranch(branch: string, force = false): Promise<void> {
-    await this.runRaw(["branch", force ? "-D" : "-d", branch]);
+    const trimmed = branch.trim();
+
+    if (!isValidRefName(trimmed)) {
+      throw new Error(`Invalid branch name '${branch}'`);
+    }
+
+    // Bind the branch value with `=` so Clap never interprets the value as an option flag.
+    const deleteFlag = force
+      ? `--force-delete=${trimmed}`
+      : `--delete=${trimmed}`;
+    await this.runRaw(["branch", deleteFlag]);
   }
 
   /**
    * Discards uncommitted working changes on `branch` by restoring it to its `HEAD` commit.
    *
+   * Error conditions: Throws `Error` if `branch` is not a valid Git ref name.
+   *
    * @param branch The branch whose working changes should be discarded.
    */
   public async discardWorkingChanges(branch: string): Promise<void> {
-    await this.runRaw(["restore", "-b", branch, "HEAD"]);
+    const trimmed = branch.trim();
+
+    if (!isValidRefName(trimmed)) {
+      throw new Error(`Invalid branch name '${branch}'`);
+    }
+
+    await this.runRaw(["restore", "-b", trimmed, "--", "HEAD"]);
+  }
+
+  /**
+   * Returns true if `sandboxDir` exists on disk and represents a materialized working tree.
+   *
+   * @param sandboxDir The workspace directory path reported by `tes branch`.
+   * @returns True if the directory is materialized and authoritative for file presence.
+   */
+  private async isMaterializedSandbox(sandboxDir: string): Promise<boolean> {
+    try {
+      const stat = await fs.promises.stat(sandboxDir);
+
+      if (!stat.isDirectory()) {
+        return false;
+      }
+
+      if (path.resolve(sandboxDir) === path.resolve(this.repoRoot)) {
+        return true;
+      }
+
+      const entries = await fs.promises.readdir(sandboxDir);
+      return entries.length > 0;
+    } catch {
+      return false;
+    }
   }
 
   /**
    * Reads a file from a specific branch sandbox or Git commit tree for virtual diffing.
+   * Does not fall back to `git show` when a materialized branch sandbox reports `ENOENT`
+   * so deleted uncommitted files are not silently resurrected.
+   *
+   * Error conditions: Throws `BranchFileNotFoundError` when the file is absent on `branch`,
+   * or `Error` for invalid refs, path confinement failures, or I/O/Git failures.
    *
    * @param branch The branch name or `"HEAD"`.
    * @param relPath The repository-relative file path.
@@ -763,27 +1294,73 @@ export class CliClient {
     const [cleanRelPath] = confinedRepo;
 
     if (branch !== "HEAD") {
-      const snapshot = await this.runJson<BranchReport>(["branch"]);
+      const snapshot = await this.runJson<BranchReport>([
+        "branch",
+        "--agent",
+        "editor",
+      ]);
       const detail = snapshot.branch_details.find((b) => b.name === branch);
 
-      if (detail) {
-        const confinedSandbox = resolveConfinedPath(
-          detail.workspace_path,
-          cleanRelPath
+      if (detail && detail.workspace_path) {
+        const materialized = await this.isMaterializedSandbox(
+          detail.workspace_path
         );
 
-        if (confinedSandbox && fs.existsSync(confinedSandbox[1])) {
-          return fs.readFileSync(confinedSandbox[1], "utf8");
+        if (materialized) {
+          const confinedSandbox = resolveConfinedPath(
+            detail.workspace_path,
+            cleanRelPath
+          );
+
+          if (!confinedSandbox) {
+            throw new Error(
+              `Path '${cleanRelPath}' escaped sandbox for branch '${branch}'`
+            );
+          }
+
+          try {
+            return await fs.promises.readFile(confinedSandbox[1], "utf8");
+          } catch (err: unknown) {
+            const code =
+              typeof err === "object" && err !== null && "code" in err
+                ? (err as { readonly code?: unknown }).code
+                : undefined;
+
+            if (code === "ENOENT") {
+              throw new BranchFileNotFoundError(branch, cleanRelPath);
+            }
+
+            throw err;
+          }
         }
       }
     }
 
-    const { stdout } = await execFileAsync(
-      "git",
-      ["-C", this.repoRoot, "show", `${branch}:${cleanRelPath}`],
-      { maxBuffer: 10 * 1024 * 1024 }
-    );
+    try {
+      const { stdout } = await execFileAsync(
+        "git",
+        ["-C", this.repoRoot, "show", `${branch}:${cleanRelPath}`],
+        {
+          maxBuffer: 10 * 1024 * 1024,
+          env: this.buildEnv(),
+          timeout: DEFAULT_QUERY_TIMEOUT_MS,
+          windowsHide: true,
+        }
+      );
 
-    return stdout;
+      return stdout;
+    } catch (err: unknown) {
+      const detail = extractExecErrorText(err);
+
+      if (
+        detail.includes("does not exist in") ||
+        detail.includes("exists on disk, but not in") ||
+        detail.includes("does not exist")
+      ) {
+        throw new BranchFileNotFoundError(branch, cleanRelPath);
+      }
+
+      throw err;
+    }
   }
 }

@@ -13,43 +13,45 @@ When you open a repository initialized with `tes init`, two items appear on the 
 
 ## Live Attribution
 
-When two or more AI agents work on the same file on your active editor branch, the extension highlights each agent's lines in real time:
+Whenever any active session has uncommitted edits in a file on your active editor branch (whether a single session or multiple concurrent agents), the extension highlights each session's lines in real time:
 
-1. **File Summary CodeLens**: Appears at line 1 whenever two or more agents are concurrently editing the file (`2 agents concurrently editing this file (main): antigravity-a1b2 · claude-c3d4`).
-2. **Hunk CodeLens (`Jump to Session`)**: Appears directly above the start line of each agent's modified section (`<agent_id> · L<start>-L<end>: <intent> · Jump to Session`). Clicking the CodeLens focuses the originating integrated terminal tab, terminal multiplexer pane (`tmux`, `WezTerm`, `kitty`), external macOS terminal tab (`Terminal.app`, `iTerm2`), or IDE agent conversation.
-3. **Gutter Borders and Line Highlights**: Each agent session receives a distinct 3px left border and line highlight along with a matching marker on the scrollbar overview ruler.
-4. **Inline Labels and Hover Cards**: The first line of each agent's section displays an italic inline label (`<agent_id>: <intent>`), and hovering any highlighted line shows a card with the agent ID, branch, line range, task intent, and a clickable **`Jump to Session`** action link.
+1. **Top-of-File CodeLenses**: Shows a **`Dismiss Highlights`** CodeLens whenever highlights are active, plus a file summary CodeLens at line 1 whenever two or more sessions are concurrently editing the file (`2 agents concurrently editing this file (main): antigravity-a1b2 · claude-c3d4`).
+2. **Hunk CodeLens**: Appears directly above the start line of each session's modified section (`<agent_id> · L<start>-L<end>: <intent>`). For terminal and CLI sessions with a navigable terminal waypoint (`term-*`, TTY, `tmux`, `WezTerm`, `kitty`, `Terminal.app`, or `iTerm2`), the CodeLens appends a clickable **`· Jump to Terminal`** link that focuses that terminal tab or pane.
+3. **Gutter Borders and Line Highlights**: Each session slot receives a distinct 3px left border and line highlight along with a matching marker on the scrollbar overview ruler (overlapping lines from multiple sessions use an error highlight).
+4. **Inline Labels and Hover Cards**: The first line of each session's section displays an italic inline label (`<agent_id>: <intent>`), and hovering any highlighted line shows a card with the session ID, branch, line range, task intent, a **`Jump to Terminal`** link (when navigable), and a **`Branch Graph`** link.
 
 <EditorPreview />
 
 ## Branch Graph
 
-Click **`Graph`** in the status bar (or run **`tes: Open Branch Graph`** from the Command Palette) to open the commit graph:
+Click **`Graph`** in the status bar (or run **`Tessera: Open Branch Graph`** from the Command Palette) to open the 2D commit graph:
 
-- **Branch Column Headers**: Shows each branch's name, current commit hash, sandbox port, modified file count, and active agent sessions, with action buttons to **Switch**, **Merge**, or **Restore**.
-- **Commit History**: Displays the commit history across parallel branch lanes with merge nodes, author names, and timestamps. Conflicted merge nodes are highlighted with a red border and a `Conflict` badge.
+- **Branch Column Headers**: Sticky headers at the top of each branch lane show the branch name, **`Active`** / **`Switch`** status badge (clicking the header switches the editor working tree to that branch), a delete button (`×` on non-trunk branches), a **`Default`** or **`Branch`** badge, and the branch's assigned port (`:<port>`).
+- **Topbar Actions**: Includes one-click buttons to **`Resolve Conflict`** (when conflicts exist), **`Merge into <trunk>`**, **`Collapse Linear`** / **`Expand All`**, and **`Refresh`**.
+- **Newest-First Commit History**: Renders commit and merge cards newest-first so **`Working`** and **`HEAD`** nodes stay immediately visible beneath the sticky column headers. Consecutive commits with matching conventional topics group horizontally, long linear chains collapse into expandable pills, file chips open diffs or conflicted files, **`Working`** cards include a **`Discard`** button, and conflicted nodes are highlighted with a red border.
 
 ## Sidebar Views
 
 Clicking the Tessera icon in the Activity Bar opens three sidebar views (plus a **Branches** view inside the Source Control sidebar):
 
 ### Branches
-Lists every branch in the repository with its short commit SHA and modified file count ahead of `main`. Expanding a branch lets you:
+Lists every branch in the repository with its short commit SHA, active marker, port (`:<port>`), and modified file count ahead of `main`. Expanding a branch lets you:
 - Switch your editor to that branch
 - Open the branch's assigned dev server (`localhost:<port>`)
 - Click any modified file (`M`) to open a side-by-side diff against `main`
 
 ### Sessions
-Displays all active AI agent and terminal sessions (`antigravity-*`, `claude-*`, `codex-*`, `cursor-*`, `term-*`), their target branch, and their current task intent. Clicking the **Jump to Session** inline button (or running `tes session focus <session-id>` from a terminal) navigates directly to that session's terminal tab, multiplexer pane, or IDE window. Expanding a session shows claimed symbols and modified files.
+Displays all active AI agent and terminal sessions (`antigravity-*`, `claude-*`, `codex-*`, `cursor-*`, `term-*`), their target branch, and their current task intent. Expanding a terminal session provides a **`Jump to Terminal`** action (and the inline **Jump to Session** button or `tes session focus <session-id>` focuses the session's terminal tab, multiplexer pane, or IDE window), along with branch switching, claimed symbols, and modified files.
 
-### Checkpoints
-Lists active conflicts alongside saved checkpoints (`tes checkpoint`), with toolbar actions to create a new checkpoint or open the Conflict Resolver.
+### Conflicts & Checkpoints
+Lists active conflicts, saved checkpoints (`tes checkpoint`), and stashes (`stash@{0}`, expandable to view stashed files with inline **Pop Stash** and **Drop Stash** actions), with toolbar actions to create a new checkpoint or open the Conflict Resolver.
 
 ## Conflict Resolution
 
 When a merge conflict occurs:
 1. The extension opens the conflicted file in your editor at the `<<<<<<<` conflict marker.
-2. Resolve the conflict by editing the file and saving (`Cmd+S` / `Ctrl+S` resolves once markers are removed) or by using the **Conflict Resolver** panel (`AST Union`, `Keep Ours`, `Keep Theirs`, `Keep Working File`).
+2. Resolve the conflict by editing the file and saving (`Cmd+S` / `Ctrl+S` resolves once markers are removed) or by opening the **Conflict Resolver** panel (click **`N Conflicts`** in the status bar or run **`Tessera: Open Conflict Resolver`**).
+3. Each conflict card displays competing agent intents, **`Verification Diagnostics`** (when `diagnostics` is present, such as from a failed `--verify` check), **`Base`** (when `base_snippet` is present), **`Ours`**, and **`Theirs`** snippets, an editable **`AST-Union Preview`** box, an **`Open in Editor`** button, and one-click actions: **`Accept AST-Union`**, **`Accept Ours`**, **`Accept Theirs`**, **`Keep Working File`**, and **`Save Custom`**.
 
 ## See Also
 

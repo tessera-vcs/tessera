@@ -4,8 +4,8 @@ set -euo pipefail
 # Automated macOS Terminal.app AppleScript Multi-Shell E2E Test Suite.
 # Opens 5 real Terminal.app windows via `osascript` and tests Tessera across:
 # - /bin/bash (3.2)
-# - /opt/homebrew/bin/bash (5.x)
-# - /opt/homebrew/bin/fish
+# - Homebrew bash (5.x)
+# - Homebrew fish
 # - POSIX & C/Structured shells (/bin/sh, dash, ksh, mksh, oksh, yash, tcsh, csh, nu, elvish)
 # - Zero-hook vanilla shell (without `tes env` sourced)
 
@@ -20,6 +20,30 @@ fi
 TES_DIR="$(cd "$(dirname "$TES_BIN")" && pwd)"
 TES_BIN="$TES_DIR/$(basename "$TES_BIN")"
 
+BREW_PREFIX="$(brew --prefix 2>/dev/null || { if [ -d /opt/homebrew ]; then echo /opt/homebrew; else echo /usr/local; fi; })"
+BREW_BIN="$BREW_PREFIX/bin"
+
+BASH5_BIN=""
+if [ -x "$BREW_BIN/bash" ]; then
+  BASH5_BIN="$BREW_BIN/bash"
+else
+  CANDIDATE_BASH="$(command -v bash || true)"
+  if [ -n "$CANDIDATE_BASH" ] && [ "$CANDIDATE_BASH" != "/bin/bash" ]; then
+    BASH5_BIN="$CANDIDATE_BASH"
+  fi
+fi
+
+if [ -z "$BASH5_BIN" ]; then
+  echo "FAIL: modern bash not found (install with: brew install bash)" >&2
+  exit 1
+fi
+
+FISH_BIN="$(command -v fish || echo "$BREW_BIN/fish")"
+if [ ! -x "$FISH_BIN" ]; then
+  echo "FAIL: fish not found (install with: brew install fish)" >&2
+  exit 1
+fi
+
 TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/tes-shells-e2e.XXXXXX")"
 REMOTE_DIR="$TEST_ROOT/remote.git"
 APP_DIR="$TEST_ROOT/polyglot-service"
@@ -33,8 +57,8 @@ git init --bare -b main "$REMOTE_DIR" >/dev/null
 echo "==> [Setup] Creating fresh real-world project at $APP_DIR"
 cd "$APP_DIR"
 git init -b main >/dev/null
-git config user.name "Donald Pakkies"
-git config user.email "donald@example.com"
+git config user.name "Tessera Test"
+git config user.email "test@tessera.getlunaris.dev"
 git remote add origin "$REMOTE_DIR"
 
 mkdir -p src test
@@ -77,9 +101,9 @@ tell application "Terminal"
   activate
   do script "exec /bin/bash --noprofile --norc"
   set win_bash32 to id of front window
-  do script "exec /opt/homebrew/bin/bash --noprofile --norc"
+  do script "exec '$BASH5_BIN' --noprofile --norc"
   set win_bash5 to id of front window
-  do script "exec /opt/homebrew/bin/fish --no-config"
+  do script "exec '$FISH_BIN' --no-config"
   set win_fish to id of front window
   do script "exec /bin/sh"
   set win_posix to id of front window
@@ -110,6 +134,11 @@ trap cleanup_windows EXIT
 
 sleep 1
 
+# Escapes metacharacters in sed replacement strings (`\`, `&`, `|`).
+escape_sed_replacement() {
+  printf '%s' "$1" | sed -e 's/[\\&|]/\\&/g'
+}
+
 # Executes a shell script inside a target Terminal.app window via `osascript`
 # and blocks until its exit status is written to disk.
 run_in_window() {
@@ -119,10 +148,16 @@ run_in_window() {
   local shell_kind="${4:-posix}"
   local status_file="$LOG_DIR/${step_name}.status"
   local out_file="$LOG_DIR/${step_name}.out"
+  local esc_app_dir esc_tes_dir esc_brew_bin
 
   rm -f "$status_file" "$out_file"
-  sed -i '' "s|__APP_DIR__|$APP_DIR|g" "$script_file"
-  sed -i '' "s|__TES_DIR__|$TES_DIR|g" "$script_file"
+  esc_app_dir="$(escape_sed_replacement "$APP_DIR")"
+  esc_tes_dir="$(escape_sed_replacement "$TES_DIR")"
+  esc_brew_bin="$(escape_sed_replacement "$BREW_BIN")"
+
+  sed -i '' "s|__APP_DIR__|${esc_app_dir}|g" "$script_file"
+  sed -i '' "s|__TES_DIR__|${esc_tes_dir}|g" "$script_file"
+  sed -i '' "s|__BREW_BIN__|${esc_brew_bin}|g" "$script_file"
 
   if [ "$shell_kind" = "fish" ]; then
     local runner_file="$LOG_DIR/${step_name}.runner.fish"
@@ -158,7 +193,7 @@ EOF
     sleep 0.2
     waited=$((waited + 1))
     if [ "$waited" -gt 200 ]; then
-      echo "❌ TIMEOUT waiting for '$step_name' in window $window_id"
+      echo "TIMEOUT waiting for '$step_name' in window $window_id" >&2
       cat "$out_file" 2>/dev/null || true
       exit 1
     fi
@@ -166,19 +201,20 @@ EOF
 
   local code
   code="$(cat "$status_file" | tr -d '[:space:]')"
-  echo "--- [$step_name] (Window $window_id, Exit=$code) ---"
+  echo "[$step_name] (Window $window_id, Exit=$code)"
   cat "$out_file"
+
   if [ "$code" != "0" ]; then
-    echo "❌ Step '$step_name' failed with exit code $code"
+    echo "Step '$step_name' failed with exit code $code" >&2
     exit 1
   fi
 }
 
 cat > "$LOG_DIR/bash32_init.sh" << 'EOF'
-export PATH="__TES_DIR__:$HOME/.cargo/bin:/opt/homebrew/bin:$PATH"
+export PATH="__TES_DIR__:$HOME/.cargo/bin:__BREW_BIN__:$PATH"
 unset ANTIGRAVITY_AGENT ANTIGRAVITY_CONVERSATION_ID TES_SESSION_ID
 echo "BASH_VERSION=$BASH_VERSION"
-cd __APP_DIR__
+cd "__APP_DIR__"
 tes init
 tes config --verify-cmd "node test/run.js"
 eval "$(tes env --bash)"
@@ -206,10 +242,10 @@ EOF
 run_in_window "$WIN_BASH32" "bash32_init_and_edit" "$LOG_DIR/bash32_init.sh" "posix"
 
 cat > "$LOG_DIR/bash5_concurrent_and_switch.sh" << 'EOF'
-export PATH="__TES_DIR__:$HOME/.cargo/bin:/opt/homebrew/bin:$PATH"
+export PATH="__TES_DIR__:$HOME/.cargo/bin:__BREW_BIN__:$PATH"
 unset ANTIGRAVITY_AGENT ANTIGRAVITY_CONVERSATION_ID TES_SESSION_ID
 echo "BASH_VERSION=$BASH_VERSION"
-cd __APP_DIR__
+cd "__APP_DIR__"
 eval "$(tes env --bash)"
 echo "Bash 5 session: TES_SESSION_ID=$TES_SESSION_ID TES_BRANCH=$TES_BRANCH TES_PORT=$TES_PORT"
 tes claim --branch main --intent "Add multiply in Bash 5" src/math.js
@@ -246,10 +282,10 @@ EOF
 run_in_window "$WIN_BASH5" "bash5_concurrent_and_switch" "$LOG_DIR/bash5_concurrent_and_switch.sh" "posix"
 
 cat > "$LOG_DIR/fish_live_session.fish" << 'EOF'
-set -gx PATH "__TES_DIR__" "$HOME/.cargo/bin" "/opt/homebrew/bin" $PATH
+set -gx PATH "__TES_DIR__" "$HOME/.cargo/bin" "__BREW_BIN__" $PATH
 set -e ANTIGRAVITY_AGENT ANTIGRAVITY_CONVERSATION_ID TES_SESSION_ID
 echo "FISH_VERSION=$FISH_VERSION"
-cd __APP_DIR__
+cd "__APP_DIR__"
 tes env --fish | source
 echo "Fish session: TES_SESSION_ID=$TES_SESSION_ID TES_BRANCH=$TES_BRANCH TES_PORT=$TES_PORT"
 if test -z "$TES_SESSION_ID"; or test "$TES_BRANCH" != "main"
@@ -273,11 +309,11 @@ EOF
 run_in_window "$WIN_FISH" "fish_live_session" "$LOG_DIR/fish_live_session.fish" "fish"
 
 cat > "$LOG_DIR/all_other_shells.sh" << 'EOF'
-export PATH="__TES_DIR__:$HOME/.cargo/bin:/opt/homebrew/bin:$PATH"
+export PATH="__TES_DIR__:$HOME/.cargo/bin:__BREW_BIN__:$PATH"
 unset ANTIGRAVITY_AGENT ANTIGRAVITY_CONVERSATION_ID TES_SESSION_ID
-cd __APP_DIR__
+cd "__APP_DIR__"
 
-echo "--- Testing POSIX /bin/sh ---"
+echo "Testing POSIX /bin/sh"
 eval "$(tes env --sh)"
 echo "POSIX /bin/sh: TES_SESSION_ID=$TES_SESSION_ID TES_BRANCH=$TES_BRANCH TES_PORT=$TES_PORT TES_PROMPT=$TES_PROMPT"
 [ "$TES_BRANCH" = "main" ] || { echo "FAIL: /bin/sh expected main" >&2; return 1; }
@@ -286,13 +322,14 @@ tes switch -b feat/posix-modulo
 tes switch main
 echo "✓ /bin/sh passed"
 
-for posix_bin in /bin/dash /bin/ksh /opt/homebrew/bin/mksh /opt/homebrew/bin/oksh /opt/homebrew/bin/yash; do
-  if [ -x "$posix_bin" ]; then
-    echo "--- Testing $posix_bin ---"
+for shell_name in dash ksh mksh oksh yash; do
+  posix_bin="$(command -v "$shell_name" 2>/dev/null || true)"
+  if [ -n "$posix_bin" ] && [ -x "$posix_bin" ]; then
+    echo "Testing $posix_bin"
     "$posix_bin" -e -c '
-      export PATH="__TES_DIR__:$HOME/.cargo/bin:/opt/homebrew/bin:$PATH"
+      export PATH="__TES_DIR__:$HOME/.cargo/bin:__BREW_BIN__:$PATH"
       unset ANTIGRAVITY_AGENT ANTIGRAVITY_CONVERSATION_ID TES_SESSION_ID
-      cd __APP_DIR__
+      cd "__APP_DIR__"
       eval "$(tes env --sh)"
       echo "'"$posix_bin"': TES_SESSION_ID=$TES_SESSION_ID TES_BRANCH=$TES_BRANCH TES_PORT=$TES_PORT TES_PROMPT=$TES_PROMPT"
       [ "$TES_BRANCH" = "main" ] || exit 1
@@ -307,60 +344,58 @@ done
 
 for csh_bin in /bin/tcsh /bin/csh; do
   if [ -x "$csh_bin" ]; then
-    echo "--- Testing $csh_bin ---"
-    "$csh_bin" -f -e -c '
-      setenv PATH "__TES_DIR__:${HOME}/.cargo/bin:/opt/homebrew/bin:${PATH}"
-      unsetenv ANTIGRAVITY_AGENT ANTIGRAVITY_CONVERSATION_ID TES_SESSION_ID
-      cd __APP_DIR__
-      eval "`tes env --tcsh`"
-      echo "'"$csh_bin"': TES_SESSION_ID=$TES_SESSION_ID TES_BRANCH=$TES_BRANCH TES_PORT=$TES_PORT TES_PROMPT=$TES_PROMPT"
-      if ( "$TES_BRANCH" != "main" ) exit 1
-      \tes switch feat/fish-power >/dev/null
-      eval "`\tes env`"
-      if ( "$TES_BRANCH" != "feat/fish-power" ) exit 1
-      \tes switch main >/dev/null
-      eval "`\tes env`"
-      if ( "$TES_BRANCH" != "main" ) exit 1
-    ' || { echo "FAIL: $csh_bin failed" >&2; return 1; }
+    echo "Testing $csh_bin"
+    "$csh_bin" -f -e << 'CSH_INNER' || { echo "FAIL: $csh_bin failed" >&2; return 1; }
+setenv PATH "__TES_DIR__:${HOME}/.cargo/bin:__BREW_BIN__:${PATH}"
+unsetenv ANTIGRAVITY_AGENT ANTIGRAVITY_CONVERSATION_ID TES_SESSION_ID
+cd "__APP_DIR__"
+eval "`tes env --tcsh`"
+echo "tcsh/csh: TES_SESSION_ID=$TES_SESSION_ID TES_BRANCH=$TES_BRANCH TES_PORT=$TES_PORT TES_PROMPT=$TES_PROMPT"
+if ( "$TES_BRANCH" != "main" ) exit 1
+tes switch feat/fish-power
+if ( "$TES_BRANCH" != "feat/fish-power" ) exit 1
+tes switch main
+if ( "$TES_BRANCH" != "main" ) exit 1
+CSH_INNER
     echo "✓ $csh_bin parsed tes env --tcsh and switched branches cleanly"
   fi
 done
 
-if [ -x /opt/homebrew/bin/nu ]; then
-  echo "--- Testing Nushell (/opt/homebrew/bin/nu) ---"
-  command tes env --nu > __APP_DIR__/.tes_init.nu
-  /opt/homebrew/bin/nu -c '
-    $env.PATH = ($env.PATH | prepend "__TES_DIR__" | prepend $"($env.HOME)/.cargo/bin" | prepend "/opt/homebrew/bin")
+NU_BIN="$(command -v nu 2>/dev/null || true)"
+if [ -n "$NU_BIN" ] && [ -x "$NU_BIN" ]; then
+  echo "Testing Nushell ($NU_BIN)"
+  command tes env --nu > "__APP_DIR__/.tes_init.nu"
+  "$NU_BIN" -c '
+    $env.PATH = ($env.PATH | prepend "__TES_DIR__" | prepend $"($env.HOME)/.cargo/bin" | prepend "__BREW_BIN__")
     hide-env -i ANTIGRAVITY_AGENT ANTIGRAVITY_CONVERSATION_ID TES_SESSION_ID
-    cd __APP_DIR__
-    use __APP_DIR__/.tes_init.nu *
+    cd "__APP_DIR__"
+    use "__APP_DIR__/.tes_init.nu" *
     print $"nu: TES_SESSION_ID=($env.TES_SESSION_ID) TES_BRANCH=($env.TES_BRANCH) TES_PORT=($env.TES_PORT) TES_PROMPT=($env.TES_PROMPT)"
     if $env.TES_BRANCH != "main" { exit 1 }
     tes switch feat/fish-power
     if $env.TES_BRANCH != "feat/fish-power" { exit 1 }
     tes switch main
     if $env.TES_BRANCH != "main" { exit 1 }
-  ' || { rm -f __APP_DIR__/.tes_init.nu; echo "FAIL: Nushell failed" >&2; return 1; }
-  rm -f __APP_DIR__/.tes_init.nu
+  ' || { rm -f "__APP_DIR__/.tes_init.nu"; echo "FAIL: Nushell failed" >&2; return 1; }
+  rm -f "__APP_DIR__/.tes_init.nu"
   echo "✓ Nushell (nu) loaded tes env --nu and switched branches cleanly"
 fi
 
-if [ -x /opt/homebrew/bin/elvish ]; then
-  echo "--- Testing Elvish (/opt/homebrew/bin/elvish) ---"
-  /opt/homebrew/bin/elvish -c '
-    set E:PATH = "__TES_DIR__:"$E:HOME"/.cargo/bin:/opt/homebrew/bin:"$E:PATH
+ELVISH_BIN="$(command -v elvish 2>/dev/null || true)"
+if [ -n "$ELVISH_BIN" ] && [ -x "$ELVISH_BIN" ]; then
+  echo "Testing Elvish ($ELVISH_BIN)"
+  "$ELVISH_BIN" -c '
+    set E:PATH = "__TES_DIR__:"$E:HOME"/.cargo/bin:__BREW_BIN__:"$E:PATH
     unset-env ANTIGRAVITY_AGENT
     unset-env ANTIGRAVITY_CONVERSATION_ID
     unset-env TES_SESSION_ID
-    cd __APP_DIR__
+    cd "__APP_DIR__"
     eval (e:tes env --elvish | slurp)
     echo "elvish: TES_SESSION_ID="$E:TES_SESSION_ID" TES_BRANCH="$E:TES_BRANCH" TES_PORT="$E:TES_PORT" TES_PROMPT="$E:TES_PROMPT
     if (not-eq $E:TES_BRANCH "main") { exit 1 }
-    e:tes switch feat/bash5-divide >/dev/null
-    eval (e:tes env | slurp)
+    tes switch feat/bash5-divide >/dev/null
     if (not-eq $E:TES_BRANCH "feat/bash5-divide") { exit 1 }
-    e:tes switch main >/dev/null
-    eval (e:tes env | slurp)
+    tes switch main >/dev/null
     if (not-eq $E:TES_BRANCH "main") { exit 1 }
   ' || { echo "FAIL: Elvish failed" >&2; return 1; }
   echo "✓ Elvish evaluated tes env --elvish and switched branches cleanly"
@@ -369,11 +404,11 @@ EOF
 run_in_window "$WIN_POSIX" "posix_csh_nu_elvish_shells" "$LOG_DIR/all_other_shells.sh" "posix"
 
 cat > "$LOG_DIR/nohook_vanilla_shell.sh" << 'EOF'
-export PATH="__TES_DIR__:$HOME/.cargo/bin:/opt/homebrew/bin:$PATH"
+export PATH="__TES_DIR__:$HOME/.cargo/bin:__BREW_BIN__:$PATH"
 unset ANTIGRAVITY_AGENT ANTIGRAVITY_CONVERSATION_ID TES_SESSION_ID
-cd __APP_DIR__
+cd "__APP_DIR__"
 
-echo "--- Testing Zero-Hook Vanilla Shell (no tes env sourced) ---"
+echo "Testing Zero-Hook Vanilla Shell (no tes env sourced)"
 echo "TERM_SESSION_ID=${TERM_SESSION_ID:-none}"
 S1=$(tes status --json | node -e 'const d=JSON.parse(require("fs").readFileSync(0,"utf8")); console.log(d.session.agent_id);')
 S2=$(tes status --json | node -e 'const d=JSON.parse(require("fs").readFileSync(0,"utf8")); console.log(d.session.agent_id);')
@@ -402,4 +437,4 @@ echo "✓ Zero-hook vanilla shell switched, octopus-merged Bash 5 + Fish branche
 EOF
 run_in_window "$WIN_NOHOOK" "nohook_vanilla_shell" "$LOG_DIR/nohook_vanilla_shell.sh" "posix"
 
-echo "✅ ALL NON-ZSH SHELLS IN TERMINAL.APP PASSED!"
+echo "ALL NON-ZSH SHELLS IN TERMINAL.APP PASSED!"
