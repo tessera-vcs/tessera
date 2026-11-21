@@ -2787,7 +2787,7 @@ fn pager_ignores_sigint_and_restores_termios_on_pty() {
         "#!/bin/sh\n\
 trap '' INT\n\
 cat >/dev/null\n\
-stty -onlcr -echo -icanon </dev/tty\n\
+stty -onlcr -echo -icanon <&1\n\
 printf ok > \"$TES_TEST_PAGER_READY\"\n\
 i=0\n\
 while [ ! -f \"$TES_TEST_PAGER_DONE\" ] && [ \"$i\" -lt 250 ]; do\n\
