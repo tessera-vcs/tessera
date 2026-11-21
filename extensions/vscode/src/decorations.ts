@@ -6,6 +6,8 @@ import * as path from "path";
 import * as vscode from "vscode";
 import { FileLineAttribution, WorkspaceStateSnapshot } from "./client";
 
+const DOCUMENT_CHANGE_DEBOUNCE_MS = 150;
+
 /**
  * Renders live multi-agent line-range decorations and CodeLenses directly inside open
  * text editors for active sessions working on the current editor branch.
@@ -23,6 +25,7 @@ export class AgentDecorationController
   public readonly onDidChangeCodeLenses =
     this.onDidChangeCodeLensesEmitter.event;
   private readonly disposables: vscode.Disposable[] = [];
+  private changeDebounceTimer: NodeJS.Timeout | undefined;
 
   /**
    * Initializes per-slot decoration styles and subscribes to editor visibility and document events.
@@ -82,10 +85,42 @@ export class AgentDecorationController
       vscode.window.onDidChangeVisibleTextEditors(() => {
         this.applyToVisibleEditors();
       }),
-      vscode.workspace.onDidChangeTextDocument(() => {
-        this.applyToVisibleEditors();
+      vscode.workspace.onDidChangeTextDocument((event) => {
+        if (
+          event.document.uri.scheme !== "file" ||
+          event.contentChanges.length === 0
+        ) {
+          return;
+        }
+
+        this.scheduleApplyToVisibleEditors();
+      }),
+      vscode.workspace.onDidCloseTextDocument((doc) => {
+        if (doc.uri.scheme !== "file") {
+          return;
+        }
+
+        const relPath = this.resolveRelativePath(doc.uri.fsPath);
+
+        if (relPath) {
+          this.dismissedSignatures.delete(relPath);
+        }
       })
     );
+  }
+
+  /**
+   * Schedules a debounced refresh of visible editor decorations after text document edits.
+   */
+  private scheduleApplyToVisibleEditors(): void {
+    if (this.changeDebounceTimer !== undefined) {
+      clearTimeout(this.changeDebounceTimer);
+    }
+
+    this.changeDebounceTimer = setTimeout(() => {
+      this.changeDebounceTimer = undefined;
+      this.applyToVisibleEditors();
+    }, DOCUMENT_CHANGE_DEBOUNCE_MS);
   }
 
   /**
@@ -256,7 +291,7 @@ export class AgentDecorationController
       editor.setDecorations(this.collisionDecoration, []);
     };
 
-    if (!this.snapshot) {
+    if (!this.snapshot || editor.document.uri.scheme !== "file") {
       clearAll();
       return;
     }
@@ -320,7 +355,10 @@ export class AgentDecorationController
         const jumpLink = this.isTerminalNavigable(owner.agent_id)
           ? `[$(terminal) Jump to Terminal](command:tes.focusSession?${encodedArgs}) · `
           : "";
-        const safeAgent = owner.agent_id.replace(/[\\`*_{}[\]()#+\-.!|<>]/g, "\\$&");
+        const safeAgent = owner.agent_id.replace(
+          /[\\`*_{}[\]()#+\-.!|<>]/g,
+          "\\$&"
+        );
         const safeBranch = owner.branch.replace(/[`\\<>]/g, "\\$&");
         const safeIntent = owner.intent
           .replace(/[\\`*_{}[\]()#+\-.!|<>]/g, "\\$&")
@@ -420,6 +458,17 @@ export class AgentDecorationController
     const editorBranch = this.getEditorBranch();
     const all = this.snapshot?.radarReport.file_attributions ?? [];
 
+    if (process.platform === "win32") {
+      const lowerTarget = relPath.toLowerCase();
+
+      return all.filter(
+        (a) =>
+          a.path.toLowerCase() === lowerTarget &&
+          a.branch === editorBranch &&
+          a.in_working_tree
+      );
+    }
+
     return all.filter(
       (a) =>
         a.path === relPath &&
@@ -454,7 +503,8 @@ export class AgentDecorationController
   }
 
   /**
-   * Converts an absolute filesystem path into a normalized repository-relative slash path.
+   * Converts an absolute filesystem path into a normalized repository-relative slash path,
+   * handling Windows case-insensitive drive letters cleanly.
    *
    * @param fsPath The absolute filesystem path to convert.
    * @returns The normalized repository-relative path, or `undefined` if outside the working tree.
@@ -462,25 +512,42 @@ export class AgentDecorationController
   private resolveRelativePath(fsPath: string): string | undefined {
     const normalizedRoot = path.resolve(this.repoRoot);
     const normalizedFile = path.resolve(fsPath);
+    const rootWithSep = normalizedRoot.endsWith(path.sep)
+      ? normalizedRoot
+      : normalizedRoot + path.sep;
 
-    if (normalizedFile.startsWith(normalizedRoot + path.sep)) {
-      const rel = path
-        .relative(normalizedRoot, normalizedFile)
-        .split(path.sep)
-        .join("/");
+    let relRaw: string | undefined;
 
-      if (!rel.startsWith(".git/") && !rel.startsWith(".tessera/")) {
-        return rel;
+    if (process.platform === "win32") {
+      if (normalizedFile.toLowerCase().startsWith(rootWithSep.toLowerCase())) {
+        relRaw = normalizedFile.slice(rootWithSep.length);
       }
+    } else if (normalizedFile.startsWith(rootWithSep)) {
+      relRaw = normalizedFile.slice(rootWithSep.length);
+    }
+
+    if (!relRaw) {
+      return undefined;
+    }
+
+    const rel = relRaw.split(path.sep).join("/");
+
+    if (!rel.startsWith(".git/") && !rel.startsWith(".tessera/")) {
+      return rel;
     }
 
     return undefined;
   }
 
   /**
-   * Disposes all editor decoration types, event emitters, and listener subscriptions.
+   * Disposes all editor decoration types, timers, event emitters, and listener subscriptions.
    */
   public dispose(): void {
+    if (this.changeDebounceTimer !== undefined) {
+      clearTimeout(this.changeDebounceTimer);
+      this.changeDebounceTimer = undefined;
+    }
+
     for (const dec of this.slotDecorations) {
       dec.dispose();
     }

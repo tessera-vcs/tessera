@@ -22,7 +22,7 @@
     "url": "https://github.com/tessera-vcs/tessera/issues"
   },
   "engines": {
-    "vscode": "^1.107.0"
+    "vscode": "^1.85.0"
   },
   "categories": [
     "SCM Providers",
@@ -137,7 +137,7 @@
       },
       {
         "command": "tes.diffBranchFile",
-        "title": "Diff with main",
+        "title": "Diff with Trunk",
         "category": "Tessera",
         "icon": "$(diff)"
       },
@@ -191,6 +191,28 @@
       }
     ],
     "menus": {
+      "commandPalette": [
+        {
+          "command": "tes.diffBranchFile",
+          "when": "false"
+        },
+        {
+          "command": "tes.openBranchPort",
+          "when": "false"
+        },
+        {
+          "command": "tes.closeSession",
+          "when": "false"
+        },
+        {
+          "command": "tes.popStash",
+          "when": "false"
+        },
+        {
+          "command": "tes.dropStash",
+          "when": "false"
+        }
+      ],
       "view/title": [
         {
           "command": "tes.openGraph",
@@ -260,6 +282,11 @@
           "group": "inline@5"
         },
         {
+          "command": "tes.pushBranch",
+          "when": "viewItem == branchItem",
+          "group": "1_branch@1"
+        },
+        {
           "command": "tes.openConflictStudio",
           "when": "viewItem == conflictItem",
           "group": "inline@1"
@@ -282,7 +309,7 @@
         "tes.binPath": {
           "type": "string",
           "default": "tes",
-          "scope": "application",
+          "scope": "machine-overridable",
           "description": "Path to the tes executable."
         }
       }
