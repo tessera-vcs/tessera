@@ -19,6 +19,9 @@ fi
 TES_DIR="$(cd "$(dirname "$TES_BIN")" && pwd)"
 TES_BIN="$TES_DIR/$(basename "$TES_BIN")"
 
+BREW_PREFIX="$(brew --prefix 2>/dev/null || { if [ -d /opt/homebrew ]; then echo /opt/homebrew; else echo /usr/local; fi; })"
+BREW_BIN="$BREW_PREFIX/bin"
+
 TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/tes-zsh-e2e.XXXXXX")"
 REMOTE_DIR="$TEST_ROOT/remote.git"
 APP_DIR="$TEST_ROOT/acme-platform"
@@ -32,8 +35,8 @@ git init --bare -b main "$REMOTE_DIR" >/dev/null
 echo "==> [Setup] Creating fresh real-world project at $APP_DIR"
 cd "$APP_DIR"
 git init -b main >/dev/null
-git config user.name "Donald Pakkies"
-git config user.email "donald@example.com"
+git config user.name "Tessera Test"
+git config user.email "test@tessera.getlunaris.dev"
 git remote add origin "$REMOTE_DIR"
 
 mkdir -p src test migrations
@@ -110,6 +113,11 @@ git push -u origin main >/dev/null
 
 echo "==> [AppleScript] Launching 3 real Terminal.app windows via osascript in $APP_DIR..."
 
+# Escapes metacharacters in sed replacement strings (`\`, `&`, `|`).
+escape_sed_replacement() {
+  printf '%s' "$1" | sed -e 's/[\\&|]/\\&/g'
+}
+
 # Executes a Zsh script inside a target Terminal.app window/tab via `osascript`
 # and blocks until its exit status is written to disk.
 run_in_terminal_tab() {
@@ -120,10 +128,16 @@ run_in_terminal_tab() {
   local wrapper_file="$LOG_DIR/${step_name}.wrapper.zsh"
   local status_file="$LOG_DIR/${step_name}.status"
   local out_file="$LOG_DIR/${step_name}.out"
+  local esc_app_dir esc_tes_dir esc_brew_bin
 
   rm -f "$status_file" "$out_file" "$wrapper_file"
-  sed -i '' "s|__APP_DIR__|$APP_DIR|g" "$cmd_file"
-  sed -i '' "s|__TES_DIR__|$TES_DIR|g" "$cmd_file"
+  esc_app_dir="$(escape_sed_replacement "$APP_DIR")"
+  esc_tes_dir="$(escape_sed_replacement "$TES_DIR")"
+  esc_brew_bin="$(escape_sed_replacement "$BREW_BIN")"
+
+  sed -i '' "s|__APP_DIR__|${esc_app_dir}|g" "$cmd_file"
+  sed -i '' "s|__TES_DIR__|${esc_tes_dir}|g" "$cmd_file"
+  sed -i '' "s|__BREW_BIN__|${esc_brew_bin}|g" "$cmd_file"
 
   cat > "$wrapper_file" <<WRAP
 _tes_step_fn() {
@@ -145,7 +159,7 @@ EOF
     sleep 0.2
     waited=$((waited + 1))
     if [ "$waited" -gt 150 ]; then
-      echo "❌ TIMEOUT waiting for step '$step_name' in window $window_id tab $tab_index"
+      echo "TIMEOUT waiting for step '$step_name' in window $window_id tab $tab_index" >&2
       cat "$out_file" 2>/dev/null || true
       exit 1
     fi
@@ -153,10 +167,11 @@ EOF
 
   local exit_code
   exit_code="$(cat "$status_file" | tr -d '[:space:]')"
-  echo "--- [$step_name] (Window $window_id, Tab $tab_index, Exit=$exit_code) ---"
+  echo "[$step_name] (Window $window_id, Tab $tab_index, Exit=$exit_code)"
   cat "$out_file"
+
   if [ "$exit_code" != "0" ]; then
-    echo "❌ Step '$step_name' failed with exit code $exit_code"
+    echo "Step '$step_name' failed with exit code $exit_code" >&2
     exit "$exit_code"
   fi
 }
@@ -196,9 +211,9 @@ trap cleanup_window EXIT
 sleep 1
 
 cat > "$LOG_DIR/init_env_config.zsh" << 'EOF'
-export PATH="__TES_DIR__:$HOME/.cargo/bin:$PATH"
+export PATH="__TES_DIR__:$HOME/.cargo/bin:__BREW_BIN__:$PATH"
 unset ANTIGRAVITY_AGENT ANTIGRAVITY_CONVERSATION_ID
-cd __APP_DIR__
+cd "__APP_DIR__"
 tes --version
 tes init
 eval "$(tes env --zsh)"
@@ -212,9 +227,9 @@ EOF
 run_in_terminal_tab "$WIN1" 1 "init_env_config" "$LOG_DIR/init_env_config.zsh"
 
 cat > "$LOG_DIR/tab2_setup.zsh" << 'EOF'
-export PATH="__TES_DIR__:$HOME/.cargo/bin:$PATH"
+export PATH="__TES_DIR__:$HOME/.cargo/bin:__BREW_BIN__:$PATH"
 unset ANTIGRAVITY_AGENT ANTIGRAVITY_CONVERSATION_ID
-cd __APP_DIR__
+cd "__APP_DIR__"
 eval "$(tes env --zsh)"
 _tes_precmd
 echo "Terminal 2 TES_SESSION_ID=$TES_SESSION_ID TES_BRANCH=$TES_BRANCH TES_PORT=$TES_PORT"
@@ -222,9 +237,9 @@ EOF
 run_in_terminal_tab "$WIN2" 1 "tab2_env" "$LOG_DIR/tab2_setup.zsh"
 
 cat > "$LOG_DIR/tab3_setup.zsh" << 'EOF'
-export PATH="__TES_DIR__:$HOME/.cargo/bin:$PATH"
+export PATH="__TES_DIR__:$HOME/.cargo/bin:__BREW_BIN__:$PATH"
 unset ANTIGRAVITY_AGENT ANTIGRAVITY_CONVERSATION_ID
-cd __APP_DIR__
+cd "__APP_DIR__"
 eval "$(tes env --zsh)"
 _tes_precmd
 echo "Terminal 3 TES_SESSION_ID=$TES_SESSION_ID TES_BRANCH=$TES_BRANCH TES_PORT=$TES_PORT"
@@ -233,7 +248,7 @@ run_in_terminal_tab "$WIN3" 1 "tab3_env" "$LOG_DIR/tab3_setup.zsh"
 
 cat > "$LOG_DIR/tab1_claim_edit.zsh" << 'EOF'
 set -e
-cd __APP_DIR__
+cd "__APP_DIR__"
 tes claim --branch main --intent "Add applyDiscount to pricing.ts" src/pricing.ts
 tes hook pre-tool --path src/pricing.ts
 cat >> src/pricing.ts << 'INNER'
@@ -250,7 +265,7 @@ run_in_terminal_tab "$WIN1" 1 "tab1_same_branch_edit" "$LOG_DIR/tab1_claim_edit.
 
 cat > "$LOG_DIR/tab2_claim_edit.zsh" << 'EOF'
 set -e
-cd __APP_DIR__
+cd "__APP_DIR__"
 tes claim --branch main --intent "Add calculateTax to pricing.ts" src/pricing.ts
 tes hook pre-tool --path src/pricing.ts
 cat >> src/pricing.ts << 'INNER'
@@ -261,9 +276,9 @@ export function calculateTax(cents: number, taxRatePercent: number): number {
 INNER
 tes hook post-tool --path src/pricing.ts
 tes status
-echo "--- Tab 2 isolated diff (should only show calculateTax): ---"
+echo "Tab 2 isolated diff (should only show calculateTax):"
 tes diff
-echo "--- Tab 2 --all diff (should show both applyDiscount and calculateTax): ---"
+echo "Tab 2 --all diff (should show both applyDiscount and calculateTax):"
 tes diff --all
 tes radar
 EOF
@@ -271,7 +286,7 @@ run_in_terminal_tab "$WIN2" 1 "tab2_same_branch_concurrent_merge" "$LOG_DIR/tab2
 
 cat > "$LOG_DIR/tab2_stash.zsh" << 'EOF'
 set -e
-cd __APP_DIR__
+cd "__APP_DIR__"
 tes claim --branch main --intent "Add calculateTax and update auth" src/pricing.ts src/auth.ts
 cat >> src/auth.ts << 'INNER'
 
@@ -281,33 +296,33 @@ export function isAdmin(token: SessionToken): boolean {
 INNER
 tes hook post-tool --path src/auth.ts
 
-echo "--- Path-scoped stash of only src/auth.ts ---"
+echo "Path-scoped stash of only src/auth.ts"
 tes stash push -m "WIP: admin helper in auth.ts" src/auth.ts
 tes stash list
 grep -q "calculateTax" src/pricing.ts && echo "✓ calculateTax still on disk"
 grep -q "applyDiscount" src/pricing.ts && echo "✓ peer applyDiscount still on disk"
 ! grep -q "isAdmin" src/auth.ts && echo "✓ stashed isAdmin removed from working tree"
 
-echo "--- Stash apply (keeps stash entry) & Stash drop ---"
+echo "Stash apply (keeps stash entry) & Stash drop"
 tes stash apply 0
 grep -q "isAdmin" src/auth.ts && echo "✓ isAdmin restored via stash apply"
 tes stash list
 tes stash drop 0
 tes stash list
 
-echo "--- Stash push & pop ---"
+echo "Stash push & pop"
 tes stash push -m "WIP: auth admin" src/auth.ts
 tes stash pop 0
 grep -q "isAdmin" src/auth.ts && echo "✓ isAdmin restored via stash pop"
 
-echo "--- Commit Tab 2 changes on main ---"
+echo "Commit Tab 2 changes on main"
 tes commit -m "feat(pricing,auth): add calculateTax and isAdmin"
 EOF
 run_in_terminal_tab "$WIN2" 1 "tab2_stash_and_commit" "$LOG_DIR/tab2_stash.zsh"
 
 cat > "$LOG_DIR/tab1_commit.zsh" << 'EOF'
 set -e
-cd __APP_DIR__
+cd "__APP_DIR__"
 tes status
 grep -q "applyDiscount" src/pricing.ts && echo "✓ Tab 1 applyDiscount still present"
 grep -q "calculateTax" src/pricing.ts && echo "✓ Tab 2 committed calculateTax also present"
@@ -318,7 +333,7 @@ run_in_terminal_tab "$WIN1" 1 "tab1_commit_after_peer" "$LOG_DIR/tab1_commit.zsh
 
 cat > "$LOG_DIR/tab2_branch_sandbox.zsh" << 'EOF'
 set -e
-cd __APP_DIR__
+cd "__APP_DIR__"
 tes switch feat/tier-pricing
 _tes_precmd
 echo "Tab 2 switched to: $TES_BRANCH (Workspace: $TES_WORKSPACE)"
@@ -353,7 +368,7 @@ run_in_terminal_tab "$WIN2" 1 "tab2_branch_sandbox_exec_rename" "$LOG_DIR/tab2_b
 
 cat > "$LOG_DIR/tab3_parallel_branch.zsh" << 'EOF'
 set -e
-cd __APP_DIR__
+cd "__APP_DIR__"
 tes switch feat/audit-log
 _tes_precmd
 echo "Tab 3 switched to: $TES_BRANCH"
@@ -371,14 +386,14 @@ tes hook post-tool --path src/auth.ts
 tes hook post-tool --path migrations/0002_audit.sql
 tes commit -m "feat(audit): add formatAuditActor and 0002_audit migration"
 
-echo "--- Cross-branch range diff main..feat/audit-log: ---"
+echo "Cross-branch range diff main..feat/audit-log:"
 tes diff main..feat/audit-log src/auth.ts
 EOF
 run_in_terminal_tab "$WIN3" 1 "tab3_parallel_branch_and_range_diff" "$LOG_DIR/tab3_parallel_branch.zsh"
 
 cat > "$LOG_DIR/tab1_merge_and_cherry_pick.zsh" << 'EOF'
 set -e
-cd __APP_DIR__
+cd "__APP_DIR__"
 ! grep -q "enterpriseTierPrice" src/pricing.ts && echo "✓ main working tree stayed clean while Tab 2 & Tab 3 committed to feature branches"
 
 tes switch -b feat/hotfix-currency
@@ -412,9 +427,9 @@ run_in_terminal_tab "$WIN1" 1 "tab1_cherry_pick_and_octopus_merge" "$LOG_DIR/tab
 
 cat > "$LOG_DIR/checkpoints_conflicts_restore_remote_mcp.zsh" << 'EOF'
 set -e
-cd __APP_DIR__
+cd "__APP_DIR__"
 
-echo "--- Checkpoint & Restore ---"
+echo "Checkpoint & Restore"
 tes checkpoint before-experiment
 echo "// experimental change" >> src/pricing.ts
 tes hook post-tool --path src/pricing.ts
@@ -425,7 +440,7 @@ if grep -q "experimental change" src/pricing.ts; then
 fi
 echo "✓ tes restore <path> discarded file change"
 
-echo "--- Overlapping Conflict Detection & Resolution ---"
+echo "Overlapping Conflict Detection & Resolution"
 tes claim --branch main --intent "Agent A changes formatCurrency prefix" --agent agent-conflict-a src/pricing.ts
 tes hook pre-tool --path src/pricing.ts --agent agent-conflict-a
 tes claim --branch main --intent "Agent B changes formatCurrency to EUR" --agent agent-conflict-b src/pricing.ts
@@ -443,7 +458,7 @@ node -e '
   const s = fs.readFileSync("src/pricing.ts", "utf8").replace("return `USD ${(cents / 100).toFixed(2)}`;", "return `EUR ${(cents / 100).toFixed(2)}`;");
   fs.writeFileSync("src/pricing.ts", s);
 '
-tes hook post-tool --path src/pricing.ts --agent agent-conflict-b || true
+tes hook post-tool --path src/pricing.ts --agent agent-conflict-b
 
 tes conflicts
 tes resolve src/pricing.ts --strategy ours
@@ -455,7 +470,7 @@ if ! grep -q "USD " src/pricing.ts; then
 fi
 echo "✓ committed USD resolution onto main"
 
-echo "--- Operation Log & Undo ---"
+echo "Operation Log & Undo"
 tes oplog -n 5
 tes undo
 if grep -q "USD " src/pricing.ts; then
@@ -465,19 +480,35 @@ fi
 echo "✓ tes undo rolled back commit cleanly"
 tes agent close agent-conflict-b || true
 
-echo "--- Push & Pull with Bare Remote ---"
+echo "Push & Pull with Bare Remote"
 tes push origin main
 tes pull origin main
 
-echo "--- Dynamic Tab Completion (tes complete) ---"
+echo "Dynamic Tab Completion (tes complete)"
 tes complete switch ""
 tes complete restore ""
 tes complete cherry-pick ""
 
-echo "--- MCP Server JSON-RPC 2.0 over stdio ---"
-printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}\n{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"status","arguments":{}}}\n{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"radar","arguments":{}}}\n' | tes mcp | head -n 10
+echo "MCP Server JSON-RPC 2.0 over stdio"
+MCP_OUT="$(printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}\n{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"status","arguments":{}}}\n{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"radar","arguments":{}}}\n' | tes mcp)"
+printf '%s\n' "$MCP_OUT" | node -e '
+  const assert = require("assert");
+  const lines = require("fs").readFileSync(0, "utf8").trim().split(/\r?\n/).filter(Boolean);
+  assert.strictEqual(lines.length, 4, `Expected 4 MCP JSON-RPC responses, got ${lines.length}`);
+  const resps = lines.map((line) => JSON.parse(line));
+  for (let i = 0; i < resps.length; i++) {
+    assert.strictEqual(resps[i].jsonrpc, "2.0", `Response ${i} missing jsonrpc 2.0`);
+    assert.strictEqual(resps[i].id, i + 1, `Response ${i} id mismatch`);
+  }
+  assert.strictEqual(resps[0].result.serverInfo.name, "tessera", "Unexpected MCP serverInfo.name");
+  assert(typeof resps[0].result.protocolVersion === "string" && resps[0].result.protocolVersion.length > 0, "Missing protocolVersion");
+  assert(Array.isArray(resps[1].result.tools) && resps[1].result.tools.length > 0, "Expected non-empty MCP tools list");
+  assert.strictEqual(resps[2].result.isError, false, "MCP status tool call failed");
+  assert.strictEqual(resps[3].result.isError, false, "MCP radar tool call failed");
+  console.log(`✓ MCP JSON-RPC 2.0 verified (${resps[1].result.tools.length} tools)`);
+'
 
-echo "--- Session Clear, Watch, GC, & Git Passthrough ---"
+echo "Session Clear, Watch, GC, & Git Passthrough"
 tes session clear
 tes watch --once
 tes gc
@@ -489,8 +520,8 @@ run_in_terminal_tab "$WIN1" 1 "full_lifecycle_conflicts_undo_remote_mcp_gc" "$LO
 osascript <<EOF
 tell application "Terminal"
   set t1 to contents of tab 1 of window id $WIN1
-  return "=== Terminal 1 Tail ===\n" & (text -400 thru -1 of t1)
+  return "Terminal 1 Tail:\n" & (text -400 thru -1 of t1)
 end tell
 EOF
 
-echo "✅ ALL REAL-WORLD APPLESCRIPT TERMINAL (ZSH) TESTS PASSED!"
+echo "ALL REAL-WORLD APPLESCRIPT TERMINAL (ZSH) TESTS PASSED!"

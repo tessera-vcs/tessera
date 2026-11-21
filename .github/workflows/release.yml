@@ -7,8 +7,11 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
-  actions: read
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -17,6 +20,9 @@ jobs:
   prepare:
     name: Verify CI & Resolve Version
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
     outputs:
       tag: ${{ steps.meta.outputs.tag }}
       version: ${{ steps.meta.outputs.version }}
@@ -30,32 +36,48 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          CARGO_VER="$(grep -m1 '^version =' src/Cargo.toml | cut -d'"' -f2)"
+          CARGO_VER="$(python3 -c 'import tomllib; print(tomllib.load(open("src/Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
           VSCODE_VER="$(node -p "require('./extensions/vscode/package.json').version")"
 
           if [ -z "$CARGO_VER" ]; then
-            echo "❌ Failed to extract workspace version from src/Cargo.toml"
+            echo "Failed to extract workspace version from src/Cargo.toml" >&2
             exit 1
           fi
 
           if [ "$CARGO_VER" != "$VSCODE_VER" ]; then
-            echo "❌ Version mismatch: src/Cargo.toml ($CARGO_VER) != extensions/vscode/package.json ($VSCODE_VER)"
+            echo "Version mismatch: src/Cargo.toml ($CARGO_VER) != extensions/vscode/package.json ($VSCODE_VER)" >&2
             exit 1
           fi
 
           TAG="v${CARGO_VER}"
           if [[ "${GITHUB_REF}" == refs/tags/v* ]] && [ "${GITHUB_REF_NAME}" != "$TAG" ]; then
-            echo "❌ Pushed git tag (${GITHUB_REF_NAME}) does not match src/Cargo.toml version ($TAG)"
+            echo "Pushed git tag (${GITHUB_REF_NAME}) does not match src/Cargo.toml version ($TAG)" >&2
             exit 1
           fi
 
-          PASSED_RUNS="$(gh api "/repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${GITHUB_SHA}&status=completed" --jq '.workflow_runs | map(select(.conclusion == "success")) | length')"
-          if [ "${PASSED_RUNS}" -lt 1 ]; then
-            echo "❌ Cannot release commit ${GITHUB_SHA}: no passed CI workflow run found for this commit."
+          RUN_IDS="$(gh api "/repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${GITHUB_SHA}&status=completed" --jq '.workflow_runs[] | select(.conclusion == "success") | .id')"
+          VERIFIED_RUST_RUN=""
+
+          for run_id in $RUN_IDS; do
+            RUST_PASSED="$(gh api --paginate "/repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/jobs" \
+              --jq '[.jobs[] | select((.name | startswith("Rust Lint & Test (")) and .conclusion == "success")] | length' \
+              | awk '{sum += $1} END {print sum + 0}')"
+            RUST_TOTAL="$(gh api --paginate "/repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/jobs" \
+              --jq '[.jobs[] | select(.name | startswith("Rust Lint & Test ("))] | length' \
+              | awk '{sum += $1} END {print sum + 0}')"
+
+            if [ "$RUST_PASSED" -ge 3 ] && [ "$RUST_PASSED" -eq "$RUST_TOTAL" ]; then
+              VERIFIED_RUST_RUN="$run_id"
+              break
+            fi
+          done
+
+          if [ -z "$VERIFIED_RUST_RUN" ]; then
+            echo "Cannot release commit ${GITHUB_SHA}: no completed CI run with passing rust-matrix jobs found for this commit." >&2
             exit 1
           fi
 
-          echo "✅ Verified passed CI run for ${GITHUB_SHA}. Releasing ${TAG}."
+          echo "Verified CI run ${VERIFIED_RUST_RUN} with passing rust-matrix jobs for ${GITHUB_SHA}. Releasing ${TAG}."
           echo "version=${CARGO_VER}" >> "$GITHUB_OUTPUT"
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
 
@@ -162,8 +184,9 @@ jobs:
           Copy-Item "src\target\${{ matrix.target }}\release\tes.exe" "stage\tes.exe"
           $zipName = "tes-${{ matrix.target }}.zip"
           Compress-Archive -Path "stage\tes.exe" -DestinationPath "dist\$zipName" -Force
-          $hash = (Get-FileHash -Path "dist\$zipName" -Algorithm SHA256).Hash.ToLower()
-          "$hash  $zipName" | Set-Content -Path "dist\$zipName.sha256" -Encoding ASCII
+          $hash = (Get-FileHash -Path "dist\$zipName" -Algorithm SHA256).Hash.ToLowerInvariant()
+          $shaPath = Join-Path (Resolve-Path "dist").Path "$zipName.sha256"
+          [System.IO.File]::WriteAllText($shaPath, "$hash  $zipName`n", [System.Text.UTF8Encoding]::new($false))
 
       - name: Verify Unix installer (install.sh)
         if: matrix.target == 'aarch64-apple-darwin' || matrix.target == 'x86_64-unknown-linux-musl'
@@ -270,7 +293,7 @@ jobs:
           mkdir -p ../../dist
           npm ci
           npm run compile
-          npx --yes @vscode/vsce package --no-dependencies -o ../../dist/tessera-vscode.vsix
+          npx --yes @vscode/vsce@4.1.1 package --no-dependencies -o ../../dist/tessera-vscode.vsix
           (cd ../../dist && sha256sum tessera-vscode.vsix > tessera-vscode.vsix.sha256)
 
       - name: Upload VSIX artifact
@@ -287,30 +310,36 @@ jobs:
       - build-bsd-binaries
       - build-vscode-extension
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: main
+          ref: ${{ github.sha }}
 
-      - name: Generate CHANGELOG.md
+      - name: Determine git-cliff arguments
+        id: cliff_args
+        run: |
+          TAG="${{ needs.prepare.outputs.tag }}"
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "args=--verbose --latest --strip header --output RELEASE_NOTES.md" >> "$GITHUB_OUTPUT"
+          else
+            echo "args=--verbose --unreleased --tag ${TAG} --strip header --output RELEASE_NOTES.md" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate release notes
         uses: orhun/git-cliff-action@v4
         with:
           config: cliff.toml
-          args: --verbose --tag "${{ needs.prepare.outputs.tag }}" --output CHANGELOG.md
+          args: ${{ steps.cliff_args.outputs.args }}
 
-      - name: Commit and push CHANGELOG.md
-        id: changelog_commit
+      - name: Ensure non-empty release notes
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add CHANGELOG.md
-          if ! git diff --cached --quiet; then
-            git commit -m "chore(release): update CHANGELOG.md for ${{ needs.prepare.outputs.tag }} [skip ci]"
-            git push origin main
+          if [ ! -s RELEASE_NOTES.md ]; then
+            printf 'Release %s\n' "${{ needs.prepare.outputs.tag }}" > RELEASE_NOTES.md
           fi
-          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Download all release artifacts
         uses: actions/download-artifact@v4
@@ -322,7 +351,11 @@ jobs:
         run: |
           (
             cd release-assets
-            cat *.sha256 > SHA256SUMS.txt
+            for f in *.sha256; do
+              tr -d '\r' < "$f" > "${f}.tmp"
+              mv "${f}.tmp" "$f"
+            done
+            LC_ALL=C cat *.sha256 > SHA256SUMS.txt
           )
           ls -lh release-assets
 
@@ -330,6 +363,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.prepare.outputs.tag }}
-          target_commitish: ${{ steps.changelog_commit.outputs.sha }}
-          generate_release_notes: true
+          target_commitish: ${{ github.sha }}
+          body_path: RELEASE_NOTES.md
           files: release-assets/*

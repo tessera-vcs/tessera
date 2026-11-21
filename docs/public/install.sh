@@ -6,6 +6,13 @@ REPO="${TES_GITHUB_REPO:-tessera-vcs/tessera}"
 VERSION="${TES_VERSION:-latest}"
 INSTALL_DIR="${TES_INSTALL_DIR:-$HOME/.local/bin}"
 
+if [ "$VERSION" != "latest" ]; then
+  case "$VERSION" in
+    v*) ;;
+    *) VERSION="v${VERSION}" ;;
+  esac
+fi
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -18,6 +25,17 @@ success() { printf "  ${GREEN}✔${RESET} %s\n" "$1"; }
 warn()    { printf "  ${YELLOW}⚠${RESET} %s\n" "$1"; }
 error()   { printf "  ${RED}✖${RESET} %s\n" "$1" >&2; }
 step()    { printf "\n${CYAN}[%s/3]${RESET} %s\n" "$1" "$2"; }
+
+has_bsd_ftp() {
+  case "$(uname -s)" in
+    FreeBSD|OpenBSD|NetBSD|Darwin)
+      command -v ftp >/dev/null 2>&1
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
 
 download_with_progress() {
   url="$1"
@@ -51,9 +69,12 @@ download_with_progress() {
     retries=3
     delay=2
     count=0
+    status_file="${dest}.status"
+    err_file="${dest}.err"
 
     while [ "$count" -lt "$retries" ]; do
       count=$((count + 1))
+      rm -f "$dest" "$status_file" "$err_file"
 
       if [ -n "$size_str" ]; then
         printf "  ${PURPLE}↓${RESET} %s... (0%% of %s)" "$label" "$size_str"
@@ -61,15 +82,27 @@ download_with_progress() {
         printf "  ${PURPLE}↓${RESET} %s... (0%%)" "$label"
       fi
 
-      curl -fL -# "$url" -o "$dest" 2>&1 | awk -v RS="$CR" '
-        /([0-9]+(\.[0-9]+)?%)/ {
-          match($0, /[0-9]+(\.[0-9]+)?%/)
-          if (RSTART > 0) {
-            print substr($0, RSTART, RLENGTH)
-            system("")
+      (
+        rc=0
+        curl -fL -# "$url" -o "$dest" 2>&1 || rc=$?
+        printf '%s\n' "$rc" > "$status_file"
+      ) | awk -v RS="$CR" -v errfile="$err_file" '
+        {
+          n = split($0, parts, "\n")
+          for (i = 1; i <= n; i++) {
+            line = parts[i]
+            if (match(line, /[0-9]+(\.[0-9]+)?%/)) {
+              print substr(line, RSTART, RLENGTH)
+              system("")
+            } else {
+              gsub(/^[ \t]+|[ \t]+$/, "", line)
+              if (length(line) > 0) {
+                print line >> errfile
+              }
+            }
           }
         }
-      ' | while read -r pct; do
+      ' | while IFS= read -r pct; do
         if [ -n "$size_str" ]; then
           printf "\r  ${PURPLE}↓${RESET} %s... (%s of %s)\033[K" "$label" "$pct" "$size_str"
         else
@@ -77,33 +110,55 @@ download_with_progress() {
         fi
       done
 
-      if [ -s "$dest" ]; then
+      curl_rc="$(cat "$status_file" 2>/dev/null || true)"
+      case "$curl_rc" in
+        ''|*[!0-9]*) curl_rc=1 ;;
+      esac
+
+      if [ "$curl_rc" -eq 0 ] && [ -s "$dest" ]; then
+        rm -f "$status_file" "$err_file"
+
         if [ -n "$size_str" ]; then
           printf "\r  ${GREEN}✔${RESET} %s (100%% of %s)\033[K\n" "$label" "$size_str"
         else
           printf "\r  ${GREEN}✔${RESET} %s (100%%)\033[K\n" "$label"
         fi
+
         return 0
       fi
 
-      printf "\r  ${YELLOW}⚠${RESET} %s (retrying %d/%d in %ds...)\033[K\n" "$label" "$count" "$retries" "$delay"
-      sleep "$delay"
+      rm -f "$dest"
+
+      if [ "$count" -lt "$retries" ]; then
+        printf "\r  ${YELLOW}⚠${RESET} %s (retrying %d/%d in %ds...)\033[K\n" "$label" "$count" "$retries" "$delay"
+        sleep "$delay"
+      fi
     done
 
     printf "\r  ${RED}✖${RESET} %s (failed after %d attempts)\033[K\n" "$label" "$retries" >&2
+
+    if [ -s "$err_file" ]; then
+      while IFS= read -r err_line; do
+        error "$err_line"
+      done < "$err_file"
+    fi
+
+    rm -f "$status_file" "$err_file"
     return 1
   elif command -v wget >/dev/null 2>&1; then
+    rm -f "$dest"
     printf "  ${PURPLE}↓${RESET} %s...\n" "$label"
     wget --show-progress -qO "$dest" "$url" 2>/dev/null || wget -qO "$dest" "$url"
     success "$label"
     return 0
-  elif command -v ftp >/dev/null 2>&1; then
+  elif has_bsd_ftp; then
+    rm -f "$dest"
     printf "  ${PURPLE}↓${RESET} %s...\n" "$label"
     ftp -o "$dest" "$url"
     success "$label"
     return 0
   else
-    error "curl, wget, or ftp is required."
+    error "curl or wget is required (or BSD ftp on BSD/macOS)."
     return 1
   fi
 }
@@ -111,11 +166,13 @@ download_with_progress() {
 download_quiet() {
   url="$1"
   dest="$2"
+  rm -f "$dest"
+
   if command -v curl >/dev/null 2>&1; then
     curl -fsSL "$url" -o "$dest"
   elif command -v wget >/dev/null 2>&1; then
     wget -qO "$dest" "$url"
-  elif command -v ftp >/dev/null 2>&1; then
+  elif has_bsd_ftp; then
     ftp -V -o "$dest" "$url"
   else
     return 1
@@ -148,9 +205,19 @@ case "$OS" in
     TARGET="${RUST_ARCH}-unknown-linux-musl"
     ;;
   FreeBSD)
+    if [ "$RUST_ARCH" = "aarch64" ]; then
+      error "Prebuilt binaries for aarch64 FreeBSD/OpenBSD are not yet published; build from source with cargo install"
+      exit 1
+    fi
+
     TARGET="${RUST_ARCH}-unknown-freebsd"
     ;;
   OpenBSD)
+    if [ "$RUST_ARCH" = "aarch64" ]; then
+      error "Prebuilt binaries for aarch64 FreeBSD/OpenBSD are not yet published; build from source with cargo install"
+      exit 1
+    fi
+
     TARGET="${RUST_ARCH}-unknown-openbsd"
     ;;
   *)
@@ -160,6 +227,7 @@ case "$OS" in
 esac
 
 ARCHIVE="tes-${TARGET}.tar.gz"
+
 if [ -n "${TES_BASE_URL:-}" ]; then
   BASE_URL="${TES_BASE_URL%/}"
   success "Target: ${TARGET}"
@@ -172,7 +240,22 @@ else
 fi
 
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/tes-install.XXXXXX")"
-trap 'rm -rf "$TMP_DIR"' EXIT
+STAGE_BIN=""
+
+cleanup() {
+  if [ -n "${STAGE_BIN:-}" ]; then
+    rm -f "$STAGE_BIN"
+  fi
+
+  if [ -n "${TMP_DIR:-}" ]; then
+    rm -rf "$TMP_DIR"
+  fi
+}
+
+trap cleanup EXIT
+trap 'cleanup; trap - INT; kill -INT $$' INT
+trap 'cleanup; trap - TERM; kill -TERM $$' TERM
+trap 'cleanup; trap - HUP; kill -HUP $$' HUP
 
 step "2" "Downloading & verifying archive..."
 
@@ -184,7 +267,19 @@ if [ "${TES_SKIP_CHECKSUM:-0}" != "1" ]; then
     exit 1
   fi
 
-  EXPECTED_HASH="$(awk '{print $1}' "${TMP_DIR}/${ARCHIVE}.sha256")"
+  EXPECTED_HASH="$(awk '{print $1; exit}' "${TMP_DIR}/${ARCHIVE}.sha256" | tr -d '\r[:space:]' | tr '[:upper:]' '[:lower:]')"
+  case "$EXPECTED_HASH" in
+    *[!0-9a-f]*)
+      error "Invalid SHA-256 checksum format in ${ARCHIVE}.sha256"
+      exit 1
+      ;;
+  esac
+
+  if [ "${#EXPECTED_HASH}" -ne 64 ]; then
+    error "Invalid SHA-256 checksum length in ${ARCHIVE}.sha256 (expected 64 hex chars, got ${#EXPECTED_HASH})"
+    exit 1
+  fi
+
   ACTUAL_HASH=""
   if command -v sha256sum >/dev/null 2>&1; then
     ACTUAL_HASH="$(sha256sum "${TMP_DIR}/${ARCHIVE}" | awk '{print $1}')"
@@ -195,6 +290,8 @@ if [ "${TES_SKIP_CHECKSUM:-0}" != "1" ]; then
   elif command -v cksum >/dev/null 2>&1; then
     ACTUAL_HASH="$(cksum -a sha256 -n "${TMP_DIR}/${ARCHIVE}" 2>/dev/null | awk '{print $1}')"
   fi
+
+  ACTUAL_HASH="$(printf '%s' "$ACTUAL_HASH" | tr -d '\r[:space:]' | tr '[:upper:]' '[:lower:]')"
 
   if [ -z "$ACTUAL_HASH" ]; then
     error "No SHA-256 verification tool (sha256sum, shasum, sha256, or cksum) found."
@@ -213,8 +310,12 @@ step "3" "Installing binary..."
 
 tar -xzf "${TMP_DIR}/${ARCHIVE}" -C "${TMP_DIR}"
 mkdir -p "${INSTALL_DIR}"
-cp "${TMP_DIR}/tes" "${INSTALL_DIR}/tes"
-chmod +x "${INSTALL_DIR}/tes"
+
+STAGE_BIN="${INSTALL_DIR}/.tes.tmp.$$"
+cp "${TMP_DIR}/tes" "${STAGE_BIN}"
+chmod 755 "${STAGE_BIN}"
+mv -f "${STAGE_BIN}" "${INSTALL_DIR}/tes"
+STAGE_BIN=""
 
 success "Installed tes to ${INSTALL_DIR}/tes"
 

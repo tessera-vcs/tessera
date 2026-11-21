@@ -46,10 +46,10 @@ cd "$REPO"
 git remote add origin "$REMOTE"
 "$TES_BIN" push -u origin main >/dev/null
 
-echo "=== Testing Shell Integrations (tes env) Across Installed Shells ==="
+echo "Testing Shell Integrations (tes env) Across Installed Shells"
 
 # Verifies that a POSIX-compatible shell properly evaluates `tes env` hooks
-# and updates `TES_BRANCH` across branch switches.
+# and that its `tes()` wrapper automatically updates `TES_BRANCH` across switches.
 test_posix_like_shell() {
   local sh_name="$1"
   local sh_bin="$2"
@@ -61,16 +61,18 @@ test_posix_like_shell() {
     export PATH=\"$TES_DIR:\$PATH\"
     cd \"$REPO\"
     eval \"\$(tes env $env_flag)\"
+    if [ \"\$TES_BRANCH\" != \"main\" ]; then
+      echo \"FAIL ($sh_name): expected initial TES_BRANCH=main, got \$TES_BRANCH\"
+      exit 1
+    fi
     tes switch \"$branch_name\" >/dev/null
-    eval \"\$(tes env)\"
     if [ \"\$TES_BRANCH\" != \"$branch_name\" ]; then
-      echo \"FAIL ($sh_name): expected TES_BRANCH=$branch_name, got \$TES_BRANCH\"
+      echo \"FAIL ($sh_name): tes() wrapper did not update TES_BRANCH to $branch_name, got \$TES_BRANCH\"
       exit 1
     fi
     tes switch main >/dev/null
-    eval \"\$(tes env)\"
     if [ \"\$TES_BRANCH\" != \"main\" ]; then
-      echo \"FAIL ($sh_name): expected TES_BRANCH=main, got \$TES_BRANCH\"
+      echo \"FAIL ($sh_name): tes() wrapper did not restore TES_BRANCH to main, got \$TES_BRANCH\"
       exit 1
     fi
   "
@@ -99,12 +101,20 @@ if command -v fish >/dev/null 2>&1; then
     set -gx PATH \"$TES_DIR\" \$PATH
     cd \"$REPO\"
     tes env --fish | source
+    if test \"\$TES_BRANCH\" != \"main\"
+      echo \"FAIL (fish): expected initial main, got \$TES_BRANCH\"
+      exit 1
+    end
     tes switch feat/shell-fish >/dev/null
     if test \"\$TES_BRANCH\" != \"feat/shell-fish\"
       echo \"FAIL (fish): expected feat/shell-fish, got \$TES_BRANCH\"
       exit 1
     end
     tes switch main >/dev/null
+    if test \"\$TES_BRANCH\" != \"main\"
+      echo \"FAIL (fish): expected main after switch back, got \$TES_BRANCH\"
+      exit 1
+    end
   "
   echo "     ✓ fish passed"
 fi
@@ -112,18 +122,27 @@ fi
 for csh_bin in tcsh csh; do
   if command -v "$csh_bin" >/dev/null 2>&1; then
     echo "  -> Testing $csh_bin ($(command -v "$csh_bin")) with --tcsh..."
-    "$csh_bin" -f -c "
-      setenv PATH \"${TES_DIR}:\${PATH}\"
-      cd \"$REPO\"
-      eval \"\`tes env --tcsh\`\"
-      tes switch feat/shell-${csh_bin} >/dev/null
-      eval \"\`tes env\`\"
-      if ( \"\$TES_BRANCH\" != \"feat/shell-${csh_bin}\" ) then
-        echo \"FAIL ($csh_bin): expected feat/shell-${csh_bin}, got \$TES_BRANCH\"
-        exit 1
-      endif
-      tes switch main >/dev/null
-    "
+    CSH_SCRIPT="$WORK_ROOT/test_${csh_bin}.csh"
+    cat << CSH_EOF > "$CSH_SCRIPT"
+setenv PATH "${TES_DIR}:\${PATH}"
+cd "$REPO"
+eval "\`tes env --tcsh\`"
+if ( "\$TES_BRANCH" != "main" ) then
+  echo "FAIL ($csh_bin): expected initial main, got \$TES_BRANCH"
+  exit 1
+endif
+tes switch feat/shell-${csh_bin}
+if ( "\$TES_BRANCH" != "feat/shell-${csh_bin}" ) then
+  echo "FAIL ($csh_bin): tes alias did not update TES_BRANCH to feat/shell-${csh_bin}, got \$TES_BRANCH"
+  exit 1
+endif
+tes switch main
+if ( "\$TES_BRANCH" != "main" ) then
+  echo "FAIL ($csh_bin): tes alias did not restore TES_BRANCH to main, got \$TES_BRANCH"
+  exit 1
+endif
+CSH_EOF
+    "$csh_bin" -f "$CSH_SCRIPT" >/dev/null
     echo "     ✓ $csh_bin passed"
   fi
 done
@@ -131,18 +150,35 @@ done
 if command -v nu >/dev/null 2>&1; then
   echo "  -> Testing nushell ($(command -v nu)) with --nu..."
   NU_HOOK="$WORK_ROOT/tes_hook.nu"
+  OUTSIDE_DIR="$WORK_ROOT/outside-repo"
+  mkdir -p "$OUTSIDE_DIR"
   "$TES_BIN" env --nu > "$NU_HOOK"
+
+  # Verify loading the Nushell hook outside any Git/Tessera repository does not crash.
+  nu -c "
+    \$env.PATH = (\$env.PATH | prepend \"$TES_DIR\")
+    cd \"$OUTSIDE_DIR\"
+    use \"$NU_HOOK\" *
+    if (\"TES_BRANCH\" in \$env) {
+      error make {msg: \"Unexpected TES_BRANCH outside a Tessera repo\"}
+    }
+  " >/dev/null
+
   nu -c "
     \$env.PATH = (\$env.PATH | prepend \"$TES_DIR\")
     cd \"$REPO\"
-    source \"$NU_HOOK\"
-    \$env.TES_SESSION_ID = \"term-nu-ci\"
-    ^tes switch feat/shell-nu
-    let info = (^tes env --json | from json)
-    if \$info.branch != \"feat/shell-nu\" {
-      error make {msg: \"Nushell branch mismatch\"}
+    use \"$NU_HOOK\" *
+    if \$env.TES_BRANCH != \"main\" {
+      error make {msg: \"Expected initial Nushell TES_BRANCH=main\"}
     }
-    ^tes switch main
+    tes switch feat/shell-nu
+    if \$env.TES_BRANCH != \"feat/shell-nu\" {
+      error make {msg: \"Nushell tes wrapper did not update TES_BRANCH to feat/shell-nu\"}
+    }
+    tes switch main
+    if \$env.TES_BRANCH != \"main\" {
+      error make {msg: \"Nushell tes wrapper did not restore TES_BRANCH to main\"}
+    }
   " >/dev/null
   echo "     ✓ nushell passed"
 fi
@@ -151,16 +187,22 @@ if command -v elvish >/dev/null 2>&1; then
   echo "  -> Testing elvish ($(command -v elvish)) with --elvish..."
   ELV_RC="$WORK_ROOT/tes_rc.elv"
   cat << ELV_EOF > "$ELV_RC"
-set paths = [$TES_DIR \$@paths]
+set paths = ["$TES_DIR" \$@paths]
 cd "$REPO"
 ELV_EOF
   "$TES_BIN" env --elvish >> "$ELV_RC"
   cat << 'ELV_EOF' >> "$ELV_RC"
+if (!=s $E:TES_BRANCH main) {
+  fail 'Elvish initial TES_BRANCH mismatch'
+}
 tes switch feat/shell-elvish >/dev/null
 if (!=s $E:TES_BRANCH feat/shell-elvish) {
-  fail 'Elvish TES_BRANCH mismatch'
+  fail 'Elvish TES_BRANCH mismatch after switch'
 }
 tes switch main >/dev/null
+if (!=s $E:TES_BRANCH main) {
+  fail 'Elvish TES_BRANCH mismatch after switch back to main'
+}
 ELV_EOF
   elvish "$ELV_RC"
   echo "     ✓ elvish passed"
@@ -178,11 +220,15 @@ if command -v pwsh >/dev/null 2>&1; then
       exit 1
     }
     tes switch main | Out-Null
+    if (\$env:TES_BRANCH -ne 'main') {
+      Write-Error \"Expected main, got \$env:TES_BRANCH\"
+      exit 1
+    }
   "
   echo "     ✓ pwsh passed"
 fi
 
-echo "=== Testing Concurrent Multi-Agent 3-Way AST Merge, Stash, Restore, & Cherry-Pick ==="
+echo "Testing Concurrent Multi-Agent 3-Way AST Merge, Stash, Restore, and Cherry-Pick"
 
 export TES_SESSION_ID="agent-alpha"
 "$TES_BIN" claim --branch feat/alpha --intent "Update alpha() and add gamma()" src/lib.rs >/dev/null
@@ -230,14 +276,40 @@ grep -q "pub fn delta()" "$REPO/src/lib.rs"
 
 echo "// temporary wip comment" >> "$REPO/src/lib.rs"
 "$TES_BIN" stash push -m "wip comment" >/dev/null
+
 if grep -q "temporary wip comment" "$REPO/src/lib.rs"; then
-  echo "❌ Stash push did not revert working tree"
+  echo "FAIL: Stash push did not revert working tree"
   exit 1
 fi
+
 "$TES_BIN" stash pop >/dev/null
 grep -q "temporary wip comment" "$REPO/src/lib.rs"
 "$TES_BIN" restore src/lib.rs >/dev/null
 
+export TES_SESSION_ID="agent-cherry"
+"$TES_BIN" claim --branch feat/hotfix --intent "Add epsilon() helper" src/lib.rs >/dev/null
+cat << 'EOF' >> "$REPO/src/lib.rs"
+
+pub fn epsilon() -> i32 {
+    500
+}
+EOF
+"$TES_BIN" hook post-tool --path src/lib.rs
+"$TES_BIN" commit -m "feat(hotfix): add epsilon helper" >/dev/null
+HOTFIX_SHA="$(git rev-parse refs/heads/feat/hotfix)"
+
+export TES_SESSION_ID="editor"
+"$TES_BIN" switch main >/dev/null
+
+if grep -q "pub fn epsilon()" "$REPO/src/lib.rs"; then
+  echo "FAIL: main unexpectedly contained epsilon() before cherry-pick"
+  exit 1
+fi
+
+"$TES_BIN" cherry-pick "$HOTFIX_SHA" >/dev/null
+grep -q "pub fn epsilon()" "$REPO/src/lib.rs"
+"$TES_BIN" branch -D feat/hotfix >/dev/null
+
 git fsck --full
 
-echo "✅ ALL CROSS-PLATFORM MULTI-SHELL & LIFECYCLE E2E TESTS PASSED!"
+echo "ALL CROSS-PLATFORM MULTI-SHELL & LIFECYCLE E2E TESTS PASSED!"
