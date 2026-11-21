@@ -3266,3 +3266,108 @@ fn sync_all_agents_skips_unchanged_and_does_not_clobber_concurrent_edits() {
     assert!(applied.claimed_symbols.contains("b.rs::concurrent_sym"));
     assert_eq!(applied.read_blobs.get("extra.rs"), Some(&new_a_blob));
 }
+
+#[test]
+fn gc_prunes_orphaned_sandboxes_sidecars_and_dead_leases_while_preserving_active_ones() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    fs::write(root.join("lib.rs"), "pub fn base() -> i32 { 1 }\n").expect("write lib.rs");
+
+    let (coord, _) = Coordinator::init_repo(root).expect("init_repo");
+    let (_, main_ws, _) = coord
+        .prepare_branch_sandbox("term-main", Some("main"))
+        .expect("prepare main sandbox");
+    assert!(main_ws.is_dir(), "main sandbox should exist");
+
+    let branches_root = coord.branches_root();
+    let orphan_idle = branches_root.join("legacy-orphan-branch");
+    let orphan_live = branches_root.join("legacy-live-branch");
+    fs::create_dir_all(&orphan_idle).expect("mkdir orphan_idle");
+    fs::write(orphan_idle.join("stale.txt"), b"old").expect("write stale.txt");
+    fs::write(branches_root.join("legacy-orphan-branch.slot"), b"9").expect("write orphan slot");
+    fs::write(
+        branches_root.join("legacy-orphan-branch.tree"),
+        b"0000000000000000000000000000000000000000",
+    )
+    .expect("write orphan tree");
+    fs::write(
+        branches_root.join("legacy-orphan-branch.pending-merge"),
+        b"1",
+    )
+    .expect("write orphan pending-merge");
+
+    fs::create_dir_all(&orphan_live).expect("mkdir orphan_live");
+    fs::write(branches_root.join("legacy-live-branch.slot"), b"10").expect("write live slot");
+
+    let leases_dir = coord.sandboxes_root().join("bin").join(".leases");
+    let dead_lease = leases_dir.join("3999");
+    let live_lease = leases_dir.join("3998");
+    fs::create_dir_all(&dead_lease).expect("mkdir dead_lease");
+    fs::write(dead_lease.join("pid"), b"99999999").expect("write dead pid");
+    fs::write(
+        dead_lease.join("workspace"),
+        orphan_idle.display().to_string(),
+    )
+    .expect("write dead ws");
+    fs::write(leases_dir.join("3999.lock"), b"").expect("write non-numeric lock file");
+
+    fs::create_dir_all(&live_lease).expect("mkdir live_lease");
+    fs::write(live_lease.join("pid"), std::process::id().to_string()).expect("write live pid");
+    fs::write(
+        live_lease.join("workspace"),
+        orphan_live.display().to_string(),
+    )
+    .expect("write live ws");
+
+    // Dry-run must preview everything without deleting any file or directory.
+    let preview = coord.gc(true).expect("gc dry-run");
+    assert!(preview.dry_run);
+    assert_eq!(preview.pruned_sandboxes, vec!["legacy-orphan-branch"]);
+    assert_eq!(
+        preview.pruned_sidecars,
+        vec![
+            "legacy-orphan-branch.pending-merge",
+            "legacy-orphan-branch.slot",
+            "legacy-orphan-branch.tree",
+        ]
+    );
+    assert_eq!(preview.pruned_dead_leases, vec!["3999"]);
+    assert_eq!(preview.skipped_active_sandboxes, vec!["legacy-live-branch"]);
+    assert!(orphan_idle.is_dir(), "dry-run must not delete orphan_idle");
+    assert!(dead_lease.is_dir(), "dry-run must not delete dead_lease");
+
+    // Real gc must prune idle orphan + sidecars + dead lease while keeping live-leased & real sandboxes.
+    let report = coord.gc(false).expect("gc apply");
+    assert!(!report.dry_run);
+    assert_eq!(report.pruned_sandboxes, vec!["legacy-orphan-branch"]);
+    assert_eq!(
+        report.pruned_sidecars,
+        vec![
+            "legacy-orphan-branch.pending-merge",
+            "legacy-orphan-branch.slot",
+            "legacy-orphan-branch.tree",
+        ]
+    );
+    assert_eq!(report.pruned_dead_leases, vec!["3999"]);
+    assert_eq!(report.skipped_active_sandboxes, vec!["legacy-live-branch"]);
+
+    assert!(!orphan_idle.exists(), "orphan_idle must be removed");
+    assert!(!branches_root.join("legacy-orphan-branch.slot").exists());
+    assert!(!branches_root.join("legacy-orphan-branch.tree").exists());
+    assert!(
+        !branches_root
+            .join("legacy-orphan-branch.pending-merge")
+            .exists()
+    );
+    assert!(!dead_lease.exists(), "dead_lease must be removed");
+    assert!(
+        leases_dir.join("3999.lock").is_file(),
+        "lock files must not be deleted"
+    );
+    assert!(
+        orphan_live.is_dir() && branches_root.join("legacy-live-branch.slot").is_file(),
+        "orphan sandbox with live lease must be preserved"
+    );
+    assert!(live_lease.is_dir(), "live lease must be preserved");
+    assert!(main_ws.is_dir(), "known branch sandbox must be preserved");
+}

@@ -2573,6 +2573,96 @@ fn binary_conflict_symlink_worktree_and_gc_undo_integrity_e2e() {
     let gc_out = repo.tes("gc-agent", &["gc", "--json"]);
     let gc_json: serde_json::Value = serde_json::from_str(&gc_out).expect("gc json");
     assert!(gc_json["compacted_operations"].is_u64(), "{gc_json}");
+    assert_eq!(gc_json["dry_run"], false, "{gc_json}");
+    assert!(gc_json["pruned_sandboxes"].is_array(), "{gc_json}");
+
+    // Seed an orphaned sandbox + dead port lease under the exact sandboxes root used by `tes`,
+    // confirm `tes doctor` suggests `tes gc`, confirm `tes gc --dry-run` preserves them, then
+    // `tes gc` cleans them so `tes doctor` passes cleanly.
+    let doc_probe_raw = repo.tes("gc-agent", &["doctor", "--json"]);
+    let doc_probe: serde_json::Value =
+        serde_json::from_str(&doc_probe_raw).expect("doctor probe json");
+    let sandboxes_root = PathBuf::from(
+        doc_probe["checks"]
+            .as_array()
+            .expect("checks array")
+            .iter()
+            .find(|c| c["id"] == "cow_strategy")
+            .and_then(|c| c["details"]["probe_root"].as_str())
+            .expect("cow_strategy probe_root"),
+    );
+    let orphan_dir = sandboxes_root.join("branches").join("stale-legacy-sandbox");
+    fs::create_dir_all(&orphan_dir).expect("mkdir orphan_dir");
+    fs::write(
+        sandboxes_root
+            .join("branches")
+            .join("stale-legacy-sandbox.slot"),
+        b"7",
+    )
+    .expect("write orphan slot");
+    let dead_lease_dir = sandboxes_root.join("bin").join(".leases").join("3987");
+    fs::create_dir_all(&dead_lease_dir).expect("mkdir dead lease");
+    fs::write(dead_lease_dir.join("pid"), b"99999999").expect("write dead pid");
+
+    let doc_warn_raw = repo.tes("gc-agent", &["doctor", "--json"]);
+    let doc_warn: serde_json::Value =
+        serde_json::from_str(&doc_warn_raw).expect("doctor warn json");
+    let rt_check = doc_warn["checks"]
+        .as_array()
+        .expect("checks array")
+        .iter()
+        .find(|c| c["id"] == "sandboxes_leases_conflicts")
+        .expect("sandboxes_leases_conflicts check");
+    assert_eq!(rt_check["status"], "warn", "{rt_check}");
+    assert!(
+        rt_check["summary"]
+            .as_str()
+            .unwrap_or("")
+            .contains("run 'tes gc' to clean up"),
+        "doctor warning should guide user to tes gc: {rt_check}"
+    );
+
+    let dry_out = repo.tes("gc-agent", &["gc", "--dry-run", "--json"]);
+    let dry_json: serde_json::Value = serde_json::from_str(&dry_out).expect("gc dry-run json");
+    assert_eq!(dry_json["dry_run"], true, "{dry_json}");
+    assert_eq!(
+        dry_json["pruned_sandboxes"],
+        serde_json::json!(["stale-legacy-sandbox"]),
+        "{dry_json}"
+    );
+    assert_eq!(
+        dry_json["pruned_dead_leases"],
+        serde_json::json!(["3987"]),
+        "{dry_json}"
+    );
+    assert!(orphan_dir.is_dir(), "gc --dry-run must keep orphan_dir");
+    assert!(dead_lease_dir.is_dir(), "gc --dry-run must keep dead_lease");
+
+    let apply_out = repo.tes("gc-agent", &["gc", "--json"]);
+    let apply_json: serde_json::Value = serde_json::from_str(&apply_out).expect("gc apply json");
+    assert_eq!(
+        apply_json["pruned_sandboxes"],
+        serde_json::json!(["stale-legacy-sandbox"]),
+        "{apply_json}"
+    );
+    assert_eq!(
+        apply_json["pruned_dead_leases"],
+        serde_json::json!(["3987"]),
+        "{apply_json}"
+    );
+    assert!(!orphan_dir.exists(), "gc must delete orphan_dir");
+    assert!(!dead_lease_dir.exists(), "gc must delete dead_lease");
+
+    let doc_clean_raw = repo.tes("gc-agent", &["doctor", "--json"]);
+    let doc_clean: serde_json::Value =
+        serde_json::from_str(&doc_clean_raw).expect("doctor clean json");
+    let rt_clean = doc_clean["checks"]
+        .as_array()
+        .expect("checks array")
+        .iter()
+        .find(|c| c["id"] == "sandboxes_leases_conflicts")
+        .expect("sandboxes_leases_conflicts check");
+    assert_eq!(rt_clean["status"], "pass", "{rt_clean}");
 
     repo.tes("gc-agent", &["undo"]);
     assert_eq!(

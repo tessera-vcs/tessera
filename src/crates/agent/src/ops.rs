@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -19,11 +20,11 @@ use workspace::{
 use crate::merge::apply_co_author_trailer;
 use crate::worktree::{
     acquire_file_lock, is_binary_bytes, is_harness_config_path, remove_worktree_file,
-    write_worktree_file, write_worktree_file_checked, write_worktree_rel,
+    same_canonical_path, write_worktree_file, write_worktree_file_checked, write_worktree_rel,
 };
 use crate::{
-    CherryPickReport, Coordinator, DeleteBranchReport, LogEntry, PullReport, RenameBranchReport,
-    RestoreReport, StashPopReport,
+    CherryPickReport, Coordinator, DeleteBranchReport, GcReport, LogEntry, PullReport,
+    RenameBranchReport, RestoreReport, StashPopReport,
 };
 
 /// Process-local monotonic counter guaranteeing unique stash IDs even within the same millisecond.
@@ -2467,6 +2468,196 @@ impl Coordinator {
             new_commit_id,
             conflicts: outcome.conflicts,
             touched_paths: touched_paths.into_iter().collect(),
+        })
+    }
+
+    /// Compacts ephemeral micro-snapshot operations in `.git/tessera/oplog/` and prunes orphaned
+    /// branch sandboxes, stale sandbox sidecar metadata (`.slot`, `.tree`, `.pending-merge`), and
+    /// dead port leases whose owning PID is no longer alive.
+    ///
+    /// When `dry_run` is `true`, computes and returns the complete [`GcReport`] without modifying
+    /// any Operation Log files, sandboxes, sidecars, or port leases. Orphaned sandboxes that still
+    /// host a live leased process or an active session workspace are skipped and reported in
+    /// [`GcReport::skipped_active_sandboxes`].
+    ///
+    /// # Errors
+    /// Returns [`CoreError`] if Operation Log compaction or configuration loading fails.
+    pub fn gc(&self, dry_run: bool) -> CoreResult<GcReport> {
+        let compacted_operations = self.oplog.gc_compact_with_options(dry_run)?;
+        let cfg = self.oplog.load_config()?;
+        let current = self.oplog.load_current_reconciled()?;
+
+        let mut known_safe_branches: BTreeSet<String> = BTreeSet::new();
+        known_safe_branches.insert(Self::sanitize_branch_name(&cfg.trunk_branch));
+
+        if let Ok(head_br) = self.git.current_branch_name() {
+            known_safe_branches.insert(Self::sanitize_branch_name(&head_br));
+        }
+
+        for br in self.git.list_local_branches() {
+            known_safe_branches.insert(Self::sanitize_branch_name(&br));
+        }
+
+        for br in current.view.branches.keys() {
+            known_safe_branches.insert(Self::sanitize_branch_name(br));
+        }
+
+        let mut active_workspace_paths: Vec<PathBuf> = Vec::new();
+
+        for agent in current.view.agents.values() {
+            if let Some(tb) = &agent.target_branch {
+                known_safe_branches.insert(Self::sanitize_branch_name(tb));
+            }
+
+            if let Some(ws) = &agent.workspace_path {
+                active_workspace_paths.push(PathBuf::from(ws));
+            }
+        }
+
+        let mut live_lease_workspaces: Vec<PathBuf> = Vec::new();
+        let mut pruned_dead_leases: Vec<String> = Vec::new();
+        let leases_dir = self.sandboxes_root().join("bin").join(".leases");
+
+        if let Ok(entries) = fs::read_dir(&leases_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+
+                if !path.is_dir() {
+                    continue;
+                }
+
+                let Some(port_name) = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .filter(|s| s.parse::<u16>().is_ok())
+                    .map(ToString::to_string)
+                else {
+                    continue;
+                };
+
+                let pid_opt = fs::read_to_string(path.join("pid"))
+                    .ok()
+                    .and_then(|raw| raw.trim().parse::<i32>().ok());
+                let alive = pid_opt.is_some_and(crate::session::is_process_alive);
+
+                if alive {
+                    if let Ok(ws_raw) = fs::read_to_string(path.join("workspace")) {
+                        let trimmed = ws_raw.trim();
+
+                        if !trimmed.is_empty() {
+                            live_lease_workspaces.push(PathBuf::from(trimmed));
+                        }
+                    }
+
+                    continue;
+                }
+
+                if dry_run || fs::remove_dir_all(&path).is_ok() {
+                    pruned_dead_leases.push(port_name);
+                }
+            }
+        }
+
+        let mut pruned_sandboxes: Vec<String> = Vec::new();
+        let mut pruned_sidecars: Vec<String> = Vec::new();
+        let mut skipped_active_sandboxes: Vec<String> = Vec::new();
+        let branches_root = self.branches_root();
+
+        if let Ok(entries) = fs::read_dir(&branches_root) {
+            let mut dir_entries: Vec<(String, PathBuf)> = Vec::new();
+            let mut file_entries: Vec<(String, PathBuf)> = Vec::new();
+
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Some(name) = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(ToString::to_string)
+                else {
+                    continue;
+                };
+
+                if path.is_dir() {
+                    dir_entries.push((name, path));
+                } else if path.is_file() {
+                    file_entries.push((name, path));
+                }
+            }
+
+            let mut skipped_set: BTreeSet<String> = BTreeSet::new();
+            let locks_dir = self.git.common_git_dir().join("tessera").join("locks");
+
+            for (name, path) in dir_entries {
+                if known_safe_branches.contains(&name) {
+                    continue;
+                }
+
+                let has_live_process = live_lease_workspaces
+                    .iter()
+                    .chain(active_workspace_paths.iter())
+                    .any(|ws| same_canonical_path(&path, ws));
+
+                if has_live_process {
+                    skipped_set.insert(name.clone());
+                    skipped_active_sandboxes.push(name);
+                    continue;
+                }
+
+                if dry_run {
+                    pruned_sandboxes.push(name);
+                } else {
+                    let lock_path = locks_dir.join(format!("sandbox-{name}.lock"));
+                    let _sandbox_lock = acquire_file_lock(&lock_path).ok();
+
+                    if fs::remove_dir_all(&path).is_ok() {
+                        pruned_sandboxes.push(name);
+                    }
+                }
+            }
+
+            let slots_lock_path = self.git.common_git_dir().join("tessera").join("slots.lock");
+
+            for (fname, path) in file_entries {
+                let (stem, is_slot) = if let Some(s) = fname.strip_suffix(".slot") {
+                    (s, true)
+                } else if let Some(s) = fname.strip_suffix(".tree") {
+                    (s, false)
+                } else if let Some(s) = fname.strip_suffix(".pending-merge") {
+                    (s, false)
+                } else {
+                    continue;
+                };
+
+                if known_safe_branches.contains(stem) || skipped_set.contains(stem) {
+                    continue;
+                }
+
+                if dry_run {
+                    pruned_sidecars.push(fname);
+                } else if is_slot {
+                    let _slot_lock = acquire_file_lock(&slots_lock_path).ok();
+
+                    if fs::remove_file(&path).is_ok() {
+                        pruned_sidecars.push(fname);
+                    }
+                } else if fs::remove_file(&path).is_ok() {
+                    pruned_sidecars.push(fname);
+                }
+            }
+        }
+
+        pruned_sandboxes.sort();
+        pruned_sidecars.sort();
+        pruned_dead_leases.sort();
+        skipped_active_sandboxes.sort();
+
+        Ok(GcReport {
+            dry_run,
+            compacted_operations,
+            pruned_sandboxes,
+            pruned_sidecars,
+            pruned_dead_leases,
+            skipped_active_sandboxes,
         })
     }
 }

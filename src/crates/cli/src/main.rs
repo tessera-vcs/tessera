@@ -348,7 +348,7 @@ fn run_cli() -> anyhow::Result<()> {
             branch,
             agent,
         } => run_restore(&ctx, targets, source, branch, agent),
-        Commands::Gc => run_gc(&ctx),
+        Commands::Gc { dry_run } => run_gc(&ctx, dry_run),
         Commands::Watch {
             agent,
             interval_ms,

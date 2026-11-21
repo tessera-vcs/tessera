@@ -440,8 +440,12 @@ pub enum Commands {
         agent: Option<String>,
     },
 
-    /// Compact ephemeral working-copy micro-snapshots in `.git/tessera/oplog/`.
-    Gc,
+    /// Compact ephemeral micro-snapshots and prune orphaned sandboxes and dead port leases.
+    Gc {
+        /// Preview what would be compacted and pruned without deleting any files.
+        #[arg(short = 'n', long)]
+        dry_run: bool,
+    },
 
     /// Continuously watch the working tree and auto-reconcile edits for hookless editors/harnesses.
     Watch {

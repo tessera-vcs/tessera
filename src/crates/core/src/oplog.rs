@@ -1431,6 +1431,18 @@ impl OpLogStore {
     /// # Errors
     /// Returns [`CoreError::Io`] on filesystem traversal or lock failure.
     pub fn gc_compact(&self) -> CoreResult<usize> {
+        self.gc_compact_with_options(false)
+    }
+
+    /// Compacts (or previews when `dry_run` is `true`) ephemeral micro-snapshots in
+    /// `.git/tessera/oplog/` under `oplog.lock`, keeping all active `op_heads`, root operation,
+    /// non-ephemeral operations, and checkpoint targets.
+    ///
+    /// Returns the number of ephemeral operation records removed (or eligible under `dry_run`).
+    ///
+    /// # Errors
+    /// Returns [`CoreError::Io`] on filesystem traversal or lock failure.
+    pub fn gc_compact_with_options(&self, dry_run: bool) -> CoreResult<usize> {
         let _lock = self.acquire_lock()?;
         let head = self.load_current_reconciled_unlocked()?;
         let active_heads = self.list_op_heads()?;
@@ -1486,8 +1498,8 @@ impl OpLogStore {
             .map(|(id, _)| id.clone())
             .collect();
 
-        if to_remove.is_empty() {
-            return Ok(0);
+        if to_remove.is_empty() || dry_run {
+            return Ok(to_remove.len());
         }
 
         let mut compacted_map = self.load_compacted_parents();

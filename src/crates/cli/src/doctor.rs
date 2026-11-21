@@ -545,10 +545,16 @@ pub fn collect_doctor_report(cwd: &Path) -> Value {
             || !dead_port_leases.is_empty()
             || active_conflicts_count > 0
         {
+            let gc_hint = if !orphaned_sandboxes.is_empty() || !dead_port_leases.is_empty() {
+                " (run 'tes gc' to clean up)"
+            } else {
+                ""
+            };
+
             (
                 "warn",
                 format!(
-                    "{} orphaned sandbox(es), {} dead port lease(s), {} active conflict(s)",
+                    "{} orphaned sandbox(es), {} dead port lease(s), {} active conflict(s){gc_hint}",
                     orphaned_sandboxes.len(),
                     dead_port_leases.len(),
                     active_conflicts_count
