@@ -281,6 +281,14 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate extension CHANGELOG.md
+        uses: orhun/git-cliff-action@v4
+        with:
+          config: extensions/vscode/cliff.toml
+          args: --verbose --include-path "extensions/vscode/**" --tag "${{ needs.prepare.outputs.tag }}" --output extensions/vscode/CHANGELOG.md
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -325,14 +333,20 @@ jobs:
           config: cliff.toml
           args: --verbose --tag "${{ needs.prepare.outputs.tag }}" --output CHANGELOG.md
 
-      - name: Commit and push CHANGELOG.md
+      - name: Generate extension CHANGELOG.md
+        uses: orhun/git-cliff-action@v4
+        with:
+          config: extensions/vscode/cliff.toml
+          args: --verbose --include-path "extensions/vscode/**" --tag "${{ needs.prepare.outputs.tag }}" --output extensions/vscode/CHANGELOG.md
+
+      - name: Commit and push changelogs
         id: changelog_commit
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add CHANGELOG.md
+          git add CHANGELOG.md extensions/vscode/CHANGELOG.md
           if ! git diff --cached --quiet; then
-            git commit -m "chore(release): update CHANGELOG.md for ${{ needs.prepare.outputs.tag }} [skip ci]"
+            git commit -m "chore(release): update changelogs for ${{ needs.prepare.outputs.tag }} [skip ci]"
             git push origin main
           fi
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
