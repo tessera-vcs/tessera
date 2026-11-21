@@ -1,4 +1,4 @@
-# Tessera for VS Code & Antigravity IDE
+# Tessera
 
 Visual branch management, multi-agent line attribution, 2D commit graph, and 3-way AST conflict resolution for repositories initialized with [Tessera (`tes`)](https://tessera.getlunaris.dev).
 
