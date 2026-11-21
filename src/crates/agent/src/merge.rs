@@ -641,11 +641,19 @@ impl Coordinator {
             materialize_tree_to_dir(&self.git, &acc_tree, &verify_dir)?;
             let pkg_csv = affected_packages.join(",");
 
-            let mut verify_proc = if cfg!(windows) {
+            #[cfg(windows)]
+            let mut verify_proc = {
+                use std::os::windows::process::CommandExt;
+
+                // `/S /C "..."` strips only the outer quotes and passes `cmd_str` verbatim via
+                // `raw_arg` so Rust's `cmd.exe` escaping does not break quotes, `&&`, or `>`.
                 let mut c = Command::new("cmd");
-                c.args(["/C", cmd_str]);
+                c.args(["/S", "/C"]).raw_arg(format!("\"{cmd_str}\""));
                 c
-            } else {
+            };
+
+            #[cfg(not(windows))]
+            let mut verify_proc = {
                 let mut c = Command::new("sh");
                 c.args(["-c", cmd_str]);
                 c

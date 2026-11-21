@@ -3037,11 +3037,12 @@ fn merge_agents_with_options_preserves_concurrent_peer_edits_during_verify() {
     );
 
     #[cfg(windows)]
-    let verify_cmd = format!(
-        "type nul > \"{}\" && powershell -NoProfile -NonInteractive -Command \"while (-not (Test-Path -LiteralPath '{}')) {{ Start-Sleep -Milliseconds 20 }}\"",
-        started_flag.display(),
-        done_flag.display()
-    );
+    let verify_cmd = {
+        let script_path = sync_tmp.path().join("verify.cmd");
+        let cmd_body = "@echo off\r\necho ok > \"%~dp0verify_started\"\r\n:wait\r\nif exist \"%~dp0peer_done\" exit /b 0\r\nping -n 2 127.0.0.1 >nul\r\ngoto wait\r\n";
+        fs::write(&script_path, cmd_body).expect("write verify.cmd");
+        format!("call \"{}\"", script_path.display())
+    };
 
     let report = std::thread::scope(|s| {
         let root_ref = root;
