@@ -29,7 +29,7 @@ The `tes` CLI provides commands for initializing repositories, coordinating mult
 | [tes oplog](/cli/oplog) | Inspect the content-addressed Operation Log history |
 | [tes undo](/cli/undo) | Undo the most recent operation or roll back to a specific operation ID or checkpoint |
 | [tes sync](/cli/sync) | Auto-rebase all active sessions onto the latest trunk commit |
-| [tes gc](/cli/gc) | Compact ephemeral micro-snapshot operations in `.git/tessera/oplog/` |
+| [tes gc](/cli/gc) | Compact ephemeral micro-snapshots and prune orphaned sandboxes and dead port leases (`--dry-run`) |
 | [tes watch](/cli/watch) | Watch the working tree and auto-reconcile edits for hookless editors or harnesses |
 | [tes agent](/cli/agent) (`session`) | Spawn, list, focus (`tes session focus <id>`), exec, close, or clear sessions |
 | [tes config](/cli/config) | View or update repository configuration settings and trust (`tessera.toml`) |

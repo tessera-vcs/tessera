@@ -259,6 +259,23 @@ pub struct LogEntry {
     pub refs: Vec<String>,
 }
 
+/// Summary returned by `tes gc` ([`Coordinator::gc`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GcReport {
+    /// Whether garbage collection ran in preview mode (`--dry-run`) without modifying files.
+    pub dry_run: bool,
+    /// Number of ephemeral micro-snapshot operations compacted (or eligible under `--dry-run`).
+    pub compacted_operations: usize,
+    /// Orphaned branch sandbox directories pruned (or eligible under `--dry-run`).
+    pub pruned_sandboxes: Vec<String>,
+    /// Orphaned sandbox sidecar files (`.slot`, `.tree`, `.pending-merge`) pruned (or eligible).
+    pub pruned_sidecars: Vec<String>,
+    /// Dead port lease directories (`<sandboxes_root>/bin/.leases/<port>`) pruned (or eligible).
+    pub pruned_dead_leases: Vec<String>,
+    /// Orphaned sandbox directories skipped because a live process still holds a lease or session in them.
+    pub skipped_active_sandboxes: Vec<String>,
+}
+
 /// Strategy for resolving a first-class conflict via `tes resolve`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResolveStrategy {

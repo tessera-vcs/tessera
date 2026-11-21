@@ -974,22 +974,66 @@ pub fn run_restore(
 /// Executes `tes gc`.
 ///
 /// # Errors
-/// Returns an error if the repository cannot be opened or compaction fails.
-pub fn run_gc(ctx: &CliContext) -> anyhow::Result<()> {
+/// Returns an error if the repository cannot be opened or garbage collection fails.
+pub fn run_gc(ctx: &CliContext, dry_run: bool) -> anyhow::Result<()> {
     let coord = Coordinator::open(&ctx.cwd)?;
-    let removed = coord.oplog().gc_compact()?;
+    let report = coord.gc(dry_run)?;
 
     if ctx.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({ "compacted_operations": removed }))?
-        );
+        println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
+        let verb_compact = if report.dry_run {
+            "Would compact"
+        } else {
+            "Compacted"
+        };
+        let verb_prune = if report.dry_run {
+            "Would prune"
+        } else {
+            "Pruned"
+        };
+        let prefix = if report.dry_run {
+            c_yellow("[dry-run]")
+        } else {
+            c_green("✓")
+        };
+
         println!(
-            "{} Compacted {} ephemeral micro-snapshot operation(s).",
-            c_green("✓"),
-            c_cyan(removed)
+            "{prefix} {verb_compact} {} ephemeral micro-snapshot operation(s).",
+            c_cyan(report.compacted_operations)
         );
+
+        if !report.pruned_sandboxes.is_empty() {
+            println!(
+                "{prefix} {verb_prune} {} orphaned sandbox(es): {}",
+                c_cyan(report.pruned_sandboxes.len()),
+                report.pruned_sandboxes.join(", ")
+            );
+        }
+
+        if !report.pruned_sidecars.is_empty() {
+            println!(
+                "{prefix} {verb_prune} {} orphaned sandbox metadata file(s).",
+                c_cyan(report.pruned_sidecars.len())
+            );
+        }
+
+        if !report.pruned_dead_leases.is_empty() {
+            println!(
+                "{prefix} {verb_prune} {} dead port lease(s): {}",
+                c_cyan(report.pruned_dead_leases.len()),
+                report.pruned_dead_leases.join(", ")
+            );
+        }
+
+        if !report.skipped_active_sandboxes.is_empty() {
+            println!(
+                "{} Skipped {} orphaned sandbox(es) with active process lease(s): {}",
+                c_yellow("!"),
+                c_cyan(report.skipped_active_sandboxes.len()),
+                report.skipped_active_sandboxes.join(", ")
+            );
+        }
     }
 
     Ok(())
@@ -1825,7 +1869,8 @@ pub fn run_complete(cwd: &Path, args: &CompleteArgs) {
                     ),
                     (
                         "gc".to_string(),
-                        "Compact ephemeral snapshots in Operation Log".to_string(),
+                        "Compact ephemeral snapshots and prune orphaned sandboxes and dead leases"
+                            .to_string(),
                     ),
                     (
                         "mcp".to_string(),
@@ -2069,6 +2114,20 @@ pub fn run_complete(cwd: &Path, args: &CompleteArgs) {
                     candidates.extend(collect_branches());
                 } else {
                     candidates = collect_branches();
+                }
+            }
+            Some("gc") => {
+                if cur.starts_with('-') {
+                    candidates = vec![
+                        (
+                            "-n".to_string(),
+                            "Preview what would be compacted and pruned".to_string(),
+                        ),
+                        (
+                            "--dry-run".to_string(),
+                            "Preview what would be compacted and pruned".to_string(),
+                        ),
+                    ];
                 }
             }
             Some("pull") => {

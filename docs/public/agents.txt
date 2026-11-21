@@ -106,7 +106,7 @@ tes merge <branch1> [<branch2> ...] --into main -m "<commit message>"
 | `tes oplog` | `tes oplog [-n <limit>] [--json]` |
 | `tes undo` | `tes undo [--op <operation-id>] [--checkpoint <label>]` |
 | `tes sync` | `tes sync [--json]` (non-blocking auto-rebase of active sessions onto trunk) |
-| `tes gc` | `tes gc [--json]` (compacts ephemeral micro-snapshots in `.git/tessera/oplog/`) |
+| `tes gc` | `tes gc [-n \| --dry-run] [--json]` (compacts ephemeral micro-snapshots and prunes orphaned sandboxes and dead port leases) |
 | `tes watch` | `tes watch [-a <id>] [--interval-ms <ms>] [--once] [--json]` |
 | `tes agent` (`session`) | `tes agent spawn \| list \| focus <id> \| exec <id> -- <cmd> \| close [id \| --all] \| clear [-f]` |
 | `tes config` | `tes config show \| set <k> <v> \| add-cache-dir <d> \| add-package-glob <p> \| add-bin-dir <d> \| set-env <k> <v> \| trust \| untrust` |

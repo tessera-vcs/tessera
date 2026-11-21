@@ -1912,7 +1912,7 @@ The `tes` CLI provides commands for initializing repositories, coordinating mult
 | [tes oplog](/cli/oplog) | Inspect the content-addressed Operation Log history |
 | [tes undo](/cli/undo) | Undo the most recent operation or roll back to a specific operation ID or checkpoint |
 | [tes sync](/cli/sync) | Auto-rebase all active sessions onto the latest trunk commit |
-| [tes gc](/cli/gc) | Compact ephemeral micro-snapshot operations in `.git/tessera/oplog/` |
+| [tes gc](/cli/gc) | Compact ephemeral micro-snapshots and prune orphaned sandboxes and dead port leases (`--dry-run`) |
 | [tes watch](/cli/watch) | Watch the working tree and auto-reconcile edits for hookless editors or harnesses |
 | [tes agent](/cli/agent) (`session`) | Spawn, list, focus (`tes session focus <id>`), exec, close, or clear sessions |
 | [tes config](/cli/config) | View or update repository configuration settings and trust (`tessera.toml`) |
@@ -2996,7 +2996,7 @@ tes sync --json
 
 # tes gc
 
-Compact ephemeral working-copy micro-snapshot operations in `.git/tessera/oplog/`.
+Compact ephemeral working-copy micro-snapshot operations in `.git/tessera/oplog/` and prune orphaned branch sandboxes, stale sandbox sidecars, and dead port leases.
 
 ## Usage
 
@@ -3006,19 +3006,27 @@ tes gc [options]
 
 ## Options
 
-- `--json` - Emit structured JSON output (`{ "compacted_operations": <N> }`).
+- `-n`, `--dry-run` - Preview what would be compacted and pruned without deleting any files.
+- `--json` - Emit structured JSON output (`dry_run`, `compacted_operations`, `pruned_sandboxes`, `pruned_sidecars`, `pruned_dead_leases`, `skipped_active_sandboxes`).
 
 ## Description
 
-High-frequency working-tree snapshots recorded while agents edit files are marked as `ephemeral` in the Operation Log. Running `tes gc` compacts those ephemeral micro-snapshots to keep `.git/tessera/oplog/` small while preserving all milestone operations, commits, merges, and named checkpoints (`tes checkpoint`).
+`tes gc` reclaims stale Tessera state while preserving all active work and history:
+
+- **Operation Log compaction**: Compacts high-frequency `ephemeral` working-tree micro-snapshots in `.git/tessera/oplog/` while preserving all milestone operations, commits, merges, and named checkpoints (`tes checkpoint`).
+- **Orphaned sandbox pruning**: Removes cached branch sandbox directories (and their `.slot`, `.tree`, and `.pending-merge` sidecar files) that no longer correspond to any local Git branch, `OpLog` branch, or active session. Any orphaned sandbox still hosting a live leased process is skipped and reported.
+- **Dead port lease cleanup**: Removes stale `<sandboxes_root>/bin/.leases/<port>` directories whose owning process is no longer alive.
 
 ## Examples
 
 ```bash
-# compact ephemeral micro-snapshots
+# preview what tes gc would compact and prune
+tes gc --dry-run
+
+# compact ephemeral micro-snapshots and prune orphaned sandboxes/leases
 tes gc
 
-# run compaction with JSON output
+# run garbage collection with structured JSON output
 tes gc --json
 ```
 
@@ -3184,7 +3192,7 @@ tes doctor [options]
 2. **Configuration and Trust**: Validates `.git/tessera/config.toml` and any checked-in `tessera.toml`, reporting whether execution-sensitive fields (`verify_command`, `pager`, `extra_bin_dirs`, `custom_env`) are trusted via `tes config trust`.
 3. **Copy-on-Write Filesystem Support**: Checks whether the repository filesystem supports native Copy-on-Write clones (`clonefile` on macOS APFS, `FICLONE` on Linux Btrfs/XFS/bcachefs) or uses the portable fallback.
 4. **Hooks and Harnesses**: Checks installed Git sync hooks (`.git/hooks/post-commit`, `post-merge`, `post-checkout`) and AI editor rule files.
-5. **Sessions, Sandboxes, and Conflicts**: Surfaces active conflicts, stale or orphaned sessions, and sandbox health.
+5. **Sessions, Sandboxes, and Conflicts**: Surfaces active conflicts, dead port leases, and orphaned branch sandboxes (guiding you to `tes gc` to clean them up).
 
 ## Examples
 
