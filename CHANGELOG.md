@@ -1,5 +1,39 @@
 # Changelog
 
+## [0.0.3] - 2026-11-21
+
+### Features
+
+- *(core,merge,workspace,agent,cli)* Harden invariants, fail-safe merges, doctor/dry-run/mcp, and modularize crates
+- *(cli)* Add self-updating tes upgrade/update command with SHA-256 verification and HTTP E2E tests
+
+### Bug Fixes
+
+- *(vscode)* Repair broken CLI actions, security, conflict studio, and async watcher
+- *(workspace,agent,cli)* Gate unix/macos-only helpers and muts for Linux and Windows clippy
+- *(agent)* Gate auto-watcher daemon spawn to Unix to avoid Windows 90s pipe hang
+- *(install,docs)* Guard curl.exe stderr on PowerShell 5.1 and document tes upgrade in agents.txt
+- *(ci,release)* Include CHANGELOG.md release commits in extension git-cliff path filter to preserve v0.0.1/v0.0.2 tags
+- *(agent)* Prevent watcher from recording HEAD or stale pre-commit blobs into observed_blobs
+- Harden core, merge, agent, CLI, VS Code, release, and docs for v0.0.3
+- *(core)* Allow Windows readonly clear and refine .tessera/tmp fallback boundary
+- *(agent)* Pass Windows --verify command via cmd /S /C raw_arg and use batch script in test
+
+### Documentation
+
+- Align guides, CLI references, MCP schemas, and README with hardened implementation
+- Update footer copyright to Lunaris
+- *(vscode)* Simplify extension README title and add extension-only CHANGELOG.md
+- *(vscode)* Simplify README title, auto-generate extension CHANGELOG.md, and fix VSIX packaging (#11)
+- *(readme)* Add CI, release, docs, Rust, and license badges
+
+### Miscellaneous
+
+- *(release,install)* Harden CI gates, release workflow, atomic installers, and multi-shell E2E
+- *(release)* Restore automatic CHANGELOG.md generation and push on main
+- *(release,vscode)* Auto-generate extension CHANGELOG.md via git-cliff and align @types/vscode with ^1.85.0
+- Execute install.sh, install.ps1 (pwsh + PS 5.1), git-cliff, and vsce package in CI
+
 ## [0.0.2] - 2026-10-25
 
 ### Features
@@ -28,7 +62,6 @@
 ### Miscellaneous
 
 - *(github)* Add pull request template
-- *(release)* Bump CLI binary version to 0.0.2
 - *(ci)* Trigger docs deployment only on manual workflow_dispatch
 
 ## [0.0.1] - 2026-10-24
@@ -76,3 +109,4 @@
 - Track npm lockfiles and auto-generate CHANGELOG.md during release
 - *(repo)* Add .editorconfig, .gitattributes, and autonomous agent rules
 - *(actions)* Filter CI jobs by modified paths
+
