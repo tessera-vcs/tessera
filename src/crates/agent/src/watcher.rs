@@ -44,37 +44,44 @@ fn try_acquire_watcher_lock(lock_path: &Path) -> Option<fs::File> {
 /// so rapid concurrent file writes are captured in `.git/objects` before `post-tool` hooks execute.
 ///
 /// `git_dir` should be the repository's shared common Git directory (`common_git_dir`).
+/// On Windows, background daemon spawning is skipped because child processes inherit parent pipe
+/// handles and hold open working-directory locks for the daemon lifetime.
 pub fn ensure_background_watcher(repo_root: &Path, git_dir: &Path) {
-    let lock_file = git_dir.join("tessera").join("watch.lock");
-    let probe = try_acquire_watcher_lock(&lock_file);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
 
-    if probe.is_none() {
-        return;
-    }
+        let lock_file = git_dir.join("tessera").join("watch.lock");
+        let probe = try_acquire_watcher_lock(&lock_file);
 
-    drop(probe);
-
-    let exe_opt = std::env::current_exe().ok().filter(|p| {
-        p.file_stem()
-            .and_then(|s| s.to_str())
-            .is_some_and(|stem| stem == "tes")
-    });
-
-    if let Some(bin) = exe_opt {
-        let mut cmd = std::process::Command::new(bin);
-        cmd.args(["watch", "--auto-daemon"])
-            .current_dir(repo_root)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            cmd.process_group(0);
+        if probe.is_none() {
+            return;
         }
 
-        let _ = cmd.spawn();
+        drop(probe);
+
+        let exe_opt = std::env::current_exe().ok().filter(|p| {
+            p.file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(|stem| stem == "tes")
+        });
+
+        if let Some(bin) = exe_opt {
+            let mut cmd = std::process::Command::new(bin);
+            cmd.args(["watch", "--auto-daemon"])
+                .current_dir(repo_root)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .process_group(0);
+
+            let _ = cmd.spawn();
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = (repo_root, git_dir);
     }
 }
 
