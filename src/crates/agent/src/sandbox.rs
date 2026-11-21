@@ -6,15 +6,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::UNIX_EPOCH;
 
 use core::{
-    AgentMetadata, ChangeId, CoreError, CoreResult, EntryMode, FileEntry, ObjectId, View,
-    atomic_write_file, now_millis, validate_ref_name,
+    AgentMetadata, ChangeId, CoreError, CoreResult, EntryMode, FileEntry, ObjectId, RepoConfig,
+    View, atomic_write_file, now_millis, validate_ref_name,
 };
 use workspace::{
-    build_agent_env_with_config, create_cow_workspace, ensure_polyglot_port_shims,
-    materialize_tree_to_dir, materialize_tree_to_dir_with_baseline, snapshot_working_dir,
-    sync_missing_cow_caches,
+    CowWorkspaceOptions, build_agent_env_with_config, create_cow_workspace_with_options,
+    ensure_polyglot_port_shims, materialize_tree_to_dir, materialize_tree_to_dir_with_baseline,
+    snapshot_working_dir, sync_missing_cow_caches_with_options,
 };
 
 use crate::Coordinator;
@@ -192,7 +193,9 @@ impl Coordinator {
             },
         )?;
 
-        let _ = self.prepare_branch_sandbox(session_id, Some(clean_branch));
+        if !restore_trunk_to_repo_root {
+            let _ = self.prepare_branch_sandbox(session_id, Some(clean_branch));
+        }
 
         if restore_trunk_to_repo_root {
             let _ = self.git.set_symbolic_head(clean_branch);
@@ -224,9 +227,31 @@ impl Coordinator {
             .git
             .current_branch_name()
             .unwrap_or_else(|_| "main".to_string());
+        let current_before = self.oplog.load_current_reconciled()?;
 
         if !old_branch.is_empty() && old_branch != clean_branch {
-            let _ = self.prepare_branch_sandbox("editor", Some(&old_branch));
+            let old_ws_exists = self.branch_sandbox_dir(&old_branch).is_dir();
+            let old_has_other_session = current_before
+                .view
+                .agents
+                .iter()
+                .any(|(id, a)| id != "editor" && a.effective_branch(&old_branch) == old_branch);
+            let old_head_tree = self
+                .git
+                .resolve_head_commit()
+                .ok()
+                .flatten()
+                .and_then(|cid| self.git.read_commit(&cid).ok())
+                .map(|c| c.tree_id);
+            let old_has_unowned_edits = old_head_tree.as_ref().is_some_and(|tid| {
+                !self
+                    .unowned_worktree_changes(&current_before.view, tid)
+                    .is_empty()
+            });
+
+            if old_ws_exists || old_has_other_session || old_has_unowned_edits {
+                let _ = self.prepare_branch_sandbox("editor", Some(&old_branch));
+            }
         }
 
         let mut prev_tree_map = self
@@ -275,9 +300,19 @@ impl Coordinator {
         };
         let branch_commit = self.git.read_commit(&branch_cid)?;
 
-        // Prepare `clean_branch`'s sandbox before updating `.git/HEAD` so `clean_branch` is not
-        // compared against `old_branch`'s `repo_root`.
-        let _ = self.prepare_branch_sandbox("editor", Some(clean_branch));
+        // Only materialize `clean_branch`'s sandbox before updating `.git/HEAD` when the sandbox
+        // already exists or another active session targets `clean_branch`, avoiding an unnecessary
+        // whole-repo clone when `repo_root` is serving `clean_branch` exclusively.
+        let clean_ws_exists = self.branch_sandbox_dir(clean_branch).is_dir();
+        let clean_has_active_session = current_before
+            .view
+            .agents
+            .iter()
+            .any(|(id, a)| id != "editor" && a.target_branch.as_deref() == Some(clean_branch));
+
+        if clean_ws_exists || clean_has_active_session {
+            let _ = self.prepare_branch_sandbox("editor", Some(clean_branch));
+        }
 
         let safe_clean = Self::sanitize_branch_name(clean_branch);
         let stamp_file = self.branches_root().join(format!("{safe_clean}.tree"));
@@ -401,100 +436,22 @@ impl Coordinator {
 
     /// Returns the external Copy-on-Write sandbox root directory for this repository.
     ///
-    /// Placed outside `.git/` and without hidden dot-directory segments on macOS
-    /// (`~/Library/Caches/tessera/workspaces/<repo>-<hash>`) and Linux
-    /// (`/var/tmp/tessera-workspaces-<uid>/<repo>-<hash>`) on the same filesystem device (`st_dev`)
+    /// Resolves candidate workspace bases via [`core::candidate_workspaces_bases`] (honoring
+    /// `TES_WORKSPACES_ROOT`, containing ephemeral temp-dir test repositories inside the temp
+    /// hierarchy, and using standard OS cache directories on the same filesystem device `st_dev`
     /// so tools like Vite, Next.js, and ESLint never block file serving due to `**/.git/**` rules
-    /// while APFS `clonefile(2)` and Linux `FICLONE` remain zero-copy.
+    /// while APFS `clonefile(2)` and Linux `FICLONE` remain zero-copy).
+    ///
+    /// Also writes cache hygiene markers (`CACHEDIR.TAG`, macOS `.metadata_never_index`, and Time
+    /// Machine exclusion xattr) on the base directory and records `<slug>/.repo_root`.
     pub fn sandboxes_root(&self) -> PathBuf {
         let repo_root = self.git.repo_root();
-        let repo_name = repo_root
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("repo")
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                    c
-                } else {
-                    '-'
-                }
-            })
-            .collect::<String>();
-        let full_hash = blake3::hash(repo_root.display().to_string().as_bytes()).to_hex();
-        let slug = format!("{repo_name}-{}", &full_hash[..32]);
+        let slug = core::compute_repo_slug(repo_root);
+        let bases = core::candidate_workspaces_bases(repo_root);
 
         // SAFETY: `libc::geteuid()` is a pure POSIX syscall with no arguments or memory dereferences.
         #[cfg(unix)]
         let uid = unsafe { libc::geteuid() };
-        #[cfg(not(unix))]
-        let uid = 0u32;
-
-        let mut candidates = Vec::new();
-
-        if cfg!(target_os = "macos") {
-            if let Ok(home) = std::env::var("HOME") {
-                candidates.push(
-                    PathBuf::from(home)
-                        .join("Library")
-                        .join("Caches")
-                        .join("tessera")
-                        .join("workspaces")
-                        .join(&slug),
-                );
-            }
-        } else if cfg!(windows) {
-            if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
-                if !local_app_data.trim().is_empty() {
-                    candidates.push(
-                        PathBuf::from(local_app_data)
-                            .join("tessera")
-                            .join("workspaces")
-                            .join(&slug),
-                    );
-                }
-            }
-
-            candidates.push(std::env::temp_dir().join("tessera-workspaces").join(&slug));
-        } else {
-            if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
-                if !xdg.trim().is_empty() {
-                    candidates.push(
-                        PathBuf::from(xdg)
-                            .join("tessera")
-                            .join("workspaces")
-                            .join(&slug),
-                    );
-                }
-            }
-
-            if let Ok(home) = std::env::var("HOME") {
-                if !home.trim().is_empty() {
-                    candidates.push(
-                        PathBuf::from(home)
-                            .join(".cache")
-                            .join("tessera")
-                            .join("workspaces")
-                            .join(&slug),
-                    );
-                }
-            }
-
-            candidates.push(
-                PathBuf::from("/var/tmp")
-                    .join(format!("tessera-workspaces-{uid}"))
-                    .join(&slug),
-            );
-            candidates.push(
-                std::env::temp_dir()
-                    .join(format!("tessera-workspaces-{uid}"))
-                    .join(&slug),
-            );
-        }
-
-        if let Some(parent) = repo_root.parent() {
-            candidates.push(parent.join("tessera-workspaces").join(&slug));
-        }
 
         #[cfg(unix)]
         let repo_dev = fs::metadata(repo_root).ok().map(|m| {
@@ -502,7 +459,9 @@ impl Coordinator {
             m.dev()
         });
 
-        for cand in candidates {
+        for base in bases {
+            let cand = base.join(&slug);
+
             if fs::create_dir_all(&cand).is_ok() {
                 #[cfg(unix)]
                 {
@@ -540,12 +499,21 @@ impl Coordinator {
                     let _ = fs::set_permissions(&cand, fs::Permissions::from_mode(0o700));
 
                     if let Some(r_dev) = repo_dev {
-                        if r_dev == c_meta.dev() {
-                            return cand;
+                        if r_dev != c_meta.dev() {
+                            continue;
                         }
-
-                        continue;
                     }
+                }
+
+                core::ensure_cache_dir_hygiene(&base);
+
+                let repo_marker = cand.join(".repo_root");
+
+                if !repo_marker.is_file() {
+                    let _ = core::atomic_write_file_relaxed(
+                        &repo_marker,
+                        repo_root.display().to_string().as_bytes(),
+                    );
                 }
 
                 return cand;
@@ -1176,18 +1144,24 @@ impl Coordinator {
             .join(format!("sandbox-{safe_branch}.lock"));
         let _sandbox_lock = acquire_file_lock(&sandbox_lock_path)?;
 
-        if !branch_ws_dir.exists() {
-            create_cow_workspace(
+        let cow_opts = CowWorkspaceOptions::from_config(&cfg);
+        let created_new_sandbox = !branch_ws_dir.exists();
+
+        if created_new_sandbox {
+            create_cow_workspace_with_options(
                 self.git.repo_root(),
                 &branch_ws_dir,
                 &[],
-                &cfg.cow_cache_dirs,
+                &cow_opts,
             )?;
             materialize_tree_to_dir(&self.git, &effective_tree_id, &branch_ws_dir)?;
             let _ = atomic_write_file(&tree_stamp_file, stamp_payload.as_bytes());
         } else {
-            let _ =
-                sync_missing_cow_caches(self.git.repo_root(), &branch_ws_dir, &cfg.cow_cache_dirs);
+            let _ = sync_missing_cow_caches_with_options(
+                self.git.repo_root(),
+                &branch_ws_dir,
+                &cow_opts,
+            );
             let cached_tree = fs::read_to_string(&tree_stamp_file).unwrap_or_default();
 
             if cached_tree.trim() != stamp_payload
@@ -1212,6 +1186,15 @@ impl Coordinator {
 
         drop(_sandbox_lock);
 
+        if created_new_sandbox && cfg.max_warm_sandboxes > 0 {
+            self.evict_excess_warm_sandboxes(
+                &cfg,
+                &current.view,
+                &current_head_branch,
+                &target_branch,
+            );
+        }
+
         let mut env_meta = meta;
         env_meta.target_branch = Some(target_branch.clone());
 
@@ -1220,6 +1203,15 @@ impl Coordinator {
         }
 
         let mut env_map = build_agent_env_with_config(&env_meta, &cfg, &branch_ws_dir);
+
+        if cfg.shared_cargo_target {
+            let shared_target = self.sandboxes_root().join("shared-target");
+            let _ = fs::create_dir_all(&shared_target);
+            env_map.insert(
+                "CARGO_TARGET_DIR".to_string(),
+                shared_target.display().to_string(),
+            );
+        }
         env_map.insert("TES_BRANCH".to_string(), target_branch.clone());
         env_map.insert(
             "GIT_DIR".to_string(),
@@ -1398,9 +1390,168 @@ impl Coordinator {
                 source,
             })?;
 
-        let _ = sync_missing_cow_caches(&branch_ws_dir, self.git.repo_root(), &cfg.cow_cache_dirs);
+        let cow_opts = CowWorkspaceOptions::from_config(&cfg);
+        let _ =
+            sync_missing_cow_caches_with_options(&branch_ws_dir, self.git.repo_root(), &cow_opts);
         let _ = self.prepare_branch_sandbox_inner(session_id, branch, true);
 
         Ok(status.code().unwrap_or(1))
+    }
+
+    /// Evicts the least-recently-used clean, idle non-trunk branch sandboxes whenever the number
+    /// of cached non-trunk sandboxes exceeds `cfg.max_warm_sandboxes`.
+    ///
+    /// Never evicts `cfg.trunk_branch`, `current_head_branch`, `just_created_branch`, or any
+    /// sandbox with a live port lease, active dirty session, or uncommitted working edits.
+    fn evict_excess_warm_sandboxes(
+        &self,
+        cfg: &RepoConfig,
+        view: &View,
+        current_head_branch: &str,
+        just_created_branch: &str,
+    ) {
+        if cfg.max_warm_sandboxes == 0 {
+            return;
+        }
+
+        let branches_root = self.branches_root();
+        let Ok(entries) = fs::read_dir(&branches_root) else {
+            return;
+        };
+
+        let trunk_safe = Self::sanitize_branch_name(&cfg.trunk_branch);
+        let head_safe = Self::sanitize_branch_name(current_head_branch);
+        let just_created_safe = Self::sanitize_branch_name(just_created_branch);
+
+        let mut safe_to_raw: BTreeMap<String, String> = BTreeMap::new();
+
+        for br in self.git.list_local_branches() {
+            safe_to_raw.insert(Self::sanitize_branch_name(&br), br);
+        }
+
+        for br in view.branches.keys() {
+            safe_to_raw
+                .entry(Self::sanitize_branch_name(br))
+                .or_insert_with(|| br.clone());
+        }
+
+        let mut non_protected_total: usize = 0;
+        let mut candidates: Vec<(u64, String, String, PathBuf)> = Vec::new();
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+
+            if !path.is_dir() {
+                continue;
+            }
+
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+
+            if name == trunk_safe || name == head_safe {
+                continue;
+            }
+
+            non_protected_total += 1;
+
+            if name == just_created_safe {
+                continue;
+            }
+
+            let stamp_mtime = fs::metadata(branches_root.join(format!("{name}.tree")))
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let dir_mtime = fs::metadata(&path)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let latest_mtime = stamp_mtime.max(dir_mtime);
+            let raw_branch = safe_to_raw
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| name.to_string());
+
+            candidates.push((latest_mtime, name.to_string(), raw_branch, path));
+        }
+
+        if non_protected_total <= cfg.max_warm_sandboxes {
+            return;
+        }
+
+        let mut live_lease_workspaces: Vec<PathBuf> = Vec::new();
+        let leases_dir = self.sandboxes_root().join("bin").join(".leases");
+
+        if let Ok(lease_entries) = fs::read_dir(&leases_dir) {
+            for entry in lease_entries.flatten() {
+                let lpath = entry.path();
+
+                if !lpath.is_dir() {
+                    continue;
+                }
+
+                let pid_opt = fs::read_to_string(lpath.join("pid"))
+                    .ok()
+                    .and_then(|raw| raw.trim().parse::<i32>().ok());
+
+                if pid_opt.is_some_and(crate::session::is_process_alive) {
+                    if let Ok(ws_raw) = fs::read_to_string(lpath.join("workspace")) {
+                        let trimmed = ws_raw.trim();
+
+                        if !trimmed.is_empty() {
+                            live_lease_workspaces.push(PathBuf::from(trimmed));
+                        }
+                    }
+                }
+            }
+        }
+
+        candidates.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+        let locks_dir = self.git.common_git_dir().join("tessera").join("locks");
+        let slots_lock_path = self.git.common_git_dir().join("tessera").join("slots.lock");
+
+        for (_mtime, safe_name, raw_branch, path) in candidates {
+            if non_protected_total <= cfg.max_warm_sandboxes {
+                break;
+            }
+
+            if !self.is_sandbox_clean(
+                &raw_branch,
+                &path,
+                view,
+                current_head_branch,
+                &live_lease_workspaces,
+            ) {
+                continue;
+            }
+
+            let lock_path = locks_dir.join(format!("sandbox-{safe_name}.lock"));
+            let _sandbox_lock = acquire_file_lock(&lock_path).ok();
+
+            if fs::remove_dir_all(&path).is_ok() {
+                non_protected_total = non_protected_total.saturating_sub(1);
+
+                for (suffix, is_slot) in
+                    [(".slot", true), (".tree", false), (".pending-merge", false)]
+                {
+                    let sidecar = branches_root.join(format!("{safe_name}{suffix}"));
+
+                    if sidecar.is_file() {
+                        if is_slot {
+                            let _slot_lock = acquire_file_lock(&slots_lock_path).ok();
+                            let _ = fs::remove_file(&sidecar);
+                        } else {
+                            let _ = fs::remove_file(&sidecar);
+                        }
+                    }
+                }
+            }
+        }
     }
 }

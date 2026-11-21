@@ -975,9 +975,9 @@ pub fn run_restore(
 ///
 /// # Errors
 /// Returns an error if the repository cannot be opened or garbage collection fails.
-pub fn run_gc(ctx: &CliContext, dry_run: bool) -> anyhow::Result<()> {
+pub fn run_gc(ctx: &CliContext, opts: agent::GcOptions) -> anyhow::Result<()> {
     let coord = Coordinator::open(&ctx.cwd)?;
-    let report = coord.gc(dry_run)?;
+    let report = coord.gc_with_options(&opts)?;
 
     if ctx.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -1011,6 +1011,45 @@ pub fn run_gc(ctx: &CliContext, dry_run: bool) -> anyhow::Result<()> {
             );
         }
 
+        if !report.pruned_merged_sandboxes.is_empty() {
+            println!(
+                "{prefix} {verb_prune} {} merged branch sandbox(es): {}",
+                c_cyan(report.pruned_merged_sandboxes.len()),
+                report.pruned_merged_sandboxes.join(", ")
+            );
+        }
+
+        if !report.pruned_stale_sandboxes.is_empty() {
+            println!(
+                "{prefix} {verb_prune} {} stale branch sandbox(es): {}",
+                c_cyan(report.pruned_stale_sandboxes.len()),
+                report.pruned_stale_sandboxes.join(", ")
+            );
+        }
+
+        if !report.pruned_verify_sandboxes.is_empty() {
+            println!(
+                "{prefix} {verb_prune} {} crashed verify sandbox(es): {}",
+                c_cyan(report.pruned_verify_sandboxes.len()),
+                report.pruned_verify_sandboxes.join(", ")
+            );
+        }
+
+        if !report.pruned_agent_workspaces.is_empty() {
+            println!(
+                "{prefix} {verb_prune} {} orphaned agent workspace(s): {}",
+                c_cyan(report.pruned_agent_workspaces.len()),
+                report.pruned_agent_workspaces.join(", ")
+            );
+        }
+
+        if !report.pruned_tmp_dirs.is_empty() {
+            println!(
+                "{prefix} {verb_prune} {} stale temporary directory(ies).",
+                c_cyan(report.pruned_tmp_dirs.len())
+            );
+        }
+
         if !report.pruned_sidecars.is_empty() {
             println!(
                 "{prefix} {verb_prune} {} orphaned sandbox metadata file(s).",
@@ -1026,12 +1065,61 @@ pub fn run_gc(ctx: &CliContext, dry_run: bool) -> anyhow::Result<()> {
             );
         }
 
+        let meta_count =
+            report.pruned_stat_caches + report.pruned_locks + report.pruned_session_slots;
+
+        if meta_count > 0 {
+            println!(
+                "{prefix} {verb_prune} {} stale metadata file(s) ({} stat_cache, {} lock, {} session-slot).",
+                c_cyan(meta_count),
+                report.pruned_stat_caches,
+                report.pruned_locks,
+                report.pruned_session_slots
+            );
+        }
+
+        if !report.pruned_stale_view_branches.is_empty() {
+            println!(
+                "{prefix} {verb_prune} {} stale branch record(s) from OpLog: {}",
+                c_cyan(report.pruned_stale_view_branches.len()),
+                report.pruned_stale_view_branches.join(", ")
+            );
+        }
+
+        if !report.pruned_caches.is_empty() {
+            println!(
+                "{prefix} {verb_prune} {} idle sandbox build cache(s): {}",
+                c_cyan(report.pruned_caches.len()),
+                report.pruned_caches.join(", ")
+            );
+        }
+
+        if !report.pruned_global_repos.is_empty() {
+            println!(
+                "{prefix} {verb_prune} {} orphaned global repo cache(s): {}",
+                c_cyan(report.pruned_global_repos.len()),
+                report.pruned_global_repos.join(", ")
+            );
+        }
+
         if !report.skipped_active_sandboxes.is_empty() {
             println!(
-                "{} Skipped {} orphaned sandbox(es) with active process lease(s): {}",
+                "{} Skipped {} active or dirty sandbox(es): {}",
                 c_yellow("!"),
                 c_cyan(report.skipped_active_sandboxes.len()),
                 report.skipped_active_sandboxes.join(", ")
+            );
+        }
+
+        if report.reclaimed_bytes > 0 {
+            let verb_reclaim = if report.dry_run {
+                "Would reclaim"
+            } else {
+                "Reclaimed"
+            };
+            println!(
+                "{prefix} {verb_reclaim} ~{} of unique disk space.",
+                c_cyan(workspace::format_bytes(report.reclaimed_bytes))
             );
         }
     }
@@ -1152,6 +1240,19 @@ pub fn run_config(
 
             coord.oplog().save_config(&local_cfg)?;
         }
+        ConfigCommands::AddExcludeDir { dirs } => {
+            let mut local_cfg = coord.oplog().load_local_config()?;
+
+            for d in dirs {
+                let clean = core::validate_repo_rel_path(&d)?;
+
+                if !local_cfg.cow_exclude_dirs.contains(&clean) {
+                    local_cfg.cow_exclude_dirs.push(clean);
+                }
+            }
+
+            coord.oplog().save_config(&local_cfg)?;
+        }
         ConfigCommands::AddBinDir { dirs } => {
             let mut local_cfg = coord.oplog().load_local_config()?;
 
@@ -1254,6 +1355,45 @@ pub fn run_config(
                         Some(trimmed.to_string())
                     };
                 }
+                "portable_copy_cache_max_mb" => {
+                    local_cfg.portable_copy_cache_max_mb = value.trim().parse()?;
+                }
+                "max_warm_sandboxes" => {
+                    local_cfg.max_warm_sandboxes = value.trim().parse()?;
+                }
+                "shared_cargo_target" => {
+                    local_cfg.shared_cargo_target = match value.trim().to_ascii_lowercase().as_str()
+                    {
+                        "true" | "1" | "yes" | "on" => true,
+                        "false" | "0" | "no" | "off" => false,
+                        other => anyhow::bail!(
+                            "invalid value '{other}' for shared_cargo_target (expected true or false)"
+                        ),
+                    };
+                }
+                "cow_exclude_dirs" => {
+                    let trimmed = value.trim();
+
+                    if trimmed.is_empty() {
+                        local_cfg.cow_exclude_dirs.clear();
+                    } else {
+                        let mut parsed = Vec::new();
+
+                        for part in trimmed.split(',') {
+                            let item = part.trim();
+
+                            if !item.is_empty() {
+                                let clean = core::validate_repo_rel_path(item)?;
+
+                                if !parsed.contains(&clean) {
+                                    parsed.push(clean);
+                                }
+                            }
+                        }
+
+                        local_cfg.cow_exclude_dirs = parsed;
+                    }
+                }
                 other => anyhow::bail!("unknown config key '{other}'"),
             }
 
@@ -1267,7 +1407,7 @@ pub fn run_config(
         println!("{}", serde_json::to_string_pretty(&effective_cfg)?);
     } else {
         println!(
-            "trunk_branch = {:?}\nbase_port = {}\nport_stride = {}\nport_isolation = {}\nauto_isolate_dirty_claims = {}\nwatch_interval_ms = {}\nwatch_timeout_secs = {}\nco_author = {}\nco_author_trailer = {:?}\npager = {:?}\nverify_command = {:?}\ncow_cache_dirs = {:?}\nextra_bin_dirs = {:?}\npackage_globs = {:?}\ncustom_env = {:?}",
+            "trunk_branch = {:?}\nbase_port = {}\nport_stride = {}\nport_isolation = {}\nauto_isolate_dirty_claims = {}\nwatch_interval_ms = {}\nwatch_timeout_secs = {}\nco_author = {}\nco_author_trailer = {:?}\npager = {:?}\nverify_command = {:?}\ncow_cache_dirs = {:?}\ncow_exclude_dirs = {:?}\nportable_copy_cache_max_mb = {}\nmax_warm_sandboxes = {}\nshared_cargo_target = {}\nextra_bin_dirs = {:?}\npackage_globs = {:?}\ncustom_env = {:?}",
             effective_cfg.trunk_branch,
             effective_cfg.base_port,
             effective_cfg.port_stride,
@@ -1280,6 +1420,10 @@ pub fn run_config(
             effective_cfg.pager,
             effective_cfg.verify_command,
             effective_cfg.cow_cache_dirs,
+            effective_cfg.cow_exclude_dirs,
+            effective_cfg.portable_copy_cache_max_mb,
+            effective_cfg.max_warm_sandboxes,
+            effective_cfg.shared_cargo_target,
             effective_cfg.extra_bin_dirs,
             effective_cfg.package_globs,
             effective_cfg.custom_env

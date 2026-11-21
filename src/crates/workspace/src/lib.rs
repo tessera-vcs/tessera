@@ -4,13 +4,17 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 
 pub mod cow;
+pub mod disk_usage;
 pub mod env;
 pub mod snapshot;
 
 pub use cow::{
-    CowStrategy, clone_path_cow, create_cow_workspace, materialize_tree_to_dir,
+    CowStrategy, CowWorkspaceOptions, clone_path_cow, create_cow_workspace,
+    create_cow_workspace_with_options, materialize_tree_to_dir,
     materialize_tree_to_dir_with_baseline, sanitize_build_cache, sync_missing_cow_caches,
+    sync_missing_cow_caches_with_options,
 };
+pub use disk_usage::{DirDiskUsage, format_bytes, measure_dir_usage};
 pub use env::{
     POLYGLOT_PORT_ENV_KEYS, build_agent_env, build_agent_env_with_config,
     ensure_polyglot_port_shims, is_forbidden_custom_env_key, polyglot_port_env_vars,

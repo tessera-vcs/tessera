@@ -10,7 +10,7 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use core::{
-    CoreError, CoreResult, FileEntry, GitBackend, ObjectId, resolve_confined_repo_path,
+    CoreError, CoreResult, FileEntry, GitBackend, ObjectId, RepoConfig, resolve_confined_repo_path,
     resolve_dot_git, validate_repo_rel_path, write_working_tree_file_safe,
 };
 use walkdir::WalkDir;
@@ -476,6 +476,291 @@ fn dir_has_any_entries(dir: &Path) -> bool {
         .is_some()
 }
 
+/// Maximum number of files permitted inside a single dependency/build cache directory when
+/// copying under the non-CoW `PortableCopy` fallback.
+const MAX_PORTABLE_CACHE_FILES: usize = 2_000;
+
+/// Options controlling Copy-on-Write workspace creation and cache synchronization.
+#[derive(Debug, Clone)]
+pub struct CowWorkspaceOptions<'a> {
+    /// Additional cache directory names or relative paths to clone and preserve.
+    pub cow_cache_dirs: &'a [String],
+    /// Relative directory names or paths excluded from sandbox cloning and cache sync.
+    pub cow_exclude_dirs: &'a [String],
+    /// Maximum size in MiB of each cache directory copied under `PortableCopy` fallback (`0` = skip all).
+    pub portable_copy_cache_max_mb: u64,
+    /// When `true`, Cargo `target` directories are excluded from sandbox clones so branches share
+    /// a single `CARGO_TARGET_DIR`.
+    pub shared_cargo_target: bool,
+    /// When `true`, forces non-CoW `PortableCopy` budget enforcement even on CoW filesystems (tests).
+    pub force_portable_copy: bool,
+}
+
+impl<'a> CowWorkspaceOptions<'a> {
+    /// Builds [`CowWorkspaceOptions`] from repository configuration [`RepoConfig`].
+    #[must_use]
+    pub fn from_config(cfg: &'a RepoConfig) -> Self {
+        Self {
+            cow_cache_dirs: &cfg.cow_cache_dirs,
+            cow_exclude_dirs: &cfg.cow_exclude_dirs,
+            portable_copy_cache_max_mb: cfg.portable_copy_cache_max_mb,
+            shared_cargo_target: cfg.shared_cargo_target,
+            force_portable_copy: false,
+        }
+    }
+}
+
+/// Probes once whether native Copy-on-Write cloning (`ApfsClonefile` or `LinuxReflink`) is
+/// supported between `src_root` and `dst_root` (including verifying same-device `st_dev` on Unix).
+fn probe_cow_pair(src_root: &Path, dst_root: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let Ok(src_meta) = fs::metadata(src_root) else {
+            return false;
+        };
+        let Ok(dst_meta) = fs::metadata(dst_root) else {
+            return false;
+        };
+
+        if src_meta.dev() != dst_meta.dev() {
+            return false;
+        }
+    }
+
+    #[cfg(not(unix))]
+    let _ = src_root;
+
+    let pid = std::process::id();
+    let probe_src = dst_root.join(format!(".tes-cow-probe-src-{pid}"));
+    let probe_dst = dst_root.join(format!(".tes-cow-probe-dst-{pid}"));
+
+    if fs::write(&probe_src, b"cow").is_err() {
+        return false;
+    }
+
+    let is_native = matches!(
+        clone_path_cow(&probe_src, &probe_dst),
+        Ok(CowStrategy::ApfsClonefile | CowStrategy::LinuxReflink)
+    );
+    let _ = fs::remove_file(&probe_dst);
+    let _ = fs::remove_file(&probe_src);
+    is_native
+}
+
+/// Returns `true` if `rel_str` or its final segment `name` is excluded by `opts.cow_exclude_dirs`
+/// or `opts.shared_cargo_target`.
+fn is_excluded_cache_dir(rel_str: &str, name: &str, opts: &CowWorkspaceOptions<'_>) -> bool {
+    let clean_rel = rel_str.trim_matches('/');
+
+    if opts.shared_cargo_target
+        && (name == "target" || clean_rel == "target" || clean_rel.ends_with("/target"))
+    {
+        return true;
+    }
+
+    opts.cow_exclude_dirs.iter().any(|raw| {
+        let ex = raw.trim().trim_matches('/');
+
+        if ex.is_empty() {
+            return false;
+        }
+
+        if ex.contains('/') {
+            clean_rel == ex || clean_rel.starts_with(&format!("{ex}/"))
+        } else {
+            name == ex || clean_rel == ex || clean_rel.starts_with(&format!("{ex}/"))
+        }
+    })
+}
+
+/// Returns `true` if `rel_str` or `name` is a built-in or configured build/dependency cache dir.
+fn is_cache_dir_name(rel_str: &str, name: &str, cow_cache_dirs: &[String]) -> bool {
+    let clean_rel = rel_str.trim_matches('/');
+    PRESERVED_CACHE_DIRS.contains(&name)
+        || cow_cache_dirs.iter().any(|raw| {
+            let clean = raw.trim().trim_matches('/');
+            !clean.is_empty() && (clean == name || clean == clean_rel)
+        })
+}
+
+/// Returns `true` if copying `dir` without Copy-on-Write would exceed `max_mb` MiB or
+/// [`MAX_PORTABLE_CACHE_FILES`] regular files, short-circuiting traversal immediately on overflow.
+fn exceeds_portable_copy_budget(dir: &Path, max_mb: u64) -> bool {
+    if max_mb == 0 {
+        return true;
+    }
+
+    let max_bytes = max_mb.saturating_mul(1024 * 1024);
+    let mut total_bytes: u64 = 0;
+    let mut file_count: usize = 0;
+
+    for entry in WalkDir::new(dir).follow_links(false).into_iter().flatten() {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+
+        file_count += 1;
+
+        if file_count > MAX_PORTABLE_CACHE_FILES {
+            return true;
+        }
+
+        if let Ok(meta) = entry.metadata() {
+            total_bytes = total_bytes.saturating_add(meta.len());
+
+            if total_bytes > max_bytes {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/// Checks up to depth 3 whether `dir` contains any nested excluded directory or (when
+/// `!native_cow`) any cache directory exceeding the portable copy budget.
+fn subtree_needs_selective_clone(
+    repo_root: &Path,
+    dir: &Path,
+    depth: usize,
+    native_cow: bool,
+    opts: &CowWorkspaceOptions<'_>,
+) -> bool {
+    if depth > 3 {
+        return false;
+    }
+
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+
+    for entry in entries.flatten() {
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+
+        if !ft.is_dir() || ft.is_symlink() {
+            continue;
+        }
+
+        let path = entry.path();
+        let Some(name) = entry.file_name().to_str().map(ToString::to_string) else {
+            continue;
+        };
+
+        if is_vcs_internal_segment(&name) {
+            continue;
+        }
+
+        let Ok(rel) = path.strip_prefix(repo_root) else {
+            continue;
+        };
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+
+        if is_excluded_cache_dir(&rel_str, &name, opts) {
+            return true;
+        }
+
+        if !native_cow && is_cache_dir_name(&rel_str, &name, opts.cow_cache_dirs) {
+            if exceeds_portable_copy_budget(&path, opts.portable_copy_cache_max_mb) {
+                return true;
+            }
+
+            continue;
+        }
+
+        if subtree_needs_selective_clone(repo_root, &path, depth + 1, native_cow, opts) {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Clones `src_dir` into `dst_dir`, recursively descending only along branches that contain an
+/// excluded or over-budget nested cache directory while still using whole-directory CoW clones for
+/// unaffected sibling subtrees.
+fn clone_dir_selective(
+    repo_root: &Path,
+    src_dir: &Path,
+    dst_dir: &Path,
+    workspace_dir: &Path,
+    depth: usize,
+    native_cow: bool,
+    opts: &CowWorkspaceOptions<'_>,
+) -> CoreResult<()> {
+    fs::create_dir_all(dst_dir).map_err(|source| CoreError::Io {
+        path: dst_dir.display().to_string(),
+        source,
+    })?;
+
+    let entries = fs::read_dir(src_dir).map_err(|source| CoreError::Io {
+        path: src_dir.display().to_string(),
+        source,
+    })?;
+
+    for entry in entries {
+        let entry = entry.map_err(|source| CoreError::Io {
+            path: src_dir.display().to_string(),
+            source,
+        })?;
+        let Some(name_str) = entry.file_name().to_str().map(ToString::to_string) else {
+            continue;
+        };
+
+        if is_vcs_internal_segment(&name_str) {
+            continue;
+        }
+
+        let src_child = entry.path();
+        let dst_child = dst_dir.join(&name_str);
+        let ft = entry.file_type().map_err(|source| CoreError::Io {
+            path: src_child.display().to_string(),
+            source,
+        })?;
+
+        if ft.is_dir() && !ft.is_symlink() {
+            let rel_str = src_child
+                .strip_prefix(repo_root)
+                .map(|r| r.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_else(|_| name_str.clone());
+
+            if is_excluded_cache_dir(&rel_str, &name_str, opts) {
+                continue;
+            }
+
+            if !native_cow && is_cache_dir_name(&rel_str, &name_str, opts.cow_cache_dirs) {
+                if exceeds_portable_copy_budget(&src_child, opts.portable_copy_cache_max_mb) {
+                    continue;
+                }
+
+                clone_path_cow_within(&src_child, &dst_child, workspace_dir)?;
+                continue;
+            }
+
+            if subtree_needs_selective_clone(repo_root, &src_child, depth + 1, native_cow, opts) {
+                clone_dir_selective(
+                    repo_root,
+                    &src_child,
+                    &dst_child,
+                    workspace_dir,
+                    depth + 1,
+                    native_cow,
+                    opts,
+                )?;
+            } else {
+                clone_path_cow_within(&src_child, &dst_child, workspace_dir)?;
+            }
+        } else {
+            clone_path_cow_within(&src_child, &dst_child, workspace_dir)?;
+        }
+    }
+
+    Ok(())
+}
+
 /// Ensures any warm dependency or build caches (`node_modules`, `target`, `.venv`, `vendor`, plus
 /// configured `cow_cache_dirs`), as well as untracked `.gitignore`d and secret files, that exist in
 /// `src_root` are COW-cloned into `dst_root` if missing.
@@ -490,9 +775,33 @@ pub fn sync_missing_cow_caches(
     dst_root: &Path,
     cow_cache_dirs: &[String],
 ) -> CoreResult<usize> {
+    let opts = CowWorkspaceOptions {
+        cow_cache_dirs,
+        cow_exclude_dirs: &[],
+        portable_copy_cache_max_mb: 64,
+        shared_cargo_target: false,
+        force_portable_copy: false,
+    };
+    sync_missing_cow_caches_with_options(src_root, dst_root, &opts)
+}
+
+/// Synchronizes missing dependency/build caches and ignored secret files from `src_root` into
+/// `dst_root`, honoring [`CowWorkspaceOptions`] (`cow_exclude_dirs`, `shared_cargo_target`, and
+/// the non-CoW `portable_copy_cache_max_mb` budget).
+///
+/// # Errors
+/// Returns [`CoreError::Io`] if cloning a cache directory or ignored file fails.
+pub fn sync_missing_cow_caches_with_options(
+    src_root: &Path,
+    dst_root: &Path,
+    opts: &CowWorkspaceOptions<'_>,
+) -> CoreResult<usize> {
     if !src_root.is_dir() || !dst_root.is_dir() || src_root == dst_root {
         return Ok(0);
     }
+
+    let cow_cache_dirs = opts.cow_cache_dirs;
+    let native_cow = !opts.force_portable_copy && probe_cow_pair(src_root, dst_root);
 
     let defaults = [
         "node_modules",
@@ -509,6 +818,13 @@ pub fn sync_missing_cow_caches(
         .copied()
         .chain(cow_cache_dirs.iter().map(String::as_str))
     {
+        let clean_name = name.trim().trim_matches('/');
+        let leaf_name = clean_name.rsplit('/').next().unwrap_or(clean_name);
+
+        if is_excluded_cache_dir(clean_name, leaf_name, opts) {
+            continue;
+        }
+
         let Ok((_, src_cache)) = resolve_confined_repo_path(src_root, name) else {
             continue;
         };
@@ -517,6 +833,13 @@ pub fn sync_missing_cow_caches(
         };
 
         if !src_cache.exists() {
+            continue;
+        }
+
+        if !native_cow
+            && src_cache.is_dir()
+            && exceeds_portable_copy_budget(&src_cache, opts.portable_copy_cache_max_mb)
+        {
             continue;
         }
 
@@ -586,13 +909,23 @@ pub fn sync_missing_cow_caches(
                 let rel_str = rel.to_string_lossy().replace('\\', "/");
 
                 if e.file_type().is_dir() {
-                    let is_cache_or_ignored = PRESERVED_CACHE_DIRS.contains(&name)
-                        || cow_cache_dirs
-                            .iter()
-                            .any(|d| d == name || d.trim_matches('/') == rel_str)
+                    if is_excluded_cache_dir(&rel_str, name, opts) {
+                        return false;
+                    }
+
+                    let is_cache_or_ignored = is_cache_dir_name(&rel_str, name, cow_cache_dirs)
                         || ignore_matcher.borrow().is_ignored(&rel_str, true);
 
                     if is_cache_or_ignored {
+                        if !native_cow
+                            && exceeds_portable_copy_budget(
+                                e.path(),
+                                opts.portable_copy_cache_max_mb,
+                            )
+                        {
+                            return false;
+                        }
+
                         if let Ok((_, dst_dir)) = resolve_confined_repo_path(dst_root, &rel_str) {
                             let needs_clone = if !dst_dir.exists() {
                                 true
@@ -683,6 +1016,28 @@ pub fn create_cow_workspace(
     scopes: &[String],
     cow_cache_dirs: &[String],
 ) -> CoreResult<usize> {
+    let opts = CowWorkspaceOptions {
+        cow_cache_dirs,
+        cow_exclude_dirs: &[],
+        portable_copy_cache_max_mb: 64,
+        shared_cargo_target: false,
+        force_portable_copy: false,
+    };
+    create_cow_workspace_with_options(repo_root, workspace_dir, scopes, &opts)
+}
+
+/// Creates an isolated Copy-on-Write workspace at `workspace_dir` from `repo_root`, honoring
+/// [`CowWorkspaceOptions`] (`cow_exclude_dirs`, `shared_cargo_target`, and the non-CoW
+/// `portable_copy_cache_max_mb` copy budget).
+///
+/// # Errors
+/// Returns [`CoreError::Io`] if directory traversal or cloning fails.
+pub fn create_cow_workspace_with_options(
+    repo_root: &Path,
+    workspace_dir: &Path,
+    scopes: &[String],
+    opts: &CowWorkspaceOptions<'_>,
+) -> CoreResult<usize> {
     if workspace_dir.exists() {
         fs::remove_dir_all(workspace_dir).map_err(|source| CoreError::Io {
             path: workspace_dir.display().to_string(),
@@ -694,6 +1049,10 @@ pub fn create_cow_workspace(
         path: workspace_dir.display().to_string(),
         source,
     })?;
+
+    let native_cow = !opts.force_portable_copy && probe_cow_pair(repo_root, workspace_dir);
+    let check_nested_exclusions =
+        !native_cow || opts.shared_cargo_target || !opts.cow_exclude_dirs.is_empty();
 
     let mut cloned_entries = 0usize;
     let mut root_symlinks: Vec<(PathBuf, PathBuf)> = Vec::new();
@@ -734,14 +1093,39 @@ pub fn create_cow_workspace(
             continue;
         }
 
-        if cow_cache_dirs.iter().any(|c| c == name_str) {
+        if is_excluded_cache_dir(name_str, name_str, opts) {
+            continue;
+        }
+
+        if is_cache_dir_name(name_str, name_str, opts.cow_cache_dirs) {
+            if !native_cow
+                && exceeds_portable_copy_budget(&src_path, opts.portable_copy_cache_max_mb)
+            {
+                continue;
+            }
+
             clone_path_cow_within(&src_path, &dst_path, workspace_dir)?;
             cloned_entries += 1;
             continue;
         }
 
         if scopes.is_empty() {
-            clone_path_cow_within(&src_path, &dst_path, workspace_dir)?;
+            if check_nested_exclusions
+                && subtree_needs_selective_clone(repo_root, &src_path, 1, native_cow, opts)
+            {
+                clone_dir_selective(
+                    repo_root,
+                    &src_path,
+                    &dst_path,
+                    workspace_dir,
+                    1,
+                    native_cow,
+                    opts,
+                )?;
+            } else {
+                clone_path_cow_within(&src_path, &dst_path, workspace_dir)?;
+            }
+
             cloned_entries += 1;
         } else {
             for scope in scopes {
@@ -760,7 +1144,25 @@ pub fn create_cow_workspace(
                     let sub_dst = join_rel_segments(workspace_dir, &clean_rel);
 
                     if sub_src.exists() && !sub_dst.exists() {
-                        clone_path_cow_within(&sub_src, &sub_dst, workspace_dir)?;
+                        if sub_src.is_dir()
+                            && check_nested_exclusions
+                            && subtree_needs_selective_clone(
+                                repo_root, &sub_src, 1, native_cow, opts,
+                            )
+                        {
+                            clone_dir_selective(
+                                repo_root,
+                                &sub_src,
+                                &sub_dst,
+                                workspace_dir,
+                                1,
+                                native_cow,
+                                opts,
+                            )?;
+                        } else {
+                            clone_path_cow_within(&sub_src, &sub_dst, workspace_dir)?;
+                        }
+
                         cloned_entries += 1;
                     }
                 }
@@ -1042,6 +1444,37 @@ pub fn sanitize_build_cache(workspace_dir: &Path, parent_repo_root: &Path) -> Co
     for _ in discovery.flatten() {}
 
     for (cache_dir, is_cargo_target) in build_cache_dirs {
+        // Cargo keys incremental compilation sessions by absolute source path, so cloned
+        // `target/<profile>/incremental` directories cannot be reused inside a branch sandbox
+        // and only waste disk space alongside newly created sandbox sessions.
+        if is_cargo_target {
+            if let Ok(profiles) = fs::read_dir(&cache_dir) {
+                for prof_entry in profiles.flatten() {
+                    let prof_path = prof_entry.path();
+
+                    if !prof_path.is_dir() {
+                        continue;
+                    }
+
+                    let direct_inc = prof_path.join("incremental");
+
+                    if direct_inc.is_dir() && fs::remove_dir_all(&direct_inc).is_ok() {
+                        sanitized_count += 1;
+                    }
+
+                    if let Ok(sub_profiles) = fs::read_dir(&prof_path) {
+                        for sub_entry in sub_profiles.flatten() {
+                            let nested_inc = sub_entry.path().join("incremental");
+
+                            if nested_inc.is_dir() && fs::remove_dir_all(&nested_inc).is_ok() {
+                                sanitized_count += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let walker = WalkDir::new(&cache_dir).into_iter().filter_entry(|e| {
             if e.file_type().is_dir() {
                 if let Some(name) = e.file_name().to_str() {
@@ -2045,5 +2478,125 @@ mod tests {
             fs::read_to_string(venv_scripts.join("Activate.ps1")).expect("read Activate.ps1");
         assert!(activate_ps1.contains(&ws_prefix));
         assert!(!activate_ps1.contains(r"\\?\"));
+    }
+
+    #[test]
+    fn portable_copy_budget_skips_oversized_caches_and_preserves_small_ones() {
+        let src_dir = tempfile::tempdir().expect("src tempdir");
+        let dst_parent = tempfile::tempdir().expect("dst tempdir");
+        let dst_dir = dst_parent.path().join("ws");
+
+        fs::create_dir_all(src_dir.path().join("src/target/debug")).expect("mkdir nested target");
+        fs::write(src_dir.path().join("src/lib.rs"), "pub fn ok() {}\n").expect("write lib.rs");
+        fs::write(
+            src_dir.path().join("src/target/debug/huge.bin"),
+            vec![b'B'; 2 * 1024 * 1024],
+        )
+        .expect("write 2 MiB nested cache");
+
+        fs::create_dir_all(src_dir.path().join("node_modules/pkg")).expect("mkdir small nm");
+        fs::write(
+            src_dir.path().join("node_modules/pkg/index.js"),
+            b"module.exports = 1;\n",
+        )
+        .expect("write small nm");
+
+        let opts = CowWorkspaceOptions {
+            cow_cache_dirs: &[],
+            cow_exclude_dirs: &[],
+            portable_copy_cache_max_mb: 1,
+            shared_cargo_target: false,
+            force_portable_copy: true,
+        };
+        create_cow_workspace_with_options(src_dir.path(), &dst_dir, &[], &opts)
+            .expect("create workspace under portable copy budget");
+
+        assert!(
+            dst_dir.join("src/lib.rs").is_file(),
+            "source file must be copied"
+        );
+        assert!(
+            dst_dir.join("node_modules/pkg/index.js").is_file(),
+            "small cache under budget must be copied"
+        );
+        assert!(
+            !dst_dir.join("src/target").exists(),
+            "nested cache exceeding portable_copy_cache_max_mb must be skipped"
+        );
+
+        // `portable_copy_cache_max_mb = 0` skips even tiny caches during sync.
+        let zero_dst = dst_parent.path().join("ws-zero");
+        let zero_opts = CowWorkspaceOptions {
+            cow_cache_dirs: &[],
+            cow_exclude_dirs: &[],
+            portable_copy_cache_max_mb: 0,
+            shared_cargo_target: false,
+            force_portable_copy: true,
+        };
+        create_cow_workspace_with_options(src_dir.path(), &zero_dst, &[], &zero_opts)
+            .expect("create workspace with 0 budget");
+        assert!(zero_dst.join("src/lib.rs").is_file());
+        assert!(!zero_dst.join("node_modules").exists());
+        assert!(!zero_dst.join("src/target").exists());
+    }
+
+    #[test]
+    fn cow_exclude_dirs_shared_cargo_target_and_incremental_strip_work() {
+        let src_dir = tempfile::tempdir().expect("src tempdir");
+        let dst_parent = tempfile::tempdir().expect("dst tempdir");
+        let dst_excl = dst_parent.path().join("ws-excl");
+        let dst_inc = dst_parent.path().join("ws-inc");
+
+        fs::create_dir_all(src_dir.path().join("src/target/debug/deps")).expect("mkdir deps");
+        fs::create_dir_all(src_dir.path().join("src/target/debug/incremental/sess-1"))
+            .expect("mkdir incremental");
+        fs::create_dir_all(src_dir.path().join("docs/dist")).expect("mkdir docs/dist");
+        fs::write(src_dir.path().join("src/main.rs"), "fn main() {}\n").expect("write main.rs");
+        fs::write(
+            src_dir.path().join("src/target/debug/deps/libfoo.rlib"),
+            b"rlib",
+        )
+        .expect("write rlib");
+        fs::write(
+            src_dir
+                .path()
+                .join("src/target/debug/incremental/sess-1/dep-graph.bin"),
+            b"inc",
+        )
+        .expect("write inc");
+        fs::write(src_dir.path().join("docs/dist/bundle.js"), b"bundle").expect("write bundle");
+        fs::write(src_dir.path().join("docs/README.md"), "# docs\n").expect("write readme");
+
+        // `shared_cargo_target = true` + `cow_exclude_dirs = ["docs/dist"]` skips both cleanly.
+        let excludes = vec!["docs/dist".to_string()];
+        let opts_excl = CowWorkspaceOptions {
+            cow_cache_dirs: &[],
+            cow_exclude_dirs: &excludes,
+            portable_copy_cache_max_mb: 64,
+            shared_cargo_target: true,
+            force_portable_copy: false,
+        };
+        create_cow_workspace_with_options(src_dir.path(), &dst_excl, &[], &opts_excl)
+            .expect("create excluded workspace");
+        assert!(dst_excl.join("src/main.rs").is_file());
+        assert!(dst_excl.join("docs/README.md").is_file());
+        assert!(!dst_excl.join("src/target").exists());
+        assert!(!dst_excl.join("docs/dist").exists());
+
+        // Default clone keeps `deps/libfoo.rlib` but strips path-keyed `incremental/`.
+        let opts_inc = CowWorkspaceOptions {
+            cow_cache_dirs: &[],
+            cow_exclude_dirs: &[],
+            portable_copy_cache_max_mb: 64,
+            shared_cargo_target: false,
+            force_portable_copy: false,
+        };
+        create_cow_workspace_with_options(src_dir.path(), &dst_inc, &[], &opts_inc)
+            .expect("create default workspace");
+        assert!(dst_inc.join("src/target/debug/deps/libfoo.rlib").is_file());
+        assert!(
+            !dst_inc.join("src/target/debug/incremental").exists(),
+            "cloned Cargo incremental directory must be stripped during sanitization"
+        );
     }
 }

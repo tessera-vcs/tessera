@@ -369,6 +369,9 @@ pub enum Commands {
         /// Keep merged agent sessions open instead of auto-closing them after a clean merge.
         #[arg(long)]
         keep_open: bool,
+        /// Delete merged non-trunk source branches (and their sandboxes) after a clean, verified merge.
+        #[arg(short = 'd', long = "delete-branch")]
+        delete_branch: bool,
         /// Append a `Co-authored-by` trailer (defaults to configured `co_author_trailer` when passed without a value; pass `--co-author="Name <email>"` for a custom trailer).
         #[arg(
             long,
@@ -440,11 +443,23 @@ pub enum Commands {
         agent: Option<String>,
     },
 
-    /// Compact ephemeral micro-snapshots and prune orphaned sandboxes and dead port leases.
+    /// Compact ephemeral micro-snapshots and prune orphaned, merged, or stale sandboxes, caches, and dead port leases.
     Gc {
         /// Preview what would be compacted and pruned without deleting any files.
         #[arg(short = 'n', long)]
         dry_run: bool,
+        /// Keep clean sandboxes belonging to local branches already merged into trunk.
+        #[arg(long)]
+        keep_merged: bool,
+        /// Evict clean non-trunk sandboxes untouched for at least this many days.
+        #[arg(long, value_name = "DAYS")]
+        stale: Option<u64>,
+        /// Strip cloned build/dependency caches (`target/`, `node_modules/`, etc.) inside idle sandboxes.
+        #[arg(long)]
+        prune_caches: bool,
+        /// Also sweep orphaned `<repo>-<hash>` workspace caches for deleted repositories across the global cache directory.
+        #[arg(long)]
+        all: bool,
     },
 
     /// Continuously watch the working tree and auto-reconcile edits for hookless editors/harnesses.
@@ -696,6 +711,12 @@ pub enum ConfigCommands {
         #[arg(required = true)]
         dirs: Vec<String>,
     },
+    /// Add one or more directory names or relative paths to exclude from Copy-on-Write sandbox cloning and cache sync.
+    AddExcludeDir {
+        /// Directory names or relative paths (e.g., `target`, `src/target`, `node_modules`).
+        #[arg(required = true)]
+        dirs: Vec<String>,
+    },
     /// Add one or more relative binary directories to automatically prepend to `PATH` inside `tes exec`.
     AddBinDir {
         /// Relative binary paths (e.g., `.tox/bin`, `scripts/bin`).
@@ -715,7 +736,7 @@ pub enum ConfigCommands {
         /// Template value (e.g., `redis://localhost:6379/{slot}`).
         value: String,
     },
-    /// Set a scalar configuration property (`trunk_branch`, `base_port`, `port_stride`, `port_isolation`, `verify_command`, `watch_interval_ms`, `watch_timeout_secs`, `co_author`, `co_author_trailer`, `auto_isolate_dirty_claims`, `pager`).
+    /// Set a scalar configuration property (`trunk_branch`, `base_port`, `port_stride`, `port_isolation`, `verify_command`, `watch_interval_ms`, `watch_timeout_secs`, `co_author`, `co_author_trailer`, `auto_isolate_dirty_claims`, `pager`, `portable_copy_cache_max_mb`, `max_warm_sandboxes`, `shared_cargo_target`, `cow_exclude_dirs`).
     Set {
         /// Configuration key.
         key: String,

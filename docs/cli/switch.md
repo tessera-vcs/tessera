@@ -26,7 +26,7 @@ When `<branch>` does not exist yet:
 - If `--from <base-branch>` or a positional `[start-point]` is provided (`tes switch -b <new-branch> <start-point>`), Tessera resolves that revision (or fails fast if it does not exist) and creates `<branch>` from it.
 - Otherwise, if the calling session is already bound to a feature branch (`tes switch feat/parent` followed by `tes switch feat/child`), `<branch>` forks from the session's current branch commit; if not, it forks from `HEAD`.
 
-When `--editor` is passed, `tes switch` updates the primary repository working tree (`repo_root`), `.git/HEAD`, and `.git/index` to `<branch>` and binds the calling terminal session to `<branch>` while preserving isolated sandboxes for all other background terminal sessions.
+When `--editor` is passed, `tes switch` updates the primary repository working tree (`repo_root`), `.git/HEAD`, and `.git/index` to `<branch>` and binds the calling terminal session to `<branch>` while preserving isolated sandboxes for all other background terminal sessions. Sandboxes are materialized lazily: clean solo switches that do not require an isolated background sandbox skip redundant whole-repository clones, and idle non-trunk sandboxes beyond `max_warm_sandboxes` (default `8`) are evicted automatically in LRU order when clean.
 
 ## Examples
 

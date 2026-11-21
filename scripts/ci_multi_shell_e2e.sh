@@ -16,6 +16,7 @@ export PATH="$TES_DIR:$PATH"
 
 WORK_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/tes-ci-e2e.XXXXXX")"
 trap 'rm -rf "$WORK_ROOT"' EXIT
+export TES_WORKSPACES_ROOT="$WORK_ROOT/sandboxes"
 
 REPO="$WORK_ROOT/project"
 REMOTE="$WORK_ROOT/remote.git"

@@ -46,6 +46,8 @@ pub struct MergeArgs {
     pub dry_run: bool,
     /// Keep merged sessions open.
     pub keep_open: bool,
+    /// Delete merged non-trunk source branches after a clean, verified merge.
+    pub delete_branch: bool,
     /// Explicit `Co-authored-by` trailers.
     pub co_author: Vec<String>,
     /// Suppress `Co-authored-by` trailers.
@@ -115,6 +117,7 @@ pub fn run_commit(ctx: &CliContext, args: CommitArgs) -> anyhow::Result<()> {
         co_author_trailers: args.co_author,
         amend: args.amend,
         dry_run: false,
+        delete_branch: false,
     };
 
     let report = coord.merge_agents_with_options(
@@ -223,6 +226,7 @@ pub fn run_merge(ctx: &CliContext, mut args: MergeArgs) -> anyhow::Result<()> {
         co_author_trailers: normalized_trailers,
         amend: false,
         dry_run: args.dry_run,
+        delete_branch: args.delete_branch,
     };
 
     let report = coord.merge_agents_with_options(
@@ -291,6 +295,13 @@ pub fn run_merge(ctx: &CliContext, mut args: MergeArgs) -> anyhow::Result<()> {
             report.renames_applied.len(),
             report.migrations_resequenced.len()
         );
+
+        if !report.deleted_branches.is_empty() {
+            println!(
+                "  Deleted merged branch(es): {}",
+                report.deleted_branches.join(", ")
+            );
+        }
     } else if !report.conflicts.is_empty() {
         println!(
             "{} Merge encountered {} conflict(s) targeting {} (branch tip {})",

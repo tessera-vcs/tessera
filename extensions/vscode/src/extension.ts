@@ -10,6 +10,9 @@ import { promisify } from "util";
 import * as vscode from "vscode";
 import {
   CliClient,
+  DoctorReport,
+  GcOptions,
+  GcReport,
   isSyntheticConflictPath,
   isValidRefName,
   isValidSafeIdentifier,
@@ -207,6 +210,99 @@ function formatSwitchTerminalCommand(binPath: string, branch: string): string {
 }
 
 /**
+ * Formats a byte count into a human-readable binary unit string (`B`, `KiB`, `MiB`, `GiB`).
+ *
+ * @param bytes The non-negative byte count to format.
+ * @returns The formatted size string.
+ */
+function formatByteSize(bytes: number): string {
+  const kib = 1024;
+  const mib = 1024 * 1024;
+  const gib = 1024 * 1024 * 1024;
+
+  if (bytes >= gib) {
+    return `${(bytes / gib).toFixed(2)} GiB`;
+  }
+
+  if (bytes >= mib) {
+    return `${(bytes / mib).toFixed(1)} MiB`;
+  }
+
+  if (bytes >= kib) {
+    return `${(bytes / kib).toFixed(1)} KiB`;
+  }
+
+  return `${bytes} B`;
+}
+
+/**
+ * Summarizes a `GcReport` into a concise notification string for the editor UI.
+ *
+ * @param report The structured report returned by `tes gc --json`.
+ * @returns A single-line human-readable summary.
+ */
+function formatGcSummary(report: GcReport): string {
+  const prefix = report.dry_run ? "Dry-run preview" : "Garbage collection complete";
+  const sandboxCount =
+    report.pruned_sandboxes.length +
+    (report.pruned_merged_sandboxes?.length ?? 0) +
+    (report.pruned_stale_sandboxes?.length ?? 0) +
+    (report.pruned_verify_sandboxes?.length ?? 0) +
+    (report.pruned_agent_workspaces?.length ?? 0) +
+    (report.pruned_global_repos?.length ?? 0);
+  const parts: string[] = [
+    `${report.compacted_operations} op(s)`,
+    `${sandboxCount} sandbox(es)`,
+    `${report.pruned_dead_leases.length} lease(s)`,
+  ];
+
+  const cacheCount = report.pruned_caches?.length ?? 0;
+
+  if (cacheCount > 0) {
+    parts.push(`${cacheCount} cache dir(s)`);
+  }
+
+  if (report.skipped_active_sandboxes.length > 0) {
+    parts.push(`${report.skipped_active_sandboxes.length} active skipped`);
+  }
+
+  const reclaimed = report.reclaimed_bytes ?? 0;
+
+  if (reclaimed > 0) {
+    const verb = report.dry_run ? "reclaimable" : "reclaimed";
+    parts.push(`~${formatByteSize(reclaimed)} ${verb}`);
+  }
+
+  return `${prefix}: ${parts.join(", ")}.`;
+}
+
+/**
+ * Formats a `DoctorReport` into multi-line text suitable for the Tessera output channel.
+ *
+ * @param report The structured report returned by `tes doctor --json`.
+ * @returns Formatted diagnostic text.
+ */
+function formatDoctorOutput(report: DoctorReport): string {
+  const lines: string[] = ["Tessera Doctor Diagnostics"];
+
+  for (const check of report.checks) {
+    const badge =
+      check.status === "pass"
+        ? "PASS"
+        : check.status === "warn"
+          ? "WARN"
+          : "FAIL";
+    lines.push(`  [${badge}] ${check.name}: ${check.summary}`);
+  }
+
+  lines.push(
+    `Summary: ${report.summary.pass} passed, ${report.summary.warn} warning(s), ${report.summary.fail} failed`
+  );
+
+  return lines.join("\n");
+}
+
+/**
  * Formats an unknown error value into a concise single-line message and detailed log string.
  *
  * @param err The caught error object.
@@ -294,6 +390,7 @@ export function activate(context: vscode.ExtensionContext): void {
   let decorationController: AgentDecorationController | undefined;
   let latestSnapshot: WorkspaceStateSnapshot | undefined;
   const revealedConflicts = new Set<string>();
+  const doctorPromptedRoots = new Set<string>();
   const workspaceDisposables: vscode.Disposable[] = [];
   let isRefreshing = false;
   let refreshQueued = false;
@@ -462,6 +559,58 @@ export function activate(context: vscode.ExtensionContext): void {
   };
 
   /**
+   * Runs a non-blocking `tes doctor --json` check once per repository root and surfaces a
+   * subtle warning with one-click remediation actions when stale sandboxes or failing checks exist.
+   *
+   * @param activeClient The newly bound `CliClient` for the workspace.
+   * @param targetRoot The repository root path.
+   */
+  const runStartupHealthCheck = async (
+    activeClient: CliClient,
+    targetRoot: string
+  ): Promise<void> => {
+    if (!activeClient.isInitialized() || doctorPromptedRoots.has(targetRoot)) {
+      return;
+    }
+
+    try {
+      const report = await activeClient.runDoctor();
+
+      if (client !== activeClient) {
+        return;
+      }
+
+      const sandboxCheck = report.checks.find(
+        (c) => c.id === "sandboxes_leases_conflicts"
+      );
+      const hasSandboxWarning = sandboxCheck?.status === "warn";
+      const hasFailures = report.summary.fail > 0;
+
+      if (!hasFailures && !hasSandboxWarning) {
+        return;
+      }
+
+      doctorPromptedRoots.add(targetRoot);
+
+      const message = hasFailures
+        ? `Tessera detected ${report.summary.fail} health error(s) and ${report.summary.warn} warning(s) in this repository.`
+        : `Tessera: ${sandboxCheck?.summary ?? "Stale sandboxes or leases detected."}`;
+      const buttons = hasSandboxWarning
+        ? ["Run Garbage Collection", "Show Diagnostics"]
+        : ["Show Diagnostics"];
+      const choice = await vscode.window.showWarningMessage(message, ...buttons);
+
+      if (choice === "Run Garbage Collection") {
+        void vscode.commands.executeCommand("tes.gc");
+      } else if (choice === "Show Diagnostics") {
+        void vscode.commands.executeCommand("tes.doctor");
+      }
+    } catch (err: unknown) {
+      logError("runStartupHealthCheck", err);
+    }
+  };
+
+  /**
    * Binds watchers, decoration controllers, and virtual content providers to the active workspace folder.
    */
   const initializeWorkspace = (): void => {
@@ -509,6 +658,7 @@ export function activate(context: vscode.ExtensionContext): void {
     );
 
     void refreshAll();
+    void runStartupHealthCheck(nextClient, nextRepoRoot);
   };
 
   /**
@@ -1553,6 +1703,123 @@ export function activate(context: vscode.ExtensionContext): void {
         await refreshAll();
       }
     ),
+
+    registerSafeCommand("tes.gc", async () => {
+      const activeClient = requireTrustedClient();
+
+      if (!activeClient) {
+        return;
+      }
+
+      interface GcModeItem extends vscode.QuickPickItem {
+        readonly options: GcOptions;
+      }
+
+      const modes: readonly GcModeItem[] = [
+        {
+          label: "$(clear-all) Clean Orphaned & Merged Sandboxes",
+          description: "tes gc",
+          detail:
+            "Compact ephemeral oplog snapshots and prune orphaned, merged, verify, and stale metadata caches",
+          options: {},
+        },
+        {
+          label: "$(eye) Preview Cleanup (Dry Run)",
+          description: "tes gc --dry-run",
+          detail: "Inspect what would be reclaimed without deleting any files",
+          options: { dryRun: true },
+        },
+        {
+          label: "$(package) Prune Idle Build Caches",
+          description: "tes gc --prune-caches",
+          detail:
+            "Also strip build caches (target, node_modules, .venv) inside idle surviving sandboxes",
+          options: { pruneCaches: true },
+        },
+        {
+          label: "$(globe) Global Cleanup (Include Deleted Repos)",
+          description: "tes gc --all",
+          detail:
+            "Also sweep orphaned sandbox caches left behind by deleted repositories",
+          options: { allRepos: true },
+        },
+      ];
+
+      const picked = await vscode.window.showQuickPick(modes, {
+        placeHolder: "Select a Tessera garbage collection mode",
+      });
+
+      if (!picked) {
+        return;
+      }
+
+      const report = await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title: picked.options.dryRun
+            ? "Previewing Tessera garbage collection..."
+            : "Running Tessera garbage collection...",
+        },
+        async () => activeClient.runGc(picked.options)
+      );
+
+      const summary = formatGcSummary(report);
+      outputChannel.appendLine(`[${new Date().toISOString()}] ${summary}`);
+      outputChannel.appendLine(JSON.stringify(report, null, 2));
+
+      if (!picked.options.dryRun) {
+        await refreshAll();
+      }
+
+      const action = await vscode.window.showInformationMessage(
+        summary,
+        "Show Details"
+      );
+
+      if (action === "Show Details") {
+        outputChannel.show(true);
+      }
+    }),
+
+    registerSafeCommand("tes.doctor", async () => {
+      const activeClient = requireTrustedClient();
+
+      if (!activeClient) {
+        return;
+      }
+
+      const report = await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title: "Running Tessera health diagnostics...",
+        },
+        async () => activeClient.runDoctor()
+      );
+
+      const rendered = formatDoctorOutput(report);
+      outputChannel.appendLine(`[${new Date().toISOString()}]`);
+      outputChannel.appendLine(rendered);
+      outputChannel.show(true);
+
+      const sandboxWarn =
+        report.checks.find((c) => c.id === "sandboxes_leases_conflicts")
+          ?.status === "warn";
+
+      if (report.summary.fail > 0 || report.summary.warn > 0) {
+        const msg = `Tessera Doctor: ${report.summary.pass} passed, ${report.summary.warn} warning(s), ${report.summary.fail} failed.`;
+        const choice = sandboxWarn
+          ? await vscode.window.showWarningMessage(msg, "Run Garbage Collection")
+          : await vscode.window.showWarningMessage(msg);
+
+        if (choice === "Run Garbage Collection") {
+          void vscode.commands.executeCommand("tes.gc");
+        }
+      } else {
+        void vscode.window.showInformationMessage(
+          `Tessera Doctor: all ${report.summary.pass} diagnostic checks passed.`
+        );
+      }
+    }),
 
     registerSafeCommand("tes.openGraph", async () => {
       const activeClient = requireTrustedClient();

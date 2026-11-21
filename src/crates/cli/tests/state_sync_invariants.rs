@@ -3051,3 +3051,366 @@ exit 0\n",
         libc::close(master_fd);
     }
 }
+
+#[test]
+fn workspaces_root_env_override_isolates_sandboxes_and_rejects_relative_paths() {
+    let repo = Repo::new(&[("lib.rs", "pub fn x() -> i32 { 1 }\n", false)]);
+    let custom_base = tempfile::tempdir().expect("custom_base tempdir");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_tes"))
+        .current_dir(&repo.root)
+        .env("TES_SESSION_ID", "env-override-agent")
+        .env("TES_WORKSPACES_ROOT", custom_base.path())
+        .args(["doctor", "--json"])
+        .output()
+        .expect("run tes doctor with TES_WORKSPACES_ROOT");
+    assert!(
+        out.status.success(),
+        "tes doctor failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let doc: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("doctor json with override");
+    let probe_root = PathBuf::from(
+        doc["checks"]
+            .as_array()
+            .expect("checks array")
+            .iter()
+            .find(|c| c["id"] == "cow_strategy")
+            .and_then(|c| c["details"]["probe_root"].as_str())
+            .expect("probe_root"),
+    );
+
+    assert!(
+        probe_root.starts_with(custom_base.path())
+            || probe_root
+                .canonicalize()
+                .ok()
+                .zip(custom_base.path().canonicalize().ok())
+                .is_some_and(|(a, b)| a.starts_with(b)),
+        "TES_WORKSPACES_ROOT must place sandboxes inside custom base: {}",
+        probe_root.display()
+    );
+    assert!(
+        custom_base.path().join("CACHEDIR.TAG").is_file(),
+        "custom workspaces root must receive CACHEDIR.TAG"
+    );
+    assert!(
+        probe_root.join(".repo_root").is_file(),
+        "sandbox slug must write .repo_root marker"
+    );
+
+    // Relative TES_WORKSPACES_ROOT must be ignored safely.
+    let rel_out = Command::new(env!("CARGO_BIN_EXE_tes"))
+        .current_dir(&repo.root)
+        .env("TES_SESSION_ID", "env-override-agent")
+        .env("TES_WORKSPACES_ROOT", "relative/unsafe/path")
+        .args(["doctor", "--json"])
+        .output()
+        .expect("run tes doctor with relative TES_WORKSPACES_ROOT");
+    assert!(rel_out.status.success());
+
+    let rel_doc: serde_json::Value =
+        serde_json::from_slice(&rel_out.stdout).expect("doctor json with relative override");
+    let rel_probe = rel_doc["checks"]
+        .as_array()
+        .expect("checks array")
+        .iter()
+        .find(|c| c["id"] == "cow_strategy")
+        .and_then(|c| c["details"]["probe_root"].as_str())
+        .expect("rel_probe");
+    assert!(
+        !rel_probe.contains("relative/unsafe/path"),
+        "relative TES_WORKSPACES_ROOT must be ignored: {rel_probe}"
+    );
+}
+
+#[test]
+fn gc_all_sweeps_deleted_repo_and_doctor_reports_merged_verify_and_usage() {
+    let repo = Repo::new(&[("lib.rs", "pub fn x() -> i32 { 1 }\n", false)]);
+    let custom_base = tempfile::tempdir().expect("custom_base tempdir");
+    let existing_other_repo = tempfile::tempdir().expect("existing_other_repo tempdir");
+    fs::create_dir_all(existing_other_repo.path().join(".git")).expect("mkdir .git");
+
+    let dead_slug = custom_base
+        .path()
+        .join("deleted-proj-0123456789abcdef0123456789abcdef");
+    fs::create_dir_all(dead_slug.join("branches").join("main")).expect("mkdir dead slug");
+    fs::write(
+        dead_slug.join(".repo_root"),
+        custom_base
+            .path()
+            .join("nonexistent-repo")
+            .display()
+            .to_string(),
+    )
+    .expect("write dead .repo_root");
+    fs::write(
+        dead_slug.join("branches").join("main").join("big.bin"),
+        vec![b'D'; 65_536],
+    )
+    .expect("write dead big.bin");
+
+    let live_slug = custom_base
+        .path()
+        .join("live-proj-fedcba9876543210fedcba9876543210");
+    fs::create_dir_all(live_slug.join("branches").join("main")).expect("mkdir live slug");
+    fs::write(
+        live_slug.join(".repo_root"),
+        existing_other_repo.path().display().to_string(),
+    )
+    .expect("write live .repo_root");
+
+    let run_tes = |args: &[&str]| -> serde_json::Value {
+        let out = Command::new(env!("CARGO_BIN_EXE_tes"))
+            .current_dir(&repo.root)
+            .env("TES_SESSION_ID", "gc-all-agent")
+            .env("TES_WORKSPACES_ROOT", custom_base.path())
+            .env("TES_NO_PAGER", "1")
+            .args(args)
+            .output()
+            .expect("spawn tes");
+        assert!(
+            out.status.success(),
+            "tes {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout).expect("parse json output")
+    };
+
+    // Create a merged feature branch and materialize its sandbox via `tes exec`.
+    let _ = Command::new(env!("CARGO_BIN_EXE_tes"))
+        .current_dir(&repo.root)
+        .env("TES_SESSION_ID", "gc-all-agent")
+        .env("TES_WORKSPACES_ROOT", custom_base.path())
+        .args(["switch", "-b", "feat/already-merged"])
+        .output()
+        .expect("switch -b");
+    let exec_out = Command::new(env!("CARGO_BIN_EXE_tes"))
+        .current_dir(&repo.root)
+        .env("TES_SESSION_ID", "gc-all-agent")
+        .env("TES_WORKSPACES_ROOT", custom_base.path())
+        .args([
+            "exec",
+            "-b",
+            "feat/already-merged",
+            "--",
+            env!("CARGO_BIN_EXE_tes"),
+            "--version",
+        ])
+        .output()
+        .expect("exec to materialize sandbox");
+    assert!(
+        exec_out.status.success(),
+        "tes exec failed: {}",
+        String::from_utf8_lossy(&exec_out.stderr)
+    );
+    let _ = Command::new(env!("CARGO_BIN_EXE_tes"))
+        .current_dir(&repo.root)
+        .env("TES_SESSION_ID", "gc-all-agent")
+        .env("TES_WORKSPACES_ROOT", custom_base.path())
+        .args(["switch", "main"])
+        .output()
+        .expect("switch back to main");
+
+    let doc_probe = run_tes(&["doctor", "--json"]);
+    let probe_root = PathBuf::from(
+        doc_probe["checks"]
+            .as_array()
+            .expect("checks")
+            .iter()
+            .find(|c| c["id"] == "cow_strategy")
+            .and_then(|c| c["details"]["probe_root"].as_str())
+            .expect("probe_root"),
+    );
+
+    // Seed a crashed verify sandbox and an orphaned in-repo agent workspace.
+    let dead_verify = probe_root.join("verify-sandbox-99999999-42-1");
+    fs::create_dir_all(&dead_verify).expect("mkdir dead_verify");
+    let orphan_ws = repo
+        .root
+        .join(".tessera")
+        .join("workspaces")
+        .join("stale-agent");
+    fs::create_dir_all(&orphan_ws).expect("mkdir orphan_ws");
+
+    let merged_safe = agent::Coordinator::sanitize_branch_name("feat/already-merged");
+
+    let doc_warn = run_tes(&["doctor", "--json"]);
+    let rt_check = doc_warn["checks"]
+        .as_array()
+        .expect("checks")
+        .iter()
+        .find(|c| c["id"] == "sandboxes_leases_conflicts")
+        .expect("sandboxes_leases_conflicts");
+    assert_eq!(rt_check["status"], "warn", "{rt_check}");
+    assert_eq!(
+        rt_check["details"]["merged_sandboxes"],
+        serde_json::json!([merged_safe.clone()]),
+        "{rt_check}"
+    );
+    assert_eq!(
+        rt_check["details"]["crashed_verify_sandboxes"],
+        serde_json::json!(["verify-sandbox-99999999-42-1"]),
+        "{rt_check}"
+    );
+    assert_eq!(
+        rt_check["details"]["orphaned_agent_workspaces"],
+        serde_json::json!(["stale-agent"]),
+        "{rt_check}"
+    );
+    assert_eq!(
+        rt_check["details"]["stale_global_repos"],
+        serde_json::json!(["deleted-proj-0123456789abcdef0123456789abcdef"]),
+        "{rt_check}"
+    );
+    assert!(
+        rt_check["details"]["sandbox_disk_usage"]["file_count"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0,
+        "doctor must report sandbox file_count: {rt_check}"
+    );
+
+    // Dry-run `--all` previews all deletions without removing anything.
+    let dry = run_tes(&["gc", "--dry-run", "--all", "--json"]);
+    assert_eq!(dry["dry_run"], true);
+    assert_eq!(
+        dry["pruned_merged_sandboxes"],
+        serde_json::json!([merged_safe]),
+        "{dry}"
+    );
+    assert_eq!(
+        dry["pruned_global_repos"],
+        serde_json::json!(["deleted-proj-0123456789abcdef0123456789abcdef"]),
+        "{dry}"
+    );
+    assert!(
+        dry["reclaimed_bytes"].as_u64().unwrap_or(0) >= 65_536,
+        "{dry}"
+    );
+    assert!(dead_slug.is_dir(), "dry-run must preserve dead_slug");
+    assert!(dead_verify.is_dir(), "dry-run must preserve dead_verify");
+
+    // Apply `--all` sweeps dead repo, merged sandbox, crashed verify sandbox, and orphaned ws, while keeping live_slug.
+    let applied = run_tes(&["gc", "--all", "--json"]);
+    assert_eq!(
+        applied["pruned_global_repos"],
+        serde_json::json!(["deleted-proj-0123456789abcdef0123456789abcdef"]),
+        "{applied}"
+    );
+    assert!(!dead_slug.exists(), "dead_slug must be deleted");
+    assert!(live_slug.is_dir(), "live_slug must be preserved");
+    assert!(!dead_verify.exists(), "dead_verify must be deleted");
+    assert!(!orphan_ws.exists(), "orphan_ws must be deleted");
+
+    let doc_clean = run_tes(&["doctor", "--json"]);
+    let rt_clean = doc_clean["checks"]
+        .as_array()
+        .expect("checks")
+        .iter()
+        .find(|c| c["id"] == "sandboxes_leases_conflicts")
+        .expect("sandboxes_leases_conflicts");
+    assert_eq!(rt_clean["status"], "pass", "{rt_clean}");
+}
+
+#[test]
+fn config_cache_policy_and_merge_delete_branch_cli_e2e() {
+    let repo = Repo::new(&[("lib.rs", "pub fn v() -> i32 { 1 }\n", false)]);
+
+    let cfg1_raw = repo.tes(
+        "cfg-agent",
+        &["config", "add-exclude-dir", "src/target", "dist", "--json"],
+    );
+    let cfg1: serde_json::Value = serde_json::from_str(&cfg1_raw).expect("cfg1 json");
+    assert_eq!(
+        cfg1["cow_exclude_dirs"],
+        serde_json::json!(["src/target", "dist"]),
+        "{cfg1}"
+    );
+
+    let cfg2_raw = repo.tes(
+        "cfg-agent",
+        &[
+            "config",
+            "set",
+            "portable_copy_cache_max_mb",
+            "32",
+            "--json",
+        ],
+    );
+    let cfg2: serde_json::Value = serde_json::from_str(&cfg2_raw).expect("cfg2 json");
+    assert_eq!(cfg2["portable_copy_cache_max_mb"], 32, "{cfg2}");
+
+    let cfg3_raw = repo.tes(
+        "cfg-agent",
+        &["config", "set", "max_warm_sandboxes", "4", "--json"],
+    );
+    let cfg3: serde_json::Value = serde_json::from_str(&cfg3_raw).expect("cfg3 json");
+    assert_eq!(cfg3["max_warm_sandboxes"], 4, "{cfg3}");
+
+    let cfg4_raw = repo.tes(
+        "cfg-agent",
+        &["config", "set", "shared_cargo_target", "true", "--json"],
+    );
+    let cfg4: serde_json::Value = serde_json::from_str(&cfg4_raw).expect("cfg4 json");
+    assert_eq!(cfg4["shared_cargo_target"], true, "{cfg4}");
+
+    // Create a feature branch, commit a change, then merge with `-d` and confirm branch deletion.
+    repo.tes(
+        "feat-agent",
+        &[
+            "claim",
+            "-b",
+            "feat/cli-merge-del",
+            "--intent",
+            "add helper",
+            "lib.rs",
+        ],
+    );
+    repo.write(
+        "lib.rs",
+        "pub fn v() -> i32 { 1 }\npub fn helper() -> i32 { 7 }\n",
+    );
+    repo.tes("feat-agent", &["hook", "post-tool", "--path", "lib.rs"]);
+    repo.tes("feat-agent", &["commit", "-m", "feat: add helper"]);
+
+    let merge_raw = repo.tes(
+        "cfg-agent",
+        &[
+            "merge",
+            "feat/cli-merge-del",
+            "--into",
+            "main",
+            "-d",
+            "-m",
+            "feat: merge helper",
+            "--json",
+        ],
+    );
+    let merge_json: serde_json::Value = serde_json::from_str(&merge_raw).expect("merge json");
+    assert_eq!(
+        merge_json["deleted_branches"],
+        serde_json::json!(["feat/cli-merge-del"]),
+        "{merge_json}"
+    );
+    assert!(
+        repo.read("lib.rs").contains("pub fn helper()"),
+        "merged helper must be present on main"
+    );
+
+    let branches_raw = repo.tes("cfg-agent", &["branch", "--json"]);
+    let branches_json: serde_json::Value =
+        serde_json::from_str(&branches_raw).expect("branch json");
+    let branch_list = branches_json["branches"]
+        .as_array()
+        .expect("branches array");
+    assert!(
+        !branch_list
+            .iter()
+            .any(|b| b.as_str() == Some("feat/cli-merge-del")),
+        "feat/cli-merge-del must be absent from branch list after `tes merge -d`: {branches_json}"
+    );
+}

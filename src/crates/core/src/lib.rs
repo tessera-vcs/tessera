@@ -9,6 +9,7 @@ pub use rust_core::*;
 pub mod git_backend;
 pub mod model;
 pub mod oplog;
+pub mod sandbox_paths;
 
 pub use git_backend::{
     CommitGraphNode, GitBackend, GitCommit, GitTreeNode, is_valid_sandbox_repo_root,
@@ -22,3 +23,9 @@ pub use model::{
     validate_safe_identifier, write_working_tree_file_safe,
 };
 pub use oplog::{OpLogStore, Operation, View};
+pub use sandbox_paths::{
+    CACHEDIR_TAG_CONTENT, WORKSPACES_ROOT_ENV, authorized_sandbox_bases,
+    candidate_workspaces_bases, compute_repo_slug, configured_workspaces_root,
+    ensure_cache_dir_hygiene, global_workspaces_bases, is_path_inside_temp_dir,
+    primary_global_workspaces_base,
+};

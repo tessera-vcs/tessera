@@ -16,6 +16,7 @@ tes merge [branches_or_sessions...] [options]
 - `--verify-cmd <CMD>` - Explicit speculative verification command to run before finalizing the merge (e.g., `--verify-cmd "npm run build"`; conflicts with `--verify`).
 - `--dry-run` - Preview the full semantic merge in memory (reporting files that would change and any conflicts that would occur) without advancing branch refs, modifying working-tree files, or recording an operation log entry.
 - `--keep-open` - Keep agent sessions open after merging.
+- `-d, --delete-branch` - Delete merged non-trunk source branches (and their cached sandboxes) after a clean, verified merge.
 - `--co-author [=<NAME <EMAIL>>]` - Append a `Co-authored-by:` trailer to the merge commit (defaults to configured `co_author_trailer` when passed without a value; repeatable).
 - `--no-co-author` - Omit `Co-authored-by:` trailers even if `co_author = true` in repository config.
 - `--author <NAME <EMAIL>>` - Override the commit `Author` identity for the merge commit.
@@ -37,8 +38,8 @@ tes merge -m "feat(pricing): add pricing calculator"
 # preview a multi-branch merge without mutating refs or the working tree
 tes merge feat/pricing feat/faq --into main --dry-run
 
-# merge two feature branches into main
-tes merge feat/pricing feat/faq --into main -m "feat: add pricing and faq"
+# merge two feature branches into main and delete the merged branches
+tes merge feat/pricing feat/faq --into main -d -m "feat: add pricing and faq"
 
 # merge with an explicit Co-authored-by trailer
 tes merge feat/pricing --into main -m "feat: add pricing" --co-author

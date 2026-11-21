@@ -94,7 +94,7 @@ tes merge <branch1> [<branch2> ...] --into main -m "<commit message>"
 | `tes radar` | `tes radar [--json]` (lists all active sessions, ports, branches, and claimed files) |
 | `tes exec` | `tes exec [-b <branch>] [-a <id>] -- <cmd> [args...]` |
 | `tes commit` | `tes commit [-m "<msg>"] [-b <branch>] [--amend] [--no-edit] [--verify[=<cmd>] \| --verify-cmd <cmd>] [--author "<Name <email>>"] [--co-author \| --no-co-author]` |
-| `tes merge` | `tes merge [<branches...>] [--into <target>] [-m "<msg>"] [--verify[=<cmd>] \| --verify-cmd <cmd>] [--dry-run] [--keep-open] [--author "<Name <email>>"] [--co-author \| --no-co-author]` |
+| `tes merge` | `tes merge [<branches...>] [--into <target>] [-m "<msg>"] [--verify[=<cmd>] \| --verify-cmd <cmd>] [--dry-run] [--keep-open] [-d \| --delete-branch] [--author "<Name <email>>"] [--co-author \| --no-co-author]` |
 | `tes cherry-pick` | `tes cherry-pick <commit> [-b <target-branch>] [-a <id>]` |
 | `tes pull` | `tes pull [<remote>] [<branch>] [-a <id>]` |
 | `tes push` | `tes push [-u] [-m "<msg>"] [-f \| --force-with-lease] [--tags] [-d \| --delete] [-n \| --dry-run] [--no-auto-commit] [<remote>] [<branch>] [-a <id>]` |
@@ -106,10 +106,10 @@ tes merge <branch1> [<branch2> ...] --into main -m "<commit message>"
 | `tes oplog` | `tes oplog [-n <limit>] [--json]` |
 | `tes undo` | `tes undo [--op <operation-id>] [--checkpoint <label>]` |
 | `tes sync` | `tes sync [--json]` (non-blocking auto-rebase of active sessions onto trunk) |
-| `tes gc` | `tes gc [-n \| --dry-run] [--json]` (compacts ephemeral micro-snapshots and prunes orphaned sandboxes and dead port leases) |
+| `tes gc` | `tes gc [-n \| --dry-run] [--keep-merged] [--stale <days>] [--prune-caches] [--all] [--json]` (compacts ephemeral micro-snapshots and prunes orphaned, merged, stale, verify, and global sandboxes plus dead leases) |
 | `tes watch` | `tes watch [-a <id>] [--interval-ms <ms>] [--once] [--json]` |
 | `tes agent` (`session`) | `tes agent spawn \| list \| focus <id> \| exec <id> -- <cmd> \| close [id \| --all] \| clear [-f]` |
-| `tes config` | `tes config show \| set <k> <v> \| add-cache-dir <d> \| add-package-glob <p> \| add-bin-dir <d> \| set-env <k> <v> \| trust \| untrust` |
+| `tes config` | `tes config show \| set <k> <v> \| add-cache-dir <d> \| add-exclude-dir <d> \| add-package-glob <p> \| add-bin-dir <d> \| set-env <k> <v> \| trust \| untrust` |
 | `tes doctor` | `tes doctor [--json]` (repository health, config trust, CoW, hooks, and session diagnostics) |
 | `tes upgrade` (`update`) | `tes upgrade [--check] [--version <ver>] [--force] [--json]` (self-update `tes` in place with SHA-256 verification; also `tes --upgrade` / `tes --update`) |
 | `tes mcp` | `tes mcp` (starts the Model Context Protocol JSON-RPC 2.0 server over stdio) |
@@ -139,7 +139,7 @@ When connected via MCP (`tes mcp`), the following tools, resources, and prompts 
 - `resolve`: `{ path, strategy: "ours"|"theirs"|"ast-union"|"working"|"content", content? }`
 - `sync`: `{}`
 - `undo`: `{ op?, checkpoint? }`
-- `merge`: `{ agents?, into?, message?, verify?, keep_open?, dry_run?, author?, co_author?, no_co_author? }`
+- `merge`: `{ agents?, into?, message?, verify?, keep_open?, delete_branch?, dry_run?, author?, co_author?, no_co_author? }`
 - `agent`: `{ action?: "list"|"close"|"clear", name?, all?, force?, agent_id? }`
 - `config`: `{ action?: "show" }`
 - `doctor`: `{}`
