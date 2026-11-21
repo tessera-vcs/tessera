@@ -72,6 +72,8 @@ fn rename_replacing_target(tmp_path: &Path, target_path: &Path) -> std::io::Resu
                     let mut perms = meta.permissions();
 
                     if perms.readonly() {
+                        // Windows-only: clears FILE_ATTRIBUTE_READONLY without affecting Unix modes.
+                        #[allow(clippy::permissions_set_readonly_false)]
                         perms.set_readonly(false);
                         let _ = fs::set_permissions(target_path, perms);
                     }

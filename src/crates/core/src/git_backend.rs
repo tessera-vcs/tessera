@@ -575,6 +575,23 @@ impl GitBackend {
                     .and_then(|s| s.to_str())
                     == Some(".tessera")
             {
+                if let (Some(raw_root), Some(raw_ws)) = (env_root, env_ws) {
+                    let ws_path = PathBuf::from(raw_ws.trim());
+                    let target_root = PathBuf::from(raw_root.trim());
+
+                    // Only honor `TES_WORKSPACE` inside `.tessera/tmp` when `TES_WORKSPACE` itself
+                    // resides inside this `.tessera/tmp` boundary so tempdirs created under `tes exec`
+                    // never escape back into the enclosing host sandbox.
+                    if !ws_path.as_os_str().is_empty()
+                        && path_starts_with_canonical(&ws_path, &curr)
+                        && path_starts_with_canonical(&abs_start, &ws_path)
+                    {
+                        if let Some((target_git, target_common)) = resolve_dot_git(&target_root) {
+                            return Ok(Self::with_paths(target_root, target_git, target_common));
+                        }
+                    }
+                }
+
                 return Err(CoreError::RepoNotFound(start_dir.display().to_string()));
             }
 
@@ -2696,8 +2713,35 @@ mod tests {
         let canon_sandbox = sandbox_dir.canonicalize().expect("canon sandbox");
         assert_eq!(
             is_valid_sandbox_repo_root(&canon_sandbox, Some(&repo_dir)),
-            Some(repo_dir)
+            Some(repo_dir.clone())
         );
+
+        // Verify `.tessera/tmp` blocks an enclosing host `TES_WORKSPACE` while allowing a nested one.
+        let host_ws = tmp.path().join("host-sandbox");
+        let nested_tmp = host_ws.join(".tessera").join("tmp").join("job-1");
+        let nested_ws = nested_tmp.join("inner-ws");
+        let nested_sub = nested_ws.join("pkg");
+        fs::create_dir_all(&nested_sub).expect("mkdir nested_sub");
+
+        let host_ws_str = host_ws.display().to_string();
+        let nested_ws_str = nested_ws.display().to_string();
+
+        let blocked_host = GitBackend::discover_with_context(
+            Path::new("."),
+            Some(&nested_sub),
+            Some(&repo_str),
+            Some(&host_ws_str),
+        );
+        assert!(matches!(blocked_host, Err(CoreError::RepoNotFound(_))));
+
+        let allowed_nested = GitBackend::discover_with_context(
+            Path::new("."),
+            Some(&nested_sub),
+            Some(&repo_str),
+            Some(&nested_ws_str),
+        )
+        .expect("nested TES_WORKSPACE inside .tessera/tmp should resolve");
+        assert_eq!(allowed_nested.repo_root(), repo_dir.as_path());
     }
 
     #[test]
