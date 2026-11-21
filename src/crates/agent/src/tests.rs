@@ -2836,3 +2836,104 @@ fn pre_tool_protects_unowned_human_edits_and_post_tool_preserves_executable_mode
         "pre-tool must never silently overwrite unowned uncommitted human edits in repo_root"
     );
 }
+
+#[test]
+fn watcher_skips_head_blobs_and_drops_stale_pre_commit_observations() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    fs::write(root.join("other.txt"), "hello\n").expect("write other.txt");
+
+    let (coord, _) = Coordinator::init_repo(root).expect("init_repo");
+    let initial_head = coord
+        .git()
+        .resolve_head_commit()
+        .expect("head")
+        .expect("cid");
+    let initial_tree = coord
+        .git()
+        .read_commit(&initial_head)
+        .expect("commit")
+        .tree_id;
+    let hello_blob = coord.git().write_blob(b"hello\n").expect("hello blob");
+
+    coord
+        .claim_intent_and_symbols("term-diff", Some("Watch other"), &["other.txt".to_string()])
+        .expect("claim term-diff");
+
+    // Unmodified HEAD blob must never be recorded into `observed_blobs`.
+    assert!(
+        !crate::watcher::record_watched_blob_if_fresh(
+            &coord,
+            "other.txt",
+            hello_blob,
+            Some(initial_head),
+            Some(initial_tree),
+        ),
+        "watcher must skip blobs that already match HEAD"
+    );
+
+    // Advance HEAD via commit, then verify a stale pre-commit observation is rejected.
+    fs::write(root.join("other.txt"), "trunk v3\n").expect("write v3");
+    handle_post_tool_hook(&coord, "term-diff", "other.txt").expect("post-tool v3");
+    coord
+        .merge_agents_with_message(
+            &["term-diff".to_string()],
+            Some("main"),
+            None,
+            false,
+            Some("feat: trunk v3"),
+        )
+        .expect("commit v3");
+
+    let stale_edit_blob = coord
+        .git()
+        .write_blob(b"unstaged edit\n")
+        .expect("stale blob");
+    assert!(
+        !crate::watcher::record_watched_blob_if_fresh(
+            &coord,
+            "other.txt",
+            stale_edit_blob,
+            Some(initial_head),
+            Some(initial_tree),
+        ),
+        "watcher must drop observations whose HEAD advanced concurrently"
+    );
+
+    // Subsequent same-branch concurrent edits must record the real conflict on `r2` without a phantom conflict on `r1`.
+    coord
+        .claim_intent_and_symbols_with_branch(
+            "r1",
+            Some("Left"),
+            &["other.txt".to_string()],
+            Some("main"),
+        )
+        .expect("claim r1");
+    coord
+        .claim_intent_and_symbols_with_branch(
+            "r2",
+            Some("Right"),
+            &["other.txt".to_string()],
+            Some("main"),
+        )
+        .expect("claim r2");
+
+    fs::write(root.join("other.txt"), "left version\n").expect("write left");
+    let out1 = handle_post_tool_hook(&coord, "r1", "other.txt").expect("post-tool r1");
+    assert!(
+        !out1.has_conflict,
+        "first editor r1 must not hit a phantom conflict"
+    );
+
+    fs::write(root.join("other.txt"), "right version\n").expect("write right");
+    let out2 = handle_post_tool_hook(&coord, "r2", "other.txt").expect("post-tool r2");
+    assert!(
+        out2.has_conflict,
+        "second editor r2 must detect the real conflict"
+    );
+    let cur = coord.oplog().load_current_reconciled().expect("load oplog");
+    assert!(
+        cur.view.conflicts.contains_key("other.txt"),
+        "active conflict must remain registered for tes resolve"
+    );
+}
