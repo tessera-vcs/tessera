@@ -14,7 +14,10 @@ use core::{
 };
 use merge::{attribute_agent_hunks, diff_modified_symbols, merge_ast_union};
 use serde::{Deserialize, Serialize};
-use workspace::{build_agent_env_with_config, create_cow_workspace, snapshot_working_dir};
+use workspace::{
+    CowWorkspaceOptions, build_agent_env_with_config, create_cow_workspace_with_options,
+    snapshot_working_dir,
+};
 
 use crate::harness::{
     KNOWN_HARNESS_PATHS, add_paths_to_git_exclude, install_harness_integrations_for,
@@ -2235,7 +2238,8 @@ impl Coordinator {
             .join("workspaces")
             .join(agent_id);
 
-        create_cow_workspace(self.git.repo_root(), &ws_dir, &scopes, &cfg.cow_cache_dirs)?;
+        let cow_opts = CowWorkspaceOptions::from_config(&cfg);
+        create_cow_workspace_with_options(self.git.repo_root(), &ws_dir, &scopes, &cow_opts)?;
 
         let _ = self.ensure_session(agent_id, intent)?;
         let ws_path_str = ws_dir.display().to_string();
@@ -3102,8 +3106,15 @@ impl Coordinator {
             },
         )?;
 
-        if clean_branch.is_some() {
-            let _ = self.prepare_branch_sandbox(agent_id, clean_branch);
+        if let Some(target_b) = clean_branch {
+            let head_now = self
+                .git
+                .current_branch_name()
+                .unwrap_or_else(|_| cfg.trunk_branch.clone());
+
+            if target_b != head_now || self.branch_sandbox_dir(target_b).is_dir() {
+                let _ = self.prepare_branch_sandbox(agent_id, Some(target_b));
+            }
         }
 
         for sym in symbols {

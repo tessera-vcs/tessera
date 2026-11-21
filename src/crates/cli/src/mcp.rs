@@ -532,6 +532,11 @@ fn parse_mcp_commit_options(args: &Value, allow_amend: bool) -> CommitOptions {
         }
     };
 
+    let delete_branch = args
+        .get("delete_branch")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
     CommitOptions {
         message,
         author,
@@ -539,6 +544,7 @@ fn parse_mcp_commit_options(args: &Value, allow_amend: bool) -> CommitOptions {
         co_author_trailers,
         amend,
         dry_run,
+        delete_branch,
     }
 }
 
@@ -1402,6 +1408,7 @@ fn mcp_tool_definitions() -> Value {
                     "verify": { "type": "boolean", "description": "Run the repository's configured trusted verification command before finalizing the merge." },
                     "dry_run": { "type": "boolean", "description": "Simulate the merge without mutating Git refs, working trees, or the Operation Log." },
                     "keep_open": { "type": "boolean", "description": "Keep merged agent sessions open after a clean merge." },
+                    "delete_branch": { "type": "boolean", "description": "Delete merged non-trunk source branches and their sandboxes after a clean, verified merge." },
                     "author": { "type": "string", "description": "Optional author override (\"Name <email>\")." },
                     "co_author": { "description": "Optional boolean or Co-authored-by trailer string/array." },
                     "no_co_author": { "type": "boolean", "description": "Suppress Co-authored-by trailers." }

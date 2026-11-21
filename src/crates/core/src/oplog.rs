@@ -465,6 +465,10 @@ struct RepoConfigOverlay {
     base_port: Option<u16>,
     port_stride: Option<u16>,
     cow_cache_dirs: Option<Vec<String>>,
+    cow_exclude_dirs: Option<Vec<String>>,
+    portable_copy_cache_max_mb: Option<u64>,
+    max_warm_sandboxes: Option<usize>,
+    shared_cargo_target: Option<bool>,
     extra_bin_dirs: Option<Vec<String>>,
     package_globs: Option<Vec<String>>,
     verify_command: Option<String>,
@@ -778,6 +782,28 @@ impl OpLogStore {
                                     }
                                 }
                             }
+                        }
+
+                        if let Some(exclude_dirs) = overlay.cow_exclude_dirs {
+                            for dir in exclude_dirs {
+                                if let Ok(clean_dir) = validate_repo_rel_path(&dir) {
+                                    if !cfg.cow_exclude_dirs.contains(&clean_dir) {
+                                        cfg.cow_exclude_dirs.push(clean_dir);
+                                    }
+                                }
+                            }
+                        }
+
+                        if let Some(max_mb) = overlay.portable_copy_cache_max_mb {
+                            cfg.portable_copy_cache_max_mb = max_mb;
+                        }
+
+                        if let Some(max_ws) = overlay.max_warm_sandboxes {
+                            cfg.max_warm_sandboxes = max_ws;
+                        }
+
+                        if let Some(shared_target) = overlay.shared_cargo_target {
+                            cfg.shared_cargo_target = shared_target;
                         }
 
                         if let Some(globs) = overlay.package_globs {

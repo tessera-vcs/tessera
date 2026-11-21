@@ -184,6 +184,18 @@
         "icon": "$(trash)"
       },
       {
+        "command": "tes.gc",
+        "title": "Run Garbage Collection",
+        "category": "Tessera",
+        "icon": "$(clear-all)"
+      },
+      {
+        "command": "tes.doctor",
+        "title": "Run Health Diagnostics",
+        "category": "Tessera",
+        "icon": "$(pulse)"
+      },
+      {
         "command": "tes.refresh",
         "title": "Refresh",
         "category": "Tessera",
@@ -228,6 +240,11 @@
           "command": "tes.clearSessions",
           "when": "view == sessions",
           "group": "navigation@1"
+        },
+        {
+          "command": "tes.gc",
+          "when": "view == branches || view == scmBranches",
+          "group": "navigation@4"
         },
         {
           "command": "tes.refresh",

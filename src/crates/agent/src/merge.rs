@@ -14,8 +14,8 @@ use core::{
 };
 use merge::{merge_ast_union, merge_file_3way, merge_trees_3way};
 use workspace::{
-    create_cow_workspace, materialize_tree_to_dir, materialize_tree_to_dir_with_baseline,
-    snapshot_working_dir,
+    CowWorkspaceOptions, create_cow_workspace_with_options, materialize_tree_to_dir,
+    materialize_tree_to_dir_with_baseline, snapshot_working_dir,
 };
 
 use crate::session::detect_session_id;
@@ -328,10 +328,20 @@ impl Coordinator {
         let mut merge_units = Vec::new();
         let mut shared_root_group: Vec<AgentMetadata> = Vec::new();
         let mut merged_session_ids = BTreeSet::new();
+        let mut merged_source_branches: BTreeMap<String, ObjectId> = BTreeMap::new();
 
         for id in &target_ids {
             if let Some(existing) = current.view.agents.get(id) {
                 merged_session_ids.insert(id.clone());
+
+                if let Some(tb) = existing.target_branch.as_deref() {
+                    if tb != branch && tb != cfg.trunk_branch {
+                        if let Ok(Some(tb_cid)) = self.git.resolve_ref(&format!("refs/heads/{tb}"))
+                        {
+                            merged_source_branches.insert(tb.to_string(), tb_cid);
+                        }
+                    }
+                }
 
                 if existing.workspace_path.is_some() {
                     if dry_run {
@@ -362,6 +372,9 @@ impl Coordinator {
                     shared_root_group.push(existing.clone());
                 }
             } else if let Some(branch_cid) = self.git.resolve_ref(&format!("refs/heads/{id}"))? {
+                if id != &branch && id != &cfg.trunk_branch {
+                    merged_source_branches.insert(id.clone(), branch_cid);
+                }
                 let b_commit = self.git.read_commit(&branch_cid)?;
                 let b_base = self.resolve_merge_base(&trunk_commit_id, &branch_cid);
                 let b_intent = b_commit
@@ -637,7 +650,8 @@ impl Coordinator {
                 dir: verify_dir.clone(),
             };
 
-            create_cow_workspace(self.git.repo_root(), &verify_dir, &[], &cfg.cow_cache_dirs)?;
+            let cow_opts = CowWorkspaceOptions::from_config(&cfg);
+            create_cow_workspace_with_options(self.git.repo_root(), &verify_dir, &[], &cow_opts)?;
             materialize_tree_to_dir(&self.git, &acc_tree, &verify_dir)?;
             let pkg_csv = affected_packages.join(",");
 
@@ -658,6 +672,12 @@ impl Coordinator {
                 c.args(["-c", cmd_str]);
                 c
             };
+
+            if cfg.shared_cargo_target {
+                let shared_target = self.sandboxes_root().join("shared-target");
+                let _ = fs::create_dir_all(&shared_target);
+                verify_proc.env("CARGO_TARGET_DIR", &shared_target);
+            }
 
             let output = verify_proc
                 .current_dir(&verify_dir)
@@ -722,6 +742,7 @@ impl Coordinator {
                 migrations_resequenced: all_migrations,
                 affected_packages,
                 closed_agents: Vec::new(),
+                deleted_branches: Vec::new(),
                 verification_passed,
                 verification_output,
                 created_commit: false,
@@ -1597,6 +1618,44 @@ impl Coordinator {
                 .update_ref(&format!("refs/tessera/changes/{}", cid.as_str()), head_cid);
         }
 
+        let mut deleted_branches: Vec<String> = Vec::new();
+
+        if options.delete_branch && verification_passed && all_conflicts.is_empty() {
+            let post_merge_view = self.oplog.load_current_reconciled().ok().map(|op| op.view);
+
+            for (src_branch, merged_cid) in &merged_source_branches {
+                if src_branch == &cfg.trunk_branch || src_branch == &branch {
+                    continue;
+                }
+
+                let tip_unchanged = self
+                    .git
+                    .resolve_ref(&format!("refs/heads/{src_branch}"))
+                    .ok()
+                    .flatten()
+                    .is_some_and(|cid| cid == *merged_cid);
+
+                if !tip_unchanged {
+                    continue;
+                }
+
+                let has_dirty_session = post_merge_view.as_ref().is_some_and(|v| {
+                    v.agents.values().any(|a| {
+                        a.target_branch.as_deref() == Some(src_branch.as_str())
+                            && a.has_own_changes()
+                    })
+                });
+
+                if has_dirty_session {
+                    continue;
+                }
+
+                if self.delete_branch("merge", src_branch, true).is_ok() {
+                    deleted_branches.push(src_branch.clone());
+                }
+            }
+        }
+
         Ok(MergeReport {
             target_branch: branch,
             merged_commit_id,
@@ -1607,6 +1666,7 @@ impl Coordinator {
             migrations_resequenced: all_migrations,
             affected_packages,
             closed_agents,
+            deleted_branches,
             verification_passed,
             verification_output,
             created_commit: !nothing_to_commit,
