@@ -331,11 +331,78 @@ fn extract_leading_command_token(raw: &str) -> Option<&str> {
     None
 }
 
+/// RAII terminal and signal guard for interactive Unix pagers.
+///
+/// Saves `stdout`'s `termios` state and ignores `SIGINT` in the parent process while waiting for
+/// the pager child so pressing `Ctrl-C` inside `less` never terminates `tes` early, orphans the
+/// pager, or leaves the terminal stuck in raw / `-onlcr` mode.
+#[cfg(unix)]
+struct PagerTtyGuard {
+    saved_termios: Option<libc::termios>,
+    prev_sigint: Option<libc::sighandler_t>,
+}
+
+#[cfg(unix)]
+impl PagerTtyGuard {
+    /// Captures current `termios` attributes on `stdout` and ignores `SIGINT` in the parent,
+    /// returning `(guard, restore_child_sigint)` where `restore_child_sigint` is `true` when the
+    /// pager child should reset `SIGINT` back to `SIG_DFL` before `exec`.
+    fn enter() -> (Self, bool) {
+        let saved_termios = {
+            let mut term = std::mem::MaybeUninit::<libc::termios>::zeroed();
+            // SAFETY: `tcgetattr` initializes `term` on `STDOUT_FILENO` when it returns `0`.
+            let rc = unsafe { libc::tcgetattr(libc::STDOUT_FILENO, term.as_mut_ptr()) };
+
+            if rc == 0 {
+                // SAFETY: `tcgetattr` succeeded, so `term` is fully initialized.
+                Some(unsafe { term.assume_init() })
+            } else {
+                None
+            }
+        };
+
+        // SAFETY: Setting `SIGINT` to `SIG_IGN` is a standard POSIX signal disposition update
+        // without installing any custom handler function pointer.
+        let prev = unsafe { libc::signal(libc::SIGINT, libc::SIG_IGN) };
+        let prev_sigint = (prev != libc::SIG_ERR).then_some(prev);
+        let restore_child_sigint = prev != libc::SIG_IGN;
+
+        (
+            Self {
+                saved_termios,
+                prev_sigint,
+            },
+            restore_child_sigint,
+        )
+    }
+}
+
+#[cfg(unix)]
+impl Drop for PagerTtyGuard {
+    fn drop(&mut self) {
+        if let Some(saved) = &self.saved_termios {
+            // SAFETY: `saved` was captured by `tcgetattr` on `STDOUT_FILENO` and remains valid.
+            unsafe {
+                libc::tcsetattr(libc::STDOUT_FILENO, libc::TCSANOW, saved);
+            }
+        }
+
+        if let Some(prev) = self.prev_sigint {
+            // SAFETY: `prev` is the exact prior `SIGINT` disposition returned by `libc::signal`.
+            unsafe {
+                libc::signal(libc::SIGINT, prev);
+            }
+        }
+    }
+}
+
 /// Writes `text` directly to `stdout` or pipes it safely through the configured pager when
 /// `stdout` is an interactive terminal and paging is active (`paginate || default_paged`).
 ///
 /// Always verifies the pager executable exists before spawning so output is never swallowed when
-/// `less` or a configured pager is absent from `PATH`.
+/// `less` or a configured pager is absent from `PATH`. On Unix, ignores `SIGINT` in the parent
+/// while waiting on the pager child and restores `termios` on exit so `Ctrl-C` or an abnormal
+/// pager exit never corrupts the caller's terminal state.
 pub fn emit_paged_output(
     text: &str,
     default_paged: bool,
@@ -400,6 +467,26 @@ pub fn emit_paged_output(
     cmd.env("LESS", less_env)
         .env("LV", lv_env)
         .stdin(Stdio::piped());
+
+    #[cfg(unix)]
+    let _tty_guard = {
+        use std::os::unix::process::CommandExt;
+
+        let (guard, restore_child_sigint) = PagerTtyGuard::enter();
+
+        if restore_child_sigint {
+            // SAFETY: `libc::signal` is async-signal-safe per POSIX.1-2008 and restores default
+            // `SIGINT` handling for the pager child between `fork` and `exec`.
+            unsafe {
+                cmd.pre_exec(|| {
+                    libc::signal(libc::SIGINT, libc::SIG_DFL);
+                    Ok(())
+                });
+            }
+        }
+
+        guard
+    };
 
     match cmd.spawn() {
         Ok(mut child) => {

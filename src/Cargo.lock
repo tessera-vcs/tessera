@@ -197,6 +197,7 @@ dependencies = [
  "clap",
  "core",
  "flate2",
+ "libc",
  "serde_json",
  "tempfile",
  "workspace",

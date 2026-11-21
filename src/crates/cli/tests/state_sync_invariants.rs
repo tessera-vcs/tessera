@@ -2765,3 +2765,199 @@ fn subdir_restore_stash_push_tags_and_mcp_push_error_e2e() {
         "failed MCP push must return isError: true, got: {resp}"
     );
 }
+
+/// Verifies on a real controlling Unix PTY that `tes` ignores `SIGINT` while waiting on a pager
+/// child and unconditionally restores `termios` (`OPOST`, `ONLCR`, `ICANON`, `ECHO`) even if the
+/// pager leaves the terminal in raw / `-onlcr` mode on exit.
+#[cfg(unix)]
+#[test]
+fn pager_ignores_sigint_and_restores_termios_on_pty() {
+    use std::ffi::{CStr, CString};
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::CommandExt;
+
+    let repo = Repo::new(&[("lib.rs", "pub fn alpha() -> i32 { 1 }\n", false)]);
+    let sync_tmp = tempfile::tempdir().expect("sync tempdir");
+    let ready_flag = sync_tmp.path().join("pager_ready");
+    let done_flag = sync_tmp.path().join("pager_done");
+    let pager_script = sync_tmp.path().join("corrupt_pager.sh");
+
+    fs::write(
+        &pager_script,
+        "#!/bin/sh\n\
+trap '' INT\n\
+cat >/dev/null\n\
+stty -onlcr -echo -icanon </dev/tty\n\
+printf ok > \"$TES_TEST_PAGER_READY\"\n\
+i=0\n\
+while [ ! -f \"$TES_TEST_PAGER_DONE\" ] && [ \"$i\" -lt 250 ]; do\n\
+  sleep 0.02\n\
+  i=$((i + 1))\n\
+done\n\
+exit 0\n",
+    )
+    .expect("write pager script");
+    fs::set_permissions(&pager_script, fs::Permissions::from_mode(0o755))
+        .expect("chmod pager script");
+
+    // SAFETY: Standard POSIX PTY allocation (`posix_openpt` / `grantpt` / `unlockpt` / `ptsname`).
+    let (master_fd, slave_cstr) = unsafe {
+        let mfd = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+        assert!(mfd >= 0, "posix_openpt failed");
+        assert_eq!(libc::grantpt(mfd), 0, "grantpt failed");
+        assert_eq!(libc::unlockpt(mfd), 0, "unlockpt failed");
+        let name_ptr = libc::ptsname(mfd);
+        assert!(!name_ptr.is_null(), "ptsname returned null");
+        let name = CStr::from_ptr(name_ptr).to_owned();
+        (mfd, name)
+    };
+
+    // Keep an open slave fd in the parent so we can inspect `termios` cleanly after the child exits.
+    // SAFETY: `slave_cstr` is a NUL-terminated path returned by `ptsname`.
+    let inspect_slave_fd =
+        unsafe { libc::open(slave_cstr.as_ptr(), libc::O_RDWR | libc::O_NOCTTY) };
+    assert!(inspect_slave_fd >= 0, "open inspect slave PTY failed");
+
+    // Ensure baseline `OPOST | ONLCR` and `ICANON | ECHO` are enabled before spawning `tes`.
+    // On macOS/BSD, exiting the session leader revokes open slave descriptors, so fall back to
+    // `master_fd` if `inspect_slave_fd` returns `EIO` after the child exits.
+    let read_termios = || -> libc::termios {
+        let mut t = std::mem::MaybeUninit::<libc::termios>::zeroed();
+        // SAFETY: `inspect_slave_fd` and `master_fd` are valid open PTY descriptors.
+        let rc = unsafe {
+            let r = libc::tcgetattr(inspect_slave_fd, t.as_mut_ptr());
+
+            if r == 0 {
+                r
+            } else {
+                libc::tcgetattr(master_fd, t.as_mut_ptr())
+            }
+        };
+        assert_eq!(rc, 0, "tcgetattr failed on both slave and master PTY");
+        // SAFETY: `tcgetattr` succeeded.
+        unsafe { t.assume_init() }
+    };
+
+    let mut baseline = read_termios();
+    baseline.c_oflag |= libc::OPOST | libc::ONLCR;
+    baseline.c_lflag |= libc::ICANON | libc::ECHO;
+    // SAFETY: `inspect_slave_fd` is a valid open PTY descriptor.
+    assert_eq!(
+        unsafe { libc::tcsetattr(inspect_slave_fd, libc::TCSANOW, &baseline) },
+        0,
+        "tcsetattr baseline failed"
+    );
+
+    let tes_bin = Path::new(env!("CARGO_BIN_EXE_tes"));
+    let child_slave_cstr: CString = slave_cstr.clone();
+    let mut cmd = Command::new(tes_bin);
+    cmd.current_dir(&repo.root)
+        .args(["--paginate", "doctor"])
+        .env("TES_PAGER", &pager_script)
+        .env("TES_TEST_PAGER_READY", &ready_flag)
+        .env("TES_TEST_PAGER_DONE", &done_flag)
+        .env("TERM", "xterm-256color")
+        .env_remove("TES_NO_PAGER")
+        .env_remove("GIT_PAGER")
+        .env_remove("PAGER");
+
+    for key in ISOLATED_ENV {
+        cmd.env_remove(key);
+    }
+
+    // SAFETY: Only async-signal-safe POSIX calls (`setsid`, `open`, `dup2`, `close`) execute inside
+    // `pre_exec`, giving `tes` and its pager child a real controlling terminal on `child_slave_cstr`.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+
+            let sfd = libc::open(child_slave_cstr.as_ptr(), libc::O_RDWR);
+
+            if sfd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+
+            libc::dup2(sfd, libc::STDIN_FILENO);
+            libc::dup2(sfd, libc::STDOUT_FILENO);
+            libc::dup2(sfd, libc::STDERR_FILENO);
+
+            if sfd > libc::STDERR_FILENO {
+                libc::close(sfd);
+            }
+
+            libc::close(master_fd);
+            libc::close(inspect_slave_fd);
+            Ok(())
+        });
+    }
+
+    let mut child = cmd.spawn().expect("spawn paged tes doctor on PTY");
+    let child_pid = child.id() as libc::pid_t;
+
+    let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+
+    while !ready_flag.exists() && std::time::Instant::now() < ready_deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    assert!(
+        ready_flag.exists(),
+        "timed out waiting for pager script to corrupt PTY state"
+    );
+
+    let during = read_termios();
+    assert_eq!(
+        during.c_oflag & libc::ONLCR,
+        0,
+        "test pager must have disabled ONLCR while running"
+    );
+
+    // Send SIGINT to the child's process group (simulating Ctrl-C on the controlling terminal).
+    // SAFETY: `child_pid` is the live session/process-group leader spawned above.
+    unsafe {
+        libc::kill(-child_pid, libc::SIGINT);
+    }
+
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    assert!(
+        child.try_wait().expect("try_wait after SIGINT").is_none(),
+        "tes must ignore SIGINT while waiting for its pager child"
+    );
+
+    fs::write(&done_flag, b"done").expect("signal pager exit");
+    let status = child.wait().expect("wait paged tes doctor");
+    assert!(
+        status.success(),
+        "tes --paginate doctor should exit 0 after pager exits, got: {status}"
+    );
+
+    let after = read_termios();
+    assert_ne!(
+        after.c_oflag & libc::ONLCR,
+        0,
+        "ONLCR must be restored after pager exits"
+    );
+    assert_ne!(
+        after.c_oflag & libc::OPOST,
+        0,
+        "OPOST must be restored after pager exits"
+    );
+    assert_ne!(
+        after.c_lflag & libc::ICANON,
+        0,
+        "ICANON must be restored after pager exits"
+    );
+    assert_ne!(
+        after.c_lflag & libc::ECHO,
+        0,
+        "ECHO must be restored after pager exits"
+    );
+
+    // SAFETY: Closing our owned PTY descriptors.
+    unsafe {
+        libc::close(inspect_slave_fd);
+        libc::close(master_fd);
+    }
+}
