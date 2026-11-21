@@ -85,6 +85,77 @@ pub fn ensure_background_watcher(repo_root: &Path, git_dir: &Path) {
     }
 }
 
+/// Records `blob_id` for `clean_rel` into `view.observed_blobs` unless it matches `HEAD`'s tree
+/// entry at `clean_rel`, `HEAD` advanced concurrently since `head_before`, or no active session
+/// still watches `clean_rel`.
+///
+/// Skipping unmodified `HEAD` blobs and rejecting stale pre-commit reads prevents the background
+/// watcher from leaking historical pre-commit blobs across commits and causing phantom conflicts.
+pub(crate) fn record_watched_blob_if_fresh(
+    coord: &Coordinator,
+    clean_rel: &str,
+    blob_id: ObjectId,
+    head_before: Option<ObjectId>,
+    head_tree_id: Option<ObjectId>,
+) -> bool {
+    if let Some(tree_id) = head_tree_id {
+        if coord
+            .git()
+            .read_tree_entry_at_path(&tree_id, clean_rel)
+            .ok()
+            .flatten()
+            .is_some_and(|entry| entry.blob_id == blob_id)
+        {
+            return false;
+        }
+    }
+
+    if coord.git().resolve_head_commit().ok().flatten() != head_before {
+        return false;
+    }
+
+    let mut recorded = false;
+    let _ = coord.oplog().record_tx(
+        "watcher",
+        format!("observe intermediate blob for {clean_rel}"),
+        true,
+        |view| {
+            if coord.git().resolve_head_commit().ok().flatten() != head_before {
+                return Ok(());
+            }
+
+            let still_watched = view.agents.values().any(|agent| {
+                agent.read_blobs.contains_key(clean_rel)
+                    || agent.claimed_symbols.iter().any(|sym| {
+                        sym.split("::").next().unwrap_or(sym.as_str()).trim() == clean_rel
+                    })
+            });
+
+            if !still_watched {
+                return Ok(());
+            }
+
+            let list = view
+                .observed_blobs
+                .entry(clean_rel.to_string())
+                .or_default();
+
+            if !list.contains(&blob_id) {
+                if list.len() >= MAX_OBSERVED_BLOBS_PER_PATH {
+                    list.remove(0);
+                }
+
+                list.push(blob_id);
+                recorded = true;
+            }
+
+            Ok(())
+        },
+    );
+
+    recorded
+}
+
 /// Runs the lightweight background micro-watcher that records intermediate disk blobs for
 /// claimed files into `view.observed_blobs`, exiting automatically once all active sessions
 /// close or after the configured `watch_timeout_secs` (default 90 seconds).
@@ -117,6 +188,12 @@ pub fn run_auto_watch_daemon(coord: &Coordinator) -> CoreResult<()> {
     let mut last_stat: BTreeMap<String, (u64, u64, u32, ObjectId)> = BTreeMap::new();
 
     for _ in 0..max_ticks {
+        let head_before = coord.git().resolve_head_commit().ok().flatten();
+        let head_tree_id = head_before
+            .as_ref()
+            .and_then(|cid| coord.git().read_commit(cid).ok())
+            .map(|c| c.tree_id);
+
         let Ok(current) = coord.oplog().load_current_reconciled() else {
             std::thread::sleep(std::time::Duration::from_millis(poll_ms));
             continue;
@@ -212,23 +289,12 @@ pub fn run_auto_watch_daemon(coord: &Coordinator) -> CoreResult<()> {
                 .is_some_and(|list| list.contains(&blob_id));
 
             if !already_recorded {
-                let _ = coord.oplog().record_tx(
-                    "watcher",
-                    format!("observe intermediate blob for {clean_rel}"),
-                    true,
-                    |view| {
-                        let list = view.observed_blobs.entry(clean_rel.clone()).or_default();
-
-                        if !list.contains(&blob_id) {
-                            if list.len() >= MAX_OBSERVED_BLOBS_PER_PATH {
-                                list.remove(0);
-                            }
-
-                            list.push(blob_id);
-                        }
-
-                        Ok(())
-                    },
+                let _ = record_watched_blob_if_fresh(
+                    coord,
+                    &clean_rel,
+                    blob_id,
+                    head_before,
+                    head_tree_id,
                 );
             }
         }

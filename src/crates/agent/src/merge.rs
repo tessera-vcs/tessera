@@ -1291,6 +1291,9 @@ impl Coordinator {
 
                     if !remaining_sessions_with_edits {
                         view.observed_blobs.clear();
+                    } else {
+                        view.observed_blobs
+                            .retain(|path, _| view.agents.values().any(|a| a.owns_path(path)));
                     }
                 } else if verification_passed && all_conflicts.is_empty() && keep_open {
                     for id in &target_ids {
@@ -1313,6 +1316,9 @@ impl Coordinator {
 
                     if !remaining_sessions_with_edits {
                         view.observed_blobs.clear();
+                    } else {
+                        view.observed_blobs
+                            .retain(|path, _| view.agents.values().any(|a| a.owns_path(path)));
                     }
                 }
 
